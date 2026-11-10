@@ -1,35 +1,44 @@
 // 薄网关测试（P1-6 + R1 返工）：进程内 fetch 替身 + 临时 findings/audit/approvals/notifications
 // 文件，全程不打活网、不对真实仓库发任何评论。用法（在 apps/piper 下）：
 // node scripts/test-gateway.mjs（或 npm run test:gateway）
+// R4 起 PIPER_DATA_DIR 一并指向临时目录：网关经 store 读 bot 绑定、经 settings 读令牌，
+// 数据面全部隔离——种子 bots 由 ensureData 在临时目录生成，不再隐含依赖真实 data/。
+// SKIP 口径（R4）：跳过必须经 skip() 输出并在汇总单列，绝不计为 PASS。
 // 覆盖：未批准直调被拒、正向批准恰好发一次评论（正文 = 批准快照 + 幂等标记）、驳回零调用、
 // 过期/已关闭不能再批准、意图快照与当前存储不符被拒（denied/intent_changed）、带旧 intentHash
 // 批准回 409、仓库未绑定被拒、不支持的意图被拒、无令牌明确失败且可重试、PR 已关闭执行失败
 // 保持 approved、正文含令牌被拒、写接口失败保持 approved、并发批准互斥（替身 50ms 延迟下恰好
 // 一次写、第二个 409）、崩溃重放靠评论标记查重（总写次数仍 1）、审计正负两类齐全且不含令牌、
 // 以及「除网关外无人构造 GitHub 评论写端点」的源码绕过断言。
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "piper-gateway-"));
+process.env.PIPER_DATA_DIR = join(tmp, "data");
 process.env.PIPER_FINDINGS_FILE = join(tmp, "findings.jsonl");
 process.env.PIPER_AUDIT_FILE = join(tmp, "audit.jsonl");
 process.env.PIPER_APPROVALS_FILE = join(tmp, "approvals.jsonl");
 process.env.PIPER_NOTIFICATIONS_FILE = join(tmp, "notifications.jsonl");
 
-const SETTINGS_GITHUB_FILE = join(APP_DIR, "data", "settings-github.json");
-const hasSettingsToken = existsSync(SETTINGS_GITHUB_FILE);
+// 隔离目录里不存在 settings-github.json，令牌恒走 env 兜底（R4 前还要看本机真实
+// 设置文件是否存在、存在就整项跳过——那正是审计 B4 指出的不可复现点，已删除）。
 const ENV_TOKEN = "ghp_gateway_test_token_0001";
-if (!hasSettingsToken) process.env.GITHUB_TOKEN = ENV_TOKEN;
+process.env.GITHUB_TOKEN = ENV_TOKEN;
 
 const results = [];
 let seq = 0;
 function check(name, ok, detail = "") {
 	seq += 1;
-	results.push({ seq, name, ok });
+	results.push({ seq, name, ok, status: ok ? "pass" : "fail" });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
+}
+function skip(name, reason = "") {
+	seq += 1;
+	results.push({ seq, name, ok: false, status: "skip" });
+	console.log(`SKIP ${String(seq).padStart(2, "0")} ${name}${reason ? ` — ${reason}` : ""}`);
 }
 
 // ---- fetch 替身：网关会用到的端点（PR 查询、评论列表、评论发表），其余一律 599 ----
@@ -75,6 +84,8 @@ const saveArtifactStub = (input) => {
 };
 
 try {
+	const { ensureData } = await import("../lib/store.mjs");
+	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
 	const { createFinding, getFinding, updateFinding } = await import("../lib/findings.mjs");
 	const { approveApproval, listApprovals, rejectApproval } = await import("../lib/approvals.mjs");
 	const { gatewayExecuteWrite } = await import("../lib/gateway.mjs");
@@ -281,8 +292,10 @@ try {
 		);
 	}
 
-	// 9. 无令牌：批准执行明确失败（no_token）、保持 approved、可重试成功（本机有设置令牌时跳过）
-	if (!hasSettingsToken) {
+	// 9. 无令牌：批准执行明确失败（no_token）、保持 approved、可重试成功。
+	//    R4 前本机若有真实 settings-github.json 本项整项「跳过也算过」；隔离后令牌
+	//    来源恒为 env，本项在任何机器上都真跑，不再有跳过分支。
+	{
 		const f = makeFinding({ subject: "109" });
 		delete process.env.GITHUB_TOKEN;
 		const before = postCalls.length;
@@ -301,8 +314,6 @@ try {
 			failedOk && out2.execution.ok === true && getFinding(f.id).status === "executed" && postCalls.length === before + 1,
 			`out1=${JSON.stringify(out1.execution)} out2=${JSON.stringify(out2.execution)}`,
 		);
-	} else {
-		check("无令牌用例：本机存在 settings-github.json（文件优先），跳过 env 令牌操纵", true, "skipped");
 	}
 
 	// 10. PR 已关闭：执行前复检失败 → failed/pr_not_open，保持 approved，收件箱 lastError 可见，写 API 0 次
@@ -436,14 +447,17 @@ try {
 	}
 } finally {
 	globalThis.fetch = realFetch;
+	delete process.env.PIPER_DATA_DIR;
 	delete process.env.PIPER_FINDINGS_FILE;
 	delete process.env.PIPER_AUDIT_FILE;
 	delete process.env.PIPER_APPROVALS_FILE;
 	delete process.env.PIPER_NOTIFICATIONS_FILE;
-	if (!hasSettingsToken) delete process.env.GITHUB_TOKEN;
+	delete process.env.GITHUB_TOKEN;
 	rmSync(tmp, { recursive: true, force: true });
 }
 
-const failed = results.filter((r) => !r.ok);
-console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);
+const passedCount = results.filter((r) => r.status === "pass").length;
+const skippedCount = results.filter((r) => r.status === "skip").length;
+const failed = results.filter((r) => r.status === "fail");
+console.log(`\n结果：${passedCount}/${results.length} 通过，${skippedCount} 跳过（单列，不计通过），${failed.length} 失败`);
 if (failed.length) process.exit(1);

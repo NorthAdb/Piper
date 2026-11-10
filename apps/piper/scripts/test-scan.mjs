@@ -1,6 +1,7 @@
 // 晨间扫描规则测试（P1-2）：用进程内 fetch 替身喂假 GitHub 响应，断言拍板清单两条规则、
 // 去重与单仓失败不拖垮整轮。用法（在 apps/piper 下）：node scripts/test-scan.mjs（或 npm run test:scan）
-// Finding 落盘用临时文件隔离（PIPER_FINDINGS_FILE），绝不碰真实 data/，也不访问网络。
+// Finding 落盘用临时文件隔离（PIPER_FINDINGS_FILE），PIPER_DATA_DIR 一并指向临时目录
+// （R4：ensureData 的种子文件也不落真实 data/），不访问网络。
 // P1-3 的冻结夹具评测（scripts/eval-scan.mjs）在这套断言口径上扩成入库夹具。
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,6 +16,7 @@ function check(name, ok, detail = "") {
 }
 
 const tmp = mkdtempSync(join(tmpdir(), "piper-scan-"));
+process.env.PIPER_DATA_DIR = join(tmp, "data");
 const realFetch = globalThis.fetch;
 const requested = [];
 

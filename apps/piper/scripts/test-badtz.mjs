@@ -1,15 +1,18 @@
-// R3 坏时区文件重启测试：手把 data/settings-profile.json 的 timezone 改成非法值后
+// R3 坏时区文件重启测试：把 settings-profile.json 的 timezone 预置成非法值后
 // 启动真实 server 进程，核对进程存活、日志回落提示、调度状态回缺省时区、且能从
 // 设置接口把时区修好。用法（在 apps/piper 下）：node scripts/test-badtz.mjs
-// 行为：运行前备份 settings-profile.json 字节，结束时原样还原；子进程的启动 tick
-// 可能对真实 data/ 写补跑产物，与 test-listen.mjs 的既有行为一致。
+// R4 起坏文件预置在临时数据目录（PIPER_DATA_DIR），子进程全程只碰隔离目录——
+// R3 当年是直接改用户真实 data/settings-profile.json 再还原，正是 B4 的污染面。
 import { spawn } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
-const PROFILE_FILE = join(APP_DIR, "data", "settings-profile.json");
+const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-badtz-"));
+const TMP_DATA = join(TMP_ROOT, "data");
+const PROFILE_FILE = join(TMP_DATA, "settings-profile.json");
 const PORT = 4414;
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = "badtz-test-token";
@@ -23,7 +26,7 @@ function check(name, ok, detail = "") {
 }
 
 function startServer() {
-	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN };
+	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA };
 	delete env.PIPER_HOST;
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
 	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -48,7 +51,7 @@ async function waitReady(proc, timeoutMs = 15000) {
 	return false;
 }
 
-const origBytes = existsSync(PROFILE_FILE) ? readFileSync(PROFILE_FILE, "utf8") : null;
+mkdirSync(TMP_DATA, { recursive: true });
 writeFileSync(PROFILE_FILE, JSON.stringify({ displayName: "坏时区测试", timezone: "Foo/Bar" }, null, 2) + "\n", "utf8");
 
 const { proc, output } = startServer();
@@ -98,8 +101,7 @@ try {
 	);
 } finally {
 	proc.kill("SIGTERM");
-	if (origBytes === null) rmSync(PROFILE_FILE, { force: true });
-	else writeFileSync(PROFILE_FILE, origBytes, "utf8");
+	rmSync(TMP_ROOT, { recursive: true, force: true });
 }
 
 const failed = results.filter((r) => !r.ok);

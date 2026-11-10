@@ -6,18 +6,24 @@
 // 以 subject（run id / PR 号）去重：已有 open Finding 的不重复开。建议先用规则模板，不上模型润色，
 // 模型不得发明 GitHub 上不存在的 PR 或 CI（后续步骤若引入模型写建议，同样受此约束）。
 // 令牌经 lib/settings.mjs 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
-// 本文件不直读环境变量；无令牌走公开限额。单仓失败不中断整体，失败原因写进日报；
+// 本文件不直读令牌环境变量；无令牌走公开限额。API 基址缺省 https://api.github.com，
+// 可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归用本地 GitHub 桩，全程离线、结果确定）。
+// 单仓失败不中断整体，失败原因写进日报；
 // 全部仓库失败时由调用方判定整轮失败（L0-5 语义，本文件只回 failures/total）。
 // 本文件全程只读，绝不调用任何 GitHub 写接口：pr_needs_review 附带的 writeIntent 只是
 // 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
 import { githubToken } from "./settings.mjs";
 import { createFinding, findOpenFinding } from "./findings.mjs";
 
+function ghBase() {
+	return (process.env.PIPER_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
+}
+
 async function gh(path) {
 	const headers = { Accept: "application/vnd.github+json", "User-Agent": "piper-morning-scan" };
 	const token = githubToken();
 	if (token) headers.Authorization = `Bearer ${token}`;
-	const res = await fetch(`https://api.github.com${path}`, { headers });
+	const res = await fetch(`${ghBase()}${path}`, { headers });
 	if (!res.ok) throw new Error(`GitHub API ${res.status} ${path}`);
 	return res.json();
 }

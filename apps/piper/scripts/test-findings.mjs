@@ -1,6 +1,7 @@
 // Finding 存储层单元测试（P1-1）：写入 / 读取 / 过滤 / 非法值拒绝 / 跨进程文件读回。
 // 用法（在 apps/piper 下）：node scripts/test-findings.mjs（或 npm run test:findings）
-// 行为：用临时目录里的 findings.jsonl（经 PIPER_FINDINGS_FILE 隔离，绝不碰真实 data/），
+// 行为：用临时目录里的 findings.jsonl（经 PIPER_FINDINGS_FILE 隔离），且 PIPER_DATA_DIR
+// 一并指向临时目录（R4：findings 落盘会 ensureData，种子文件也不落真实 data/），
 // 逐项断言后退出。退出码 0 = 全部通过；1 = 有失败。不访问网络。
 // 子模式：--read 时只把当前存储内容以 JSON 打到 stdout（供跨进程读回断言内部使用）。
 import { spawnSync } from "node:child_process";
@@ -38,6 +39,7 @@ function throws(fn, pattern) {
 const tmp = mkdtempSync(join(tmpdir(), "piper-findings-"));
 const file = join(tmp, "findings.jsonl");
 process.env.PIPER_FINDINGS_FILE = file;
+process.env.PIPER_DATA_DIR = join(tmp, "data");
 
 try {
 	const F = await import("../lib/findings.mjs");

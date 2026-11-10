@@ -28,12 +28,15 @@ import { getBot } from "./store.mjs";
 import { getFinding, updateFinding } from "./findings.mjs";
 import { appendAudit } from "./audit.mjs";
 
-const GH_API = "https://api.github.com";
+// GitHub API 基址：缺省官方；可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归/测试指向本地桩）。
+function ghBase() {
+	return (process.env.PIPER_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
+}
 
 async function ghJson(path, { method = "GET", token, body } = {}) {
 	const headers = { Accept: "application/vnd.github+json", "User-Agent": "piper-gateway" };
 	if (token) headers.Authorization = `Bearer ${token}`;
-	const res = await fetch(`${GH_API}${path}`, {
+	const res = await fetch(`${ghBase()}${path}`, {
 		method,
 		headers,
 		body: body === undefined ? undefined : JSON.stringify(body),

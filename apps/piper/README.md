@@ -219,9 +219,25 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
 结构、schedule 机器可解析且带 nextRunAt）；P1-5 把第 23 项 approvals 断言按切片授权
 改成「来自真实存储且结构合法」口径并续扩第 53-56 项（未登录读写 401、不存在项批准/
 驳回 404、例程与产物带 botId）；P1-6 续扩第 57-58 项（审计端点未登录 401、结构与
-按 findingId 过滤），当前共 **58 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
-其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
-整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
+按 findingId 过滤）；R2 续扩第 59-63 项（Cookie SameSite=Strict、跨源 Origin 403、
+非 JSON Content-Type 415、同源放行、登录限速）；R3 续扩第 64-66 项（非法时区 400
+且文件字节不变、合法时区不误杀），当前共 **66 项**。
+
+R4 起本脚本是全离线硬门禁：数据目录经 `PIPER_DATA_DIR` 隔离到临时目录（子进程
+server 与脚本进程内 import 的 lib 共用同一隔离目录，用户真实 `data/` 不读不写），
+GitHub 经 `PIPER_GITHUB_API_BASE` 指向脚本内起的本地桩（第 20、41-43 项的成功/
+失败两路扫描都走桩，不存在的仓库由桩回 404）；原「真实配置文件存在就整组跳过」
+的保护逻辑已删除，原被跳过的第 27-30、36-39 项在隔离目录里恒为真断言。收到
+SIGINT/SIGTERM 时脚本先杀子进程、关桩、删临时目录再退出。
+
+打真实 GitHub 的检查拆在独立的非门禁套件（数据目录同样隔离）：
+
+```bash
+npm run regression:live  # 或 node scripts/regression-live.mjs
+```
+
+它对绑定仓库跑一轮真实晨间扫描；遇 GitHub 403/429（限流）或网络不可达时输出
+`SKIP`（单列、不计通过）且退出码为 0，红只留给真实异常。
 
 Finding 存储层的单元测试在 `scripts/test-findings.mjs`（不走 HTTP、不打网络，用临时文件隔离）：
 
@@ -753,3 +769,51 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   eval:scan 5/5，`npm run check` 无错误、`npm run build:web` 成功。
 - 明确不做核对：未做每 bot 独立时区；未引入调度库；未碰 R4 测试隔离、未碰 R5
   及以后；未改 `packages/`；未改 SSE 事件名。
+
+### R4 测试隔离实测（2026-11-10，分支 fix/r4-test-isolation，堆叠在 R3 上）
+
+审计 B4 + M6 的收口：回归与全部测试脚本不再碰用户真实 `data/`，硬门禁全离线、
+结果确定，活网单独成套且红不扰人。先红后修：
+
+- 先红（未改实现时）：在真实 `data/` 预置「用户配置」——`settings-model.json`
+  （假 Key）、`settings-github.json`（假令牌）、about-me 标记行、一条 findings
+  后跑旧回归：只有 **52/58 通过、6 红**，且第 27-30、36-39 两组（8 项）被
+  「文件存在就 SKIP」整组跳过、不计数（总盘本应 66 项）。6 红里第 03、11 项的
+  原因是子进程 server 读了真实模型 Key（`modelConfigured=true`）并真的拿预置
+  假 Key 向 OpenAI 发了请求；第 20、33、34、35 项是真实扫描与真实通知文件
+  连带红。跑完哈希对比：真实 `notifications.jsonl`、`routines.json`、两份
+  `sessions/*.jsonl` 字节被改，`artifacts/` 新增 3 份日报。中途 `kill -INT`
+  脚本：脚本进程死了，子 server 成孤儿继续跑、4398 端口仍在监听。
+- 数据目录（`lib/store.mjs`）：`DATA_DIR` 支持 `PIPER_DATA_DIR` 覆盖（相对路径
+  按 cwd 解析；缺省仍是 `apps/piper/data`，产品行为不变）。
+- GitHub 基址（`lib/scan.mjs`、`lib/gateway.mjs`）：请求基址支持
+  `PIPER_GITHUB_API_BASE` 覆盖，缺省 `https://api.github.com`。
+- 回归（`scripts/regression.mjs`）：子进程 server 与脚本进程内 import 的 lib
+  共用 `PIPER_DATA_DIR` 临时目录；脚本内起本地 GitHub 桩（两绑定仓返回安静
+  数据、未映射仓 404），第 20、41-43 项改走桩；删除两处 SKIP 保护，原被跳过
+  的 8 项恒为真断言；加 SIGINT/SIGTERM 处理（杀子进程、关桩、删临时目录）。
+  计数口径：总数回到完整的 **66 项**，66 项全部是真断言、无 SKIP 混杂。
+- 活网拆分（新 `scripts/regression-live.mjs`，`npm run regression:live`）：
+  数据目录同样隔离，不设基址、打真实 GitHub；403/429（限流）与网络不可达
+  判 `SKIP`（单列、不计通过）且退出码 0，红只留给真实异常。本轮实况：联网
+  跑 **5/5 通过**（限额未触发）；在断网命名空间跑，3 项 SKIP、退出码 0——
+  SKIP 判定路径已实证（403 与网络不可达走同一判定函数，本轮 403 未自然复现）。
+- 其余脚本：`test-gateway` 加 `PIPER_DATA_DIR` 隔离并由 `ensureData` 在临时
+  目录生成种子 bots（此前隐含依赖真实 `data/bots.json`）；第 9 项删掉
+  「本机有设置令牌就整项跳过、且跳过算 PASS」的分支，恒真跑；汇总改三态
+  （通过/跳过单列/失败），`skip()` 成为唯一跳过出口。`test-listen`、
+  `test-badtz` 的子进程一并带 `PIPER_DATA_DIR`（R3 当年直改真实 profile
+  文件再还原的做法已改为临时目录预置）；`test-findings`、`test-scan`、
+  `test-schedule`、`eval-scan` 在加载 lib 前先设 `PIPER_DATA_DIR`。
+- 改绿（本分支）：同一套预置真实文件再跑 `npm run regression` **66/66**，
+  且 `data/` 全体文件哈希与跑前**逐字节一致**（预置的假 Key/假令牌文件本身
+  亦未动）；断网命名空间（`unshare -rn`，仅回环、外网确认不通）内回归
+  **66/66**，单轮耗时约 2.4 秒（红时同一回归跑了约 277 秒，主要是真实
+  扫描与限流等待）；`kill -INT` 后无孤儿 server、4398 释放、临时目录已清。
+  同批复跑：test-findings 27/27、test-scan 5/5、test-schedule 14/14、
+  test-gateway 18/18（0 跳过）、test-listen 6/6、test-badtz 4/4、
+  eval:scan 5/5，`npm run check` 无错误、`npm run build:web` 成功。
+- 明确不做核对：未做 Docker 化测试环境；live 套件未升为门禁、未进 CI；
+  产品行为变更只有 `PIPER_DATA_DIR` 与 `PIPER_GITHUB_API_BASE` 两个新环境
+  变量入口（缺省值与原行为一致）；未碰 R5 及以后；未改 `packages/`；未改
+  SSE 事件名；未增加第二种写意图。

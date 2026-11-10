@@ -7,11 +7,13 @@
 //   artifacts/<id>.md         产物（Markdown），文件头注释里带结构化元数据
 //   routines.json             routine 定义 + 上次运行结果
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const DATA_DIR = join(APP_DIR, "data");
+// 数据目录：缺省 apps/piper/data；可用 PIPER_DATA_DIR 覆盖（相对路径按进程 cwd 解析）。
+// R4 起所有测试/回归脚本都经它指向临时目录，与用户真实 data/ 完全隔离。
+export const DATA_DIR = process.env.PIPER_DATA_DIR ? resolve(process.env.PIPER_DATA_DIR) : join(APP_DIR, "data");
 const BOTS_FILE = join(DATA_DIR, "bots.json");
 const ROUTINES_FILE = join(DATA_DIR, "routines.json");
 const ABOUT_ME_FILE = join(DATA_DIR, "about-me.md");

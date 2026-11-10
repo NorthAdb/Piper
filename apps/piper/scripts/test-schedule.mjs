@@ -3,7 +3,16 @@
 // 覆盖：下一次运行计算（时区换算）、到点只触发一次、失败有限补跑、成功后同周期不再跑、
 // 启动补跑判定（已过点未成功补一次 / 已成功不补 / 未到点不补）、并发重入防护、
 // schedule 字段解析与旧文本迁移。时区固定 Asia/Hong_Kong（UTC+8，无夏令时）。
-import { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } from "../lib/schedule.mjs";
+// R4：schedule 经 settings 间接引用数据目录，PIPER_DATA_DIR 先指向临时目录再 import，
+// 与其他脚本统一隔离口径（本脚本用注入的 timezoneFn，不实际读写数据文件）。
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tmp = mkdtempSync(join(tmpdir(), "piper-schedule-"));
+process.env.PIPER_DATA_DIR = join(tmp, "data");
+
+const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../lib/schedule.mjs");
 
 const results = [];
 let seq = 0;
@@ -304,6 +313,8 @@ check(
 		JSON.stringify(st),
 	);
 }
+
+rmSync(tmp, { recursive: true, force: true });
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);

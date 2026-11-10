@@ -4,7 +4,8 @@
 //   { name, description, scans（默认 1）,
 //     repos: { "Owner/Repo": { info, commits, issues, runs, pulls, reviews } 或 { "error": 500 } },
 //     expect: { failures, findings: [{ repo, type, subject, evidenceUrl }], reportIncludes?: [..] } }
-// 每个用例用独立的临时 findings 文件跑（PIPER_FINDINGS_FILE），fetch 全域替换为夹具替身：
+// 每个用例用独立的临时 findings 文件跑（PIPER_FINDINGS_FILE），PIPER_DATA_DIR 一并
+// 指向临时目录（R4：ensureData 种子不落真实 data/），fetch 全域替换为夹具替身：
 // 夹具未映射的 URL 会被记录并以 599 失败，结尾断言为空——评测永不访问真实 api.github.com。
 // 新增用例：往 test/fixtures/github/ 放一个符合上面格式的 JSON 即可，无需改本脚本。
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
@@ -15,6 +16,7 @@ import { fileURLToPath } from "node:url";
 const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "github");
 const realFetch = globalThis.fetch;
 const tmp = mkdtempSync(join(tmpdir(), "piper-eval-"));
+process.env.PIPER_DATA_DIR = join(tmp, "data");
 
 let unmapped = [];
 function installStub(repos) {
@@ -91,6 +93,7 @@ try {
 } finally {
 	globalThis.fetch = realFetch;
 	delete process.env.PIPER_FINDINGS_FILE;
+	delete process.env.PIPER_DATA_DIR;
 	rmSync(tmp, { recursive: true, force: true });
 }
 

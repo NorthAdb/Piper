@@ -5,13 +5,16 @@
 //   B PIPER_HOST=0.0.0.0 且未设 PIPER_TOKEN（默认口令）：进程拒绝启动，退出码非 0
 //     且输出写明原因。
 //   C PIPER_HOST=0.0.0.0 且显式设置 PIPER_TOKEN：正常启动，监听 0.0.0.0。
-// 子进程会触发调度启动 tick（可能对真实 data/ 写补跑产物），与 regression.mjs 的
-// 既有行为一致；本脚本只断言监听面，不碰业务数据。
+// R4 起子进程一律带 PIPER_DATA_DIR 指向临时目录：调度启动 tick 的补跑产物只落
+// 隔离目录，不再写用户真实 data/；本脚本只断言监听面，不碰业务数据。
 import { execFileSync, spawn } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
+const TMP_DATA = join(mkdtempSync(join(tmpdir(), "piper-listen-")), "data");
 
 const results = [];
 let seq = 0;
@@ -22,7 +25,7 @@ function check(name, ok, detail = "") {
 }
 
 function baseEnv(port) {
-	const env = { ...process.env, PORT: String(port) };
+	const env = { ...process.env, PORT: String(port), PIPER_DATA_DIR: TMP_DATA };
 	delete env.PIPER_HOST;
 	delete env.PIPER_TOKEN;
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
@@ -120,6 +123,8 @@ async function caseNonLoopbackWithToken() {
 await caseDefaultLoopback();
 await caseRefuseNonLoopbackDefaultToken();
 await caseNonLoopbackWithToken();
+
+rmSync(join(TMP_DATA, ".."), { recursive: true, force: true });
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);
