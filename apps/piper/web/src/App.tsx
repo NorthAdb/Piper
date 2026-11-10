@@ -8,6 +8,7 @@ import { BotForm } from "./BotForm";
 import { BotList } from "./BotList";
 import { ChatPane } from "./ChatPane";
 import { Desktop } from "./Desktop";
+import { Settings } from "./Settings";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -25,6 +26,7 @@ export function App() {
 	const [currentBotId, setCurrentBotId] = useState<string | null>(null);
 	const [busyBotIds, setBusyBotIds] = useState<ReadonlySet<string>>(new Set());
 	const [form, setForm] = useState<FormState>({ open: false, bot: null });
+	const [view, setView] = useState<"main" | "settings">("main");
 	const [token, setToken] = useState("");
 	const [loginErr, setLoginErr] = useState("");
 
@@ -119,6 +121,10 @@ export function App() {
 
 	const currentBot = bots.find((b) => b.id === currentBotId) ?? null;
 
+	if (view === "settings") {
+		return <Settings onBack={() => setView("main")} />;
+	}
+
 	return (
 		<div className="grid h-dvh grid-cols-[264px_minmax(0,1fr)_360px]">
 			<aside className="min-h-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
@@ -129,6 +135,7 @@ export function App() {
 					onSelect={setCurrentBotId}
 					onNew={() => setForm({ open: true, bot: null })}
 					onEdit={(bot) => setForm({ open: true, bot })}
+					onOpenSettings={() => setView("settings")}
 				/>
 			</aside>
 

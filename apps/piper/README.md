@@ -158,6 +158,21 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 
 实测记录见本文件末尾「实测」节（随提交更新）。
 
+## 回归脚本
+
+历次实测的 API 断言已固化为脚本 `scripts/regression.mjs`（L0-1 落地，后续切片只扩展它）：
+
+```bash
+cd apps/piper
+npm run build:web        # 脚本需要 public/ 已构建
+npm run regression       # 或 node scripts/regression.mjs
+```
+
+脚本以「无模型 Key」的默认环境在测试端口（4398，可用 `REGRESSION_PORT` 覆盖）启动一份
+`server.mjs`，逐项断言后退出：原 26 项覆盖未登录 401、登录、bot CRUD、chat 无 Key 的
+`MODEL_NOT_CONFIGURED`、草案规则兜底全链路、晨间扫描与产物、收件箱、记忆与首页托管。
+晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），其余不依赖外网。
+
 ## 实测
 
 2026-11-10 在本机实测（Node v24.22.1；基座按上面步骤构建后 `npm start` 于 apps/piper，端口 4310）：
@@ -224,3 +239,16 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
   与前端迁移时那次 grep 误匹配同类，均为验收脚本问题、非接口回归。
 - 说明：本环境无浏览器，页面观感（深色主题、卡片层次、流式渲染）未做浏览器目检，
   由用户本地 `npm start` 后确认；以上为构建、托管与契约层证据。
+
+### L0-1 设置页骨架实测（2026-11-10，分支 feat/l0-1-settings-shell）
+
+- 回归脚本落地：此前只存在于验收过程的 26 项断言已固化为 `scripts/regression.mjs`
+  （运行方式见上文「回归脚本」节）。脚本在未改任何代码的基线上先行验证 26/26 通过，
+  证明断言与现状契约对齐，不是照着新代码反写的。
+- 设置页骨架（`web/src/Settings.tsx`）：左栏底部、待批收件箱下方新增「设置」入口；
+  点击进入独立整页视图（顶部「返回」回三栏），内分四组页签——模型 / 基础资料 /
+  连接器 / 通知——均为「尚未配置 / 即将接入」的空状态，本切片不保存任何配置。
+  设置视图在登录门之后（未登录先见登录页，原 401 行为不变）。
+- 验证：`npm run check`（tsc）无错误；`npm run build:web` 成功，bundle 内含「设置」入口与
+  四组文案；`node scripts/regression.mjs` 26/26 通过（无 Key 默认环境）。
+- 未做浏览器截图：本环境无浏览器工具，设置页观感以构建产物 + 契约证据替代，留待用户本地目检。

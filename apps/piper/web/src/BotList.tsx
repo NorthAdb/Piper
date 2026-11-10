@@ -1,6 +1,6 @@
 // 左栏业务组件：品牌区 + bot 列表（主 bot 置顶为后端返回顺序，本组件保持该顺序）、
 // 状态点（闲/忙）、新建与编辑入口、全局待批收件箱入口。视觉走设计系统（sidebar 令牌）。
-import { BotIcon, InboxIcon, PencilIcon, PinIcon, PlusIcon } from "lucide-react";
+import { BotIcon, InboxIcon, PencilIcon, PinIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { listApprovals } from "./api";
 import { Badge } from "@/components/ui/badge";
@@ -17,9 +17,10 @@ export type BotListProps = {
 	onSelect: (id: string) => void;
 	onNew: () => void;
 	onEdit: (bot: Bot) => void;
+	onOpenSettings: () => void;
 };
 
-export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdit }: BotListProps) {
+export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdit, onOpenSettings }: BotListProps) {
 	const [approvals, setApprovals] = useState<unknown[]>([]);
 	const [inboxOpen, setInboxOpen] = useState(false);
 
@@ -133,6 +134,10 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 							: "暂无待批请求。权限网关在后续迭代接入，写操作请求会汇集到这里。"}
 					</div>
 				) : null}
+				<Button type="button" variant="ghost" className="mt-1 w-full justify-start" onClick={onOpenSettings}>
+					<SettingsIcon />
+					设置
+				</Button>
 			</div>
 		</div>
 	);
