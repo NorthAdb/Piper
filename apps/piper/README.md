@@ -29,39 +29,60 @@ npm start            # 先构建前端（vite build -> public/）再启动 node 
 
 ## 前端
 
-技术栈（2026-11-10 定案并落地，分支 feat/web-assistant-ui）：**React 19 + TypeScript + Vite**，
+技术栈（2026-11-10 定案并落地）：**React 19 + TypeScript + Vite + Tailwind CSS v4**，
 源码在 `web/`，构建产物输出 `public/` 由 `server.mjs` 静态托管（`public/` 已 gitignore，不入库）。
 后端 API 与 SSE 事件契约（`session / delta / tool / system / draft / error / done`）**一律未动**，
-本次迁移只换前端实现，逐项回归结果见文末实测节。
+前端历经三步：原生实现（feat/prototype）→ React + assistant-ui（feat/web-assistant-ui）→
+设计系统视觉升级（feat/web-visual-upgrade），逐项回归见文末实测节。
 
 以 **assistant-ui（MIT，`@assistant-ui/react` 0.15.33）** 为主要组件底，实际用到的组件/API：
 
 - `AssistantRuntimeProvider` + `useExternalStoreRuntime`：前端自持消息状态（按 bot 隔离，
   父级以 `key={botId}` 挂载），`convertMessage` 把自有 part 模型映射为 `ThreadMessageLike`；
-- `ThreadPrimitive.Root / Viewport / Messages / Empty`、`ComposerPrimitive.Root / Input / Send`：中栏对话区与输入区；
+- `ThreadPrimitive.Root / Viewport / Messages / Empty`、`ComposerPrimitive.Root / Input / Send`：中栏对话区与输入区，
+  视觉按 assistant-ui 官方 registry thread 的实现方式（消息列居中定宽、用户气泡、助手整幅无气泡、
+  Composer 为悬浮圆角卡片）；
 - `MessagePrimitive.Root / Parts`：消息渲染分发——文本走 `Text` 槽位（助手消息用
   `@assistant-ui/react-markdown` 的 `MarkdownTextPrimitive` + `remark-gfm` 流式渲染，用户消息纯文本），
-  工具事件走 `tool-call` part + `tools.Fallback` 自定义渲染，草案/系统/错误走 `data-*` part +
-  `data.by_name` 分发到对应卡片；
-- 草案卡是自定义 data part 渲染器（确认/放弃按钮，对接既有 `draft` 事件与 `draft-confirm` 接口，
-  回调经 React context 注入），不是 assistant-ui 内置件。
+  工具事件走 `tool-call` part + `tools.Fallback`（渲染为 AI Elements 的 Tool 组件，见下），
+  草案/系统/错误走 `data-*` part + `data.by_name` 分发到对应卡片；
+- 草案卡是自定义 data part 渲染器（shadcn Card 实现，确认/放弃按钮对接既有 `draft` 事件与
+  `draft-confirm` 接口，回调经 React context 注入），不是 assistant-ui 内置件。
 
-**shadcn/ui AI Elements 借鉴清单**（组合方式借鉴，未引入其代码）：AI Elements 以 shadcn 方式
-拷源码进项目，整套引入需 Tailwind + Radix 脚手架，成本高于收益，故按其公开形态自行实现等价组件：
+### 设计系统（feat/web-visual-upgrade）
 
-| AI Elements 件 | Piper 中的等价实现 | 形态借鉴点 |
-|---|---|---|
-| Tool | `web/src/parts.tsx` 的 `ToolCard` | 标题行（工具名 + 状态徽标）+ 可折叠内容区（详情 JSON） |
-| Artifact | `web/src/Desktop.tsx` 的产物卡 | 标题栏（标题 + 元信息 + 收起）+ 内容区 |
-| Message / Conversation | 中栏消息气泡布局（`styles.css`） | 用户右对齐、助手左对齐的会话流排布 |
-| Prompt Input | `ComposerPrimitive` 的组合方式 | 输入区 + 发送按钮的贴底布局（实现用 assistant-ui 原语） |
+Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体系，入口 `web/src/index.css`：
 
-未借鉴：Reasoning（后端 SSE 契约无推理事件，暂无落点）、Queue/Plan 等（当前形态用不上）。
-样式为自有 CSS（`web/src/styles.css`），未引入 Tailwind。
+- **主题**：单主题深色（bot 控制台气质）。变量定义在 `:root`（html 带 `.dark` 类，
+  使 `dark:` 变体与 Radix 组件按深色工作），颜色用 oklch：zinc 系深灰面
+  （`--background` oklch(0.135) / `--card` / `--sidebar` 等）、信号靛蓝主色
+  （`--primary` oklch(0.655 0.165 276)，用于按钮、选中态、焦点环）、规范 `--destructive` 红；
+  成功/运行中状态在组件层用 emerald/amber 色阶。圆角基准 `--radius: 0.625rem`，
+  字体走系统栈（含 CJK）+ ui-monospace 等宽栈。全局规范：边框 `--border` 白 9% 透明、
+  输入面 `--input`、`--ring` 与主色同色相。
+- **shadcn 基础组件**（copy-in 官方形态，落在 `web/src/components/ui/`）：
+  button、badge、card、tabs、dialog、input、textarea、label、scroll-area、separator、
+  tooltip、collapsible、select（select 是 AI Elements CodeBlock 的传递依赖）。工具函数
+  `cn` 在 `web/src/lib/utils.ts`（clsx + tailwind-merge）；图标统一用 **lucide-react**。
+- **布局**：三栏 CSS grid（264px / 1fr / 360px）；左栏与右栏走 sidebar 令牌
+  （`bg-sidebar` / `border-sidebar-border`）；中栏顶部会话标题栏（bot 头像 + 名字 + 模型状态徽标）。
+
+### AI Elements 真引入清单（feat/web-visual-upgrade）
+
+上一版只借鉴形态、未引入代码；本版已付脚手架成本，按 shadcn copy-in 方式把官方源码
+（vercel/ai-elements，`packages/elements/src/`）落到 `web/src/components/ai-elements/` 并实际使用：
+
+| 件 | 落点 | 用处 | 相对官方源码的适配 |
+|---|---|---|---|
+| Tool | `components/ai-elements/tool.tsx` | 中栏工具卡（状态徽标 + 折叠详情） | 仅导入路径 `@repo/shadcn-ui/*` → `@/` 别名 |
+| Artifact | `components/ai-elements/artifact.tsx` | 右栏产物详情卡（标题栏/描述/关闭/内容区） | 仅导入路径同上 |
+| CodeBlock | `components/ai-elements/code-block.tsx` | Tool 的传递依赖：参数/结果的 JSON 高亮渲染 | 导入路径同上；Tailwind v4 important 改后缀语法（`dark:bg-[...]!`）；高亮器改 shiki/core + JS 正则引擎、仅注册 json 文法与 github-light/dark 主题——官方全量 `createHighlighter` 会让构建产物约 11MB/310 个文法 chunk，收窄后 1.1MB/2 文件（本项目实际只高亮 json） |
+
+未引入：Reasoning（后端 SSE 契约无推理事件，无落点）、Queue/Plan 等（当前形态用不上）。
 
 三栏布局保持规格：左栏 bot 列表与右栏「bot 桌面」（例程/产物/记忆）是业务组件自研
-（`BotList.tsx` / `Desktop.tsx`），借鉴 assistant-ui ThreadList 的列表组织思路，数据走既有 API；
-登录页沿用既有 cookie 口令机制。
+（`BotList.tsx` / `Desktop.tsx`，分别用 shadcn 基础件与 AI Elements Artifact 实现），
+数据走既有 API；登录页沿用既有 cookie 口令机制（视觉改 shadcn Card）。
 
 ## 环境变量
 
@@ -178,3 +199,28 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
   `/api/approvals` 恒 `{"approvals":[]}`；`/api/memory/repo-keeper` 返回 memory.md 与「关于我」全文。
 - 说明：本子任务环境无浏览器，页面级交互（流式渲染观感、草案卡点击确认）未做浏览器实测，
   以上均为服务端与契约层证据；前端事件处理与后端契约一一对应（见 `web/src/ChatPane.tsx` 的 SSE 分发）。
+
+### 视觉升级实测（2026-11-10，分支 feat/web-visual-upgrade）
+
+设计系统 + 三栏精修 + AI Elements 真引入，同环境复测（Node v24.22.1，端口 4310，无模型 Key）：
+
+- 构建：`npm run check`（tsc --noEmit）无错误；`npm run build:web`（vite 8.3.4 + Tailwind v4）成功。
+  产物 `public/` 共约 1.1MB / 2 文件：JS 约 1.07MB（gzip 约 325KB）、CSS 约 47KB。
+  与上一版（JS 774KB / gzip 233KB）相比增量来自 Radix 基础件、Tailwind 运行时与
+  AI Elements CodeBlock 的 shiki（已收窄为 core + json 文法，见「AI Elements 真引入清单」）；
+  仍有 >500KB chunk 警告，雏形阶段接受，后续可按路由/组件代码分割。
+- 静态托管：`GET /` 返回 200，html 带 `class="dark"`，JS bundle 含新界面文案
+  （「Personal Agent 控制台」「Bot 草案卡」「待批收件箱」），CSS 含设计系统主题变量（oklch `--primary` 等）。
+- 回归（自动化脚本逐项断言，**26/26 通过**，与升级前清单一致、功能一项不丢）：
+  未登录 401 → 登录 ok → `/api/session` modelConfigured:false → bots 两预置且主 bot 置顶 →
+  bot POST（201）/PUT 改名/DELETE 普通 bot ok、删主 bot 400 →
+  chat 普通消息 SSE `session → error MODEL_NOT_CONFIGURED「未配置模型」→ done` →
+  主 bot 建 bot 意图 SSE `system`（规则兜底）`→ draft{name:"代码审查", source:"rules"} → done` →
+  `draft-confirm`（201）落库、列表与主 bot 历史均含该草案 → 测试数据清理后恢复两预置 bot →
+  晨间扫描真实生成日报（`lastStatus:"ok"`）、产物列表 +1 且单篇可读 →
+  `/api/approvals` 恒 `{"approvals":[]}` → `/api/memory/repo-keeper` 返回 memory.md 与「关于我」。
+- 如实记录：首轮脚本有 2 项假失败（POST /api/bots、draft-confirm），定位为脚本误期望
+  状态码 200、实际后端契约一直是 201（server.mjs 未改），修正脚本后 26/26 通过；
+  与前端迁移时那次 grep 误匹配同类，均为验收脚本问题、非接口回归。
+- 说明：本环境无浏览器，页面观感（深色主题、卡片层次、流式渲染）未做浏览器目检，
+  由用户本地 `npm start` 后确认；以上为构建、托管与契约层证据。
