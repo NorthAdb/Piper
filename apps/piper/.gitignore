@@ -1,3 +1,6 @@
 # 运行时数据（文件优先存储）：bots/sessions/artifacts/workspaces 均为本地运行产物，不入库
 data/*
 !data/.gitkeep
+
+# 前端构建产物：web/ 为源码，public/ 由 npm run build:web 生成（server.mjs 静态托管），不入库
+public/

@@ -1,0 +1,122 @@
+// Piper 前端数据模型：与后端 API / SSE 契约对齐的线格式类型，以及前端自持的消息模型。
+// 后端契约见 server.mjs 文件头注释，迁移前后保持不变。
+
+export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+export type Bot = {
+	id: string;
+	name: string;
+	systemPrompt: string;
+	tools: string[];
+	memoryScope: string;
+	repos: string[];
+	routines: string[];
+	isMain: boolean;
+	canManageBots: boolean;
+	createdAt: string;
+};
+
+export type BotDraft = {
+	name: string;
+	systemPrompt: string;
+	tools: string[];
+	repos: string[];
+	memoryScope: string;
+	source: string;
+};
+
+export type Routine = {
+	id: string;
+	botId: string;
+	name: string;
+	description: string;
+	schedule: string;
+	lastRunAt: string | null;
+	lastArtifactId: string | null;
+	lastStatus: string | null;
+};
+
+export type ArtifactMeta = {
+	id: string;
+	botId: string | null;
+	kind: string;
+	title: string;
+	createdAt: string | null;
+};
+
+export type Artifact = ArtifactMeta & { body: string };
+
+// 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
+export type HistoryEntry = {
+	ts?: string;
+	role: "user" | "assistant" | "system";
+	text?: string;
+	kind?: string;
+	code?: string;
+	draft?: BotDraft;
+};
+
+// POST /api/chat 的 SSE 事件（event 名 -> data 形状）
+export type ChatEvent =
+	| { event: "session"; data: { botId: string; sessionId: string } }
+	| { event: "delta"; data: { text: string } }
+	| { event: "tool"; data: { phase: string; name: string; detail: JsonValue } }
+	| { event: "system"; data: { kind: string; text: string } }
+	| { event: "draft"; data: { draft: BotDraft } }
+	| { event: "error"; data: { code: string; message: string } }
+	| { event: "done"; data: { botId: string } };
+
+// 前端消息模型：external-store runtime 自持，convertMessage 转成 assistant-ui 的 ThreadMessageLike
+export type ChatPart =
+	| { type: "text"; text: string }
+	| { type: "tool"; id: string; name: string; phase: string; detail: JsonValue }
+	| { type: "system"; kind: string; text: string }
+	| { type: "draft"; partId: string; draft: BotDraft; readOnly: boolean; confirmedBotName?: string }
+	| { type: "error"; code: string; message: string };
+
+export type ChatMessage = {
+	id: string;
+	role: "user" | "assistant";
+	parts: ChatPart[];
+	running: boolean;
+};
+
+let seq = 0;
+export function nextId(prefix: string): string {
+	seq += 1;
+	return `${prefix}-${Date.now().toString(36)}-${seq}`;
+}
+
+// 历史流水 -> 前端消息模型（系统条目挂到 assistant 消息上以卡片 part 呈现）
+export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
+	const out: ChatMessage[] = [];
+	for (const e of entries) {
+		if (e.role === "user") {
+			out.push({ id: nextId("hist"), role: "user", parts: [{ type: "text", text: e.text ?? "" }], running: false });
+		} else if (e.role === "assistant") {
+			out.push({ id: nextId("hist"), role: "assistant", parts: [{ type: "text", text: e.text ?? "" }], running: false });
+		} else if (e.draft) {
+			out.push({
+				id: nextId("hist"),
+				role: "assistant",
+				parts: [{ type: "draft", partId: nextId("draft"), draft: e.draft, readOnly: true }],
+				running: false,
+			});
+		} else if (e.code) {
+			out.push({
+				id: nextId("hist"),
+				role: "assistant",
+				parts: [{ type: "error", code: e.code, message: e.text ?? "" }],
+				running: false,
+			});
+		} else {
+			out.push({
+				id: nextId("hist"),
+				role: "assistant",
+				parts: [{ type: "system", kind: e.kind ?? "system", text: e.text ?? "" }],
+				running: false,
+			});
+		}
+	}
+	return out;
+}
