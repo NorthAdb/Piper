@@ -1,0 +1,129 @@
+// 晨间扫描规则测试（P1-2）：用进程内 fetch 替身喂假 GitHub 响应，断言拍板清单两条规则、
+// 去重与单仓失败不拖垮整轮。用法（在 apps/piper 下）：node scripts/test-scan.mjs（或 npm run test:scan）
+// Finding 落盘用临时文件隔离（PIPER_FINDINGS_FILE），绝不碰真实 data/，也不访问网络。
+// P1-3 的冻结夹具评测（scripts/eval-scan.mjs）在这套断言口径上扩成入库夹具。
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const results = [];
+let seq = 0;
+function check(name, ok, detail = "") {
+	seq += 1;
+	results.push({ seq, name, ok });
+	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
+}
+
+const tmp = mkdtempSync(join(tmpdir(), "piper-scan-"));
+const realFetch = globalThis.fetch;
+const requested = [];
+
+function infoFor(name) {
+	return { stargazers_count: 3, forks_count: 1, default_branch: "main", pushed_at: "2026-11-10T00:00:00Z" };
+}
+
+// scenario: { "Owner/Repo": { runs, pulls, reviews, commits?, issues? } | { error } }
+function installStub(scenario) {
+	requested.length = 0;
+	globalThis.fetch = async (url) => {
+		const u = new URL(String(url));
+		requested.push(u.pathname);
+		const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
+		const entry = m ? scenario[m[1]] : undefined;
+		if (!entry) return { ok: false, status: 599, json: async () => ({}) };
+		if (entry.error) return { ok: false, status: entry.error, json: async () => ({}) };
+		const rest = m[2] ?? "";
+		let payload;
+		if (rest === "") payload = infoFor(m[1]);
+		else if (rest.startsWith("/commits")) payload = entry.commits ?? [];
+		else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+		else if (rest.startsWith("/pulls")) payload = entry.pulls ?? [];
+		else if (rest.startsWith("/issues")) payload = entry.issues ?? [];
+		else if (rest.startsWith("/actions/runs")) payload = { workflow_runs: entry.runs ?? [] };
+		else return { ok: false, status: 599, json: async () => ({}) };
+		return { ok: true, status: 200, json: async () => payload };
+	};
+}
+
+const saveArtifactStub = ({ title }) => ({ id: "stub-artifact", title });
+
+try {
+	const { runMorningScan } = await import("../lib/scan.mjs");
+	const findingsMod = await import("../lib/findings.mjs");
+
+	// ---- 场景 A：失败 CI（中间夹一条进行中与一条别分支失败）+ 待审 PR + draft PR ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "a.jsonl");
+	installStub({
+		"Acme/Widgets": {
+			runs: [
+				{ id: 9003, name: "CI", status: "in_progress", conclusion: null, head_branch: "main", html_url: "https://github.com/Acme/Widgets/actions/runs/9003", created_at: "2026-11-10T01:00:00Z" },
+				{ id: 9001, name: "CI", status: "completed", conclusion: "failure", head_branch: "main", html_url: "https://github.com/Acme/Widgets/actions/runs/9001", created_at: "2026-11-09T23:00:00Z" },
+				{ id: 9000, name: "CI", status: "completed", conclusion: "success", head_branch: "main", html_url: "https://github.com/Acme/Widgets/actions/runs/9000", created_at: "2026-11-09T20:00:00Z" },
+				{ id: 8999, name: "CI", status: "completed", conclusion: "failure", head_branch: "feature-x", html_url: "https://github.com/Acme/Widgets/actions/runs/8999", created_at: "2026-11-09T19:00:00Z" },
+			],
+			pulls: [
+				{ number: 7, title: "Fix login", draft: false, html_url: "https://github.com/Acme/Widgets/pull/7", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" },
+				{ number: 8, title: "WIP refactor", draft: true, html_url: "https://github.com/Acme/Widgets/pull/8", user: { login: "bob" }, created_at: "2026-11-09T00:00:00Z" },
+			],
+			reviews: { "7": [{ state: "COMMENTED" }] },
+			commits: [{ commit: { message: "fix: x", author: { date: "2026-11-10T00:00:00Z", name: "dev" } }, author: { login: "dev" } }],
+			issues: [],
+		},
+	});
+	const runA1 = await runMorningScan({ repos: ["Acme/Widgets"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const ci = runA1.findings.find((f) => f.type === "ci_failed");
+	const pr = runA1.findings.find((f) => f.type === "pr_needs_review");
+	check(
+		"场景A：最近已结束 run 为 failure 时开 ci_failed，subject/evidenceUrl 指向该 run（跳过进行中与别分支）",
+		Boolean(ci) && ci.subject === "9001" && ci.evidenceUrl === "https://github.com/Acme/Widgets/actions/runs/9001" && ci.status === "open",
+		JSON.stringify(runA1.findings.map((f) => `${f.type}:${f.subject}`)),
+	);
+	check(
+		"场景A：open 非 draft 且无 APPROVED 审查的 PR 开 pr_needs_review，draft PR 不开且不查其审查",
+		Boolean(pr) && pr.subject === "7" && pr.evidenceUrl === "https://github.com/Acme/Widgets/pull/7" && !requested.some((p) => p.includes("/pulls/8/reviews")),
+		JSON.stringify(runA1.findings.map((f) => `${f.type}:${f.subject}`)),
+	);
+	check(
+		"场景A：日报先拍板清单（含两条证据链接）后其余观察（含 star 统计），顺序正确",
+		runA1.report.includes("## 拍板清单") &&
+			runA1.report.includes("## 其余观察") &&
+			runA1.report.indexOf("## 拍板清单") < runA1.report.indexOf("## 其余观察") &&
+			runA1.report.includes("https://github.com/Acme/Widgets/actions/runs/9001") &&
+			runA1.report.includes("⭐ 3"),
+		"",
+	);
+	const runA2 = await runMorningScan({ repos: ["Acme/Widgets"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const openAfter = findingsMod.listFindings({ status: "open" });
+	check(
+		"场景A：连续扫两次不重复开 open Finding（本轮新开 0 条，open 总数仍 2）",
+		runA2.findings.length === 0 && openAfter.length === 2,
+		`第二轮新开=${runA2.findings.length} open=${openAfter.length}`,
+	);
+
+	// ---- 场景 B：一仓 API 500 + 一仓安静（成功 CI、已批准 PR） ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "b.jsonl");
+	installStub({
+		"Acme/Broken": { error: 500 },
+		"Acme/Quiet": {
+			runs: [{ id: 7001, name: "CI", status: "completed", conclusion: "success", head_branch: "main", html_url: "https://github.com/Acme/Quiet/actions/runs/7001", created_at: "2026-11-09T23:00:00Z" }],
+			pulls: [{ number: 9, title: "Docs", draft: false, html_url: "https://github.com/Acme/Quiet/pull/9", user: { login: "carol" }, created_at: "2026-11-09T00:00:00Z" }],
+			reviews: { "9": [{ state: "APPROVED" }] },
+			commits: [],
+			issues: [],
+		},
+	});
+	const runB = await runMorningScan({ repos: ["Acme/Broken", "Acme/Quiet"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景B：单仓 API 失败计 failures=1 并写进日报，其他仓继续；安静仓（成功 CI + 已批准 PR）不开 Finding",
+		runB.failures === 1 && runB.total === 2 && runB.findings.length === 0 && runB.report.includes("扫描失败") && runB.report.includes("Acme/Quiet") && runB.report.includes("本轮没有需要拍板的事项。"),
+		`failures=${runB.failures} findings=${runB.findings.length}`,
+	);
+} finally {
+	globalThis.fetch = realFetch;
+	delete process.env.PIPER_FINDINGS_FILE;
+	rmSync(tmp, { recursive: true, force: true });
+}
+
+const failed = results.filter((r) => !r.ok);
+console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);
+if (failed.length) process.exit(1);

@@ -240,18 +240,18 @@ const bot = getBot(routine?.botId || "repo-keeper");
 const repos = bot?.repos?.length? bot.repos: ["NorthAdb/LinkForge", "NorthAdb/Loom"];
 const routineName = routine?.name?? "晨间仓库扫描";
 try {
-const { artifact, report, failures, total} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
+const { artifact, report, failures, total, findings} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
 // 整轮失败（全部仓库取证失败）不报成功：状态记 failed 并发失败通知（L0-5）；部分失败仍算完成，失败细节在日报里。
 if (total > 0 && failures >= total) {
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "failed"});
 addNotification({ type: "routine.failed", title: `${routineName}失败`, body: `${total} 个仓库全部取证失败，详情见日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
 if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描失败（全部仓库取证失败），日报：${artifact.title}`});
-return sendJson(res, 200, { artifact, report, failed: true});
+return sendJson(res, 200, { artifact, report, failed: true, findings});
 }
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "ok"});
-addNotification({ type: "routine.completed", title: `${routineName}已完成`, body: `日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
+addNotification({ type: "routine.completed", title: `${routineName}已完成`, body: `日报：${artifact.title}（本轮新开 ${findings.length} 条待拍板事项，见日报开头的拍板清单）`, routineId: "morning-scan", artifactId: artifact.id});
 if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描完成，日报：${artifact.title}`});
-return sendJson(res, 200, { artifact, report});
+return sendJson(res, 200, { artifact, report, findings});
 } catch (err) {
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastStatus: "failed"});
 addNotification({ type: "routine.failed", title: `${routineName}失败`, body: String(err.message?? err), routineId: "morning-scan"});

@@ -173,7 +173,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 | bot 建改删双入口 | 界面表单（POST/PUT/DELETE /api/bots）+ 主 bot 对话草案卡（draft 事件 → draft-confirm 落库） |
 | 与任意 bot 真对话（Pi 内核、流式） | 已实现（agent-core Agent + pi-ai streamSimple，SSE delta）；需自备模型 Key 实测真回复，无 Key 时明确「未配置模型」 |
 | 每 bot 独立会话与工作区 | 已实现（sessions/<botId>.jsonl、workspaces/<botId>/） |
-| Routine 示例：晨间只读扫描出日报 | 已实现（GitHub 公开 REST，日报存 artifacts，右栏可读） |
+| Routine 示例：晨间只读扫描出拍板清单 + 日报 | 已实现（GitHub 公开 REST；主产物为 Finding（P1-2，响应带 `findings`），日报存 artifacts 且清单在前、观察在后，右栏可读） |
 | 待批收件箱空架子 | 已实现（GET /api/approvals 恒空数组，前端有入口与空状态） |
 | 不做：权限网关 / 记忆自动沉淀 / 多模型 / 移动端 | 按规格未做；记忆页签只读 |
 
@@ -194,7 +194,8 @@ npm run regression       # 或 node scripts/regression.mjs
 `MODEL_NOT_CONFIGURED`、草案规则兜底全链路、晨间扫描与产物、收件箱、记忆与首页托管；
 L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显全文、测试连接坏端点不崩溃、
 清除恢复未配置）；L0-3 至 L0-5 续扩至 43 项；P1-1 续扩第 44-46 项覆盖 Finding 只读 API
-（未登录 401、列表结构、不存在 404），当前共 **46 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
+（未登录 401、列表结构、不存在 404）；P1-2 把第 22 项改成产物 + 清单结构口径并续扩第 47-48 项
+（扫描响应带 findings、与只读 API 同一存储），当前共 **48 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
 其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
 整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
 
@@ -207,6 +208,15 @@ npm run test:findings    # 或 node scripts/test-findings.mjs
 
 覆盖写入补齐字段、按 status/repo/botId 过滤、缺 evidenceUrl / 非法 status / 非法 type /
 非法 writeIntent 被拒绝、改状态后去重不再命中、新进程从文件读回（重启不丢）、删除。
+
+扫描规则另有替身测试 `scripts/test-scan.mjs`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
+
+```bash
+npm run test:scan    # 或 node scripts/test-scan.mjs
+```
+
+覆盖两条规则的命中与证据链接、跳过进行中 run / 别分支 run / draft PR（且不查其审查）、
+日报清单在观察之前、连扫两次不重复开、单仓 API 失败不拖垮整轮、安静仓零 Finding。
 
 ## 实测
 
@@ -411,3 +421,27 @@ npm run test:findings    # 或 node scripts/test-findings.mjs
   复跑即 46/46。这与 L0-5 记录的同类抖动一致：无令牌回归对共享 IP 限额敏感，连跑需间隔。
 - 明确不做核对：未改扫描算法、未做审批与网关、未做评测夹具（P1-3）、未改 `packages/`、
   未改 SSE 事件名。
+
+### P1-2 扫描产出拍板清单实测（2026-11-10，分支 feat/p1-2-scan-findings）
+
+- 规则改造：`lib/scan.mjs` 重写。数据仍经 `gh()` 以 `githubToken()` 取（L0-4 口径不变），
+  新增 reviews 取证。两条程序化规则（建议用规则模板，模型不参与判定）：
+  `ci_failed` = 默认分支最近一次已结束 run 结论为 failure（API 用 branch 参数、客户端再按
+  head_branch 过滤，跳过进行中的 run）；`pr_needs_review` = open、非 draft、无任何 APPROVED
+  审查。命中先以 findOpenFinding 按 (repo, type, subject) 查 open 去重，再 createFinding 落盘，
+  expiresAt 设 7 天。扫描返回扩展为 `{ artifact, report, failures, total, findings }`，
+  HTTP 响应同步带 `findings`；整轮失败判定与通知语义（L0-5）未动，完成通知只引用清单计数。
+- 日报结构：先「## 拍板清单」（本轮新开 Finding 的标题 + 证据链接 + 建议；没有则明写
+  「本轮没有需要拍板的事项。」），后「## 其余观察」（每仓小节：概况/最近提交/待处理 PR 与
+  Issue/最近 CI；单仓失败写失败原因）。star、提交列表、已通过 CI、draft 与已批准 PR 只进观察。
+- 替身测试：`node scripts/test-scan.mjs` **5/5 通过**（fetch 替身 + 临时 findings 文件，
+  不打活网）：失败 CI 与待审 PR 各开一条且证据链接精确、进行中 run 与别分支失败 run 不误报、
+  draft PR 不开且不查其审查、清单节排在观察节之前、连扫两次第二轮新开 0 条（open 仍 2 条）、
+  一仓 500 时 failures=1 且不拖垮整轮、安静仓（成功 CI + 已批准 PR）零 Finding。
+- 回归：第 22 项按切片改成「产物 + 清单结构」口径（标题 + 两节标题 + 顺序），新增 47-48 项
+  （扫描响应 findings 结构、与只读 API 同一存储），`node scripts/regression.mjs` **48/48 通过**；
+  `npm run check` 无错误。本轮活扫描（LinkForge、Loom）实际新开 0 条——两仓当时无失败的
+  最近 CI、无待审 PR，属于安静状态；规则命中证据以替身测试与 P1-3 冻结夹具为准，不拿活仓
+  状态当断言。本切片无界面改动，无截图项。
+- 明确不做核对：未扩扫描种类（不报 star 变化/新 issue）；未做定时（P1-4）、未做任何写操作
+  （P1-6）；未改 `packages/`、未改 SSE 事件名；L0-5 的 approvals 回归断言口径未动（P1-5 才改）。

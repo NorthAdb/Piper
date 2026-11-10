@@ -182,7 +182,15 @@ async function main() {
 
 		const newArtId = run.json?.artifact?.id;
 		const art = newArtId ? await req(`/api/artifacts/${newArtId}`) : { status: 0, json: null };
-		check("新产物可按 id 读全文且含日报标题", art.status === 200 && String(art.json?.artifact?.body ?? "").includes("晨间仓库日报"), `实际 ${art.status}`);
+		check(
+			"新产物可按 id 读全文且含日报标题与拍板清单/其余观察两节（P1-2 清单结构口径）",
+			art.status === 200 &&
+				String(art.json?.artifact?.body ?? "").includes("晨间仓库日报") &&
+				String(art.json?.artifact?.body ?? "").includes("## 拍板清单") &&
+				String(art.json?.artifact?.body ?? "").includes("## 其余观察") &&
+				String(art.json?.artifact?.body ?? "").indexOf("## 拍板清单") < String(art.json?.artifact?.body ?? "").indexOf("## 其余观察"),
+			`实际 ${art.status}`,
+		);
 
 		// ---- 收件箱与记忆（23-25）----
 		const approvals = await req("/api/approvals");
@@ -214,6 +222,7 @@ async function main() {
 		await runConnectorChecks({ req, check });
 		await runNotificationChecks({ req, check, anon });
 		await runFindingChecks({ req, check, anon });
+		await runScanFindingChecks({ req, check, run });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -509,6 +518,25 @@ async function runFindingChecks({ req, check, anon }) {
 
 	const missing = await req("/api/findings/f-no-such-id");
 	check("GET /api/findings/:id 不存在返回 404", missing.status === 404, `实际 ${missing.status}`);
+}
+
+// P1-2（47-48）：扫描主产物改为拍板清单——扫描响应带 findings 数组且每条有证据链接；
+// findings 与 GET /api/findings 同一存储（按 bot 过滤可读回）。规则本身的精确断言
+// （哪条 run、哪个 PR、去重）走 scripts/test-scan.mjs 的替身测试与 P1-3 冻结夹具，
+// 不拿活仓当唯一断言（活仓状态会变）。
+async function runScanFindingChecks({ req, check, run }) {
+	const findings = run.json?.findings;
+	check(
+		"扫描响应带 findings 数组且每条含 evidenceUrl、repo、type",
+		Array.isArray(findings) && findings.every((f) => f.evidenceUrl && f.repo && (f.type === "ci_failed" || f.type === "pr_needs_review")),
+		`实际条数=${Array.isArray(findings) ? findings.length : "非数组"}`,
+	);
+	const list = await req("/api/findings?botId=repo-keeper");
+	check(
+		"GET /api/findings?botId=repo-keeper 可读回扫描落盘的 Finding（同一存储）",
+		list.status === 200 && Array.isArray(list.json?.findings),
+		`实际 ${list.status} 条数=${list.json?.findings?.length}`,
+	);
 }
 
 main().catch((err) => {
