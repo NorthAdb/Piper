@@ -1,6 +1,7 @@
 // 右栏业务组件：当前 bot 的「桌面」三页签——例程 / 产物 / 记忆，数据全部走现有 API。
-// 页签用 shadcn Tabs；例程用 shadcn Card；产物详情用 AI Elements 的 Artifact 组件
-//（components/ai-elements/artifact，真引入源码）。
+// 例程与产物按当前选中 bot 隔离（P1-5 修复）：接口返回全量，前端按 botId 过滤，
+// 选中主 bot 时不得出现仓库管家的例程或日报。页签用 shadcn Tabs；例程用 shadcn Card；
+// 产物详情用 AI Elements 的 Artifact 组件（components/ai-elements/artifact，真引入源码）。
 import { CalendarClockIcon, FileTextIcon, HistoryIcon, PlayIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { getArtifact, getMemory, listArtifacts, listRoutines, runMorningScan, UnauthorizedError } from "./api";
@@ -81,6 +82,9 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 		}
 	};
 
+	const visibleRoutines = bot ? routines.filter((r) => r.botId === bot.id) : [];
+	const visibleArtifacts = bot ? artifacts.filter((a) => a.botId === bot.id) : [];
+
 	const onOpenArtifact = async (meta: ArtifactMeta) => {
 		if (openArtifact?.id === meta.id) {
 			setOpenArtifact(null);
@@ -122,8 +126,8 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 			<ScrollArea className="min-h-0 flex-1">
 				<div className="px-3 pb-3">
 					<TabsContent value="routines" className="mt-0 flex flex-col gap-3">
-						{routines.length === 0 ? <p className="px-1 text-sm text-muted-foreground">暂无例程</p> : null}
-						{routines.map((r) => (
+						{visibleRoutines.length === 0 ? <p className="px-1 text-sm text-muted-foreground">该 bot 暂无例程</p> : null}
+						{visibleRoutines.map((r) => (
 							<Card key={r.id} className="gap-0 py-0 shadow-none">
 								<CardHeader className="flex flex-row items-center gap-2 px-4 py-3">
 									<CardTitle className="flex-1 truncate text-sm">{r.name}</CardTitle>
@@ -172,10 +176,10 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 					</TabsContent>
 
 					<TabsContent value="artifacts" className="mt-0 flex flex-col gap-1">
-						{artifacts.length === 0 ? (
-							<p className="px-1 text-sm text-muted-foreground">暂无产物，运行一次晨间扫描试试。</p>
+						{visibleArtifacts.length === 0 ? (
+							<p className="px-1 text-sm text-muted-foreground">该 bot 暂无产物，运行一次晨间扫描试试。</p>
 						) : null}
-						{artifacts.map((a) => (
+						{visibleArtifacts.map((a) => (
 							<button
 								key={a.id}
 								type="button"

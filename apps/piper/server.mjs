@@ -17,7 +17,9 @@
 // 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.mjs）
 // GET /api/artifacts 产物列表
 // GET /api/artifacts/:id 产物正文
-// GET /api/approvals 待批收件箱（雏形占位，恒为空数组）
+// GET /api/approvals 待批收件箱（P1-5：读真实存储——带 writeIntent 的 open/approved Finding 的审批视图）
+// POST /api/approvals/:id/approve 批准（P1-5 只改状态为 approved，不执行写；网关执行在 P1-6 接入）
+// POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
@@ -69,6 +71,7 @@ import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelS
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
+import { approveApproval, listApprovals, rejectApproval} from "./lib/approvals.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
 const TOKEN = process.env.PIPER_TOKEN || "piper-dev";
@@ -330,7 +333,12 @@ if (artMatch && req.method === "GET") {
 const art = readArtifact(artMatch[1]);
 return art? sendJson(res, 200, { artifact: art}): sendJson(res, 404, { error: "产物不存在"});
 }
-if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: []});
+if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: listApprovals()});
+const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject)$/);
+if (approvalMatch && req.method === "POST") {
+const approval = approvalMatch[2] === "approve"? approveApproval(approvalMatch[1]): rejectApproval(approvalMatch[1]);
+return approval? sendJson(res, 200, { approval}): sendJson(res, 404, { error: "待批项不存在"});
+}
 if (path === "/api/findings" && req.method === "GET") {
 const filters = {};
 for (const key of ["status", "repo", "botId"]) {

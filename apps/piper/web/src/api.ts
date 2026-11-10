@@ -1,5 +1,6 @@
 // Piper 后端 API 客户端：cookie 会话（与 server.mjs 一致），401 时抛 UnauthorizedError 交给界面回登录页。
 import type {
+	Approval,
 	Artifact,
 	ArtifactMeta,
 	Bot,
@@ -83,8 +84,16 @@ export async function getArtifact(id: string): Promise<Artifact> {
 	return (await api<{ artifact: Artifact }>(`/api/artifacts/${id}`)).artifact;
 }
 
-export async function listApprovals(): Promise<unknown[]> {
-	return (await api<{ approvals: unknown[] }>("/api/approvals")).approvals;
+export async function listApprovals(): Promise<Approval[]> {
+	return (await api<{ approvals: Approval[] }>("/api/approvals")).approvals;
+}
+
+export async function approveApproval(id: string): Promise<Approval> {
+	return (await api<{ approval: Approval }>(`/api/approvals/${id}/approve`, { method: "POST", body: "{}" })).approval;
+}
+
+export async function rejectApproval(id: string): Promise<Approval> {
+	return (await api<{ approval: Approval }>(`/api/approvals/${id}/reject`, { method: "POST", body: "{}" })).approval;
 }
 
 export function getMemory(botId: string): Promise<{ botId: string; markdown: string; aboutMe: string }> {

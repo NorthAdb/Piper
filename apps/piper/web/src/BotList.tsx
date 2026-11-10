@@ -1,8 +1,10 @@
 // 左栏业务组件：品牌区 + bot 列表（主 bot 置顶为后端返回顺序，本组件保持该顺序）、
-// 状态点（闲/忙）、新建与编辑入口、全局待批收件箱入口。视觉走设计系统（sidebar 令牌）。
+// 状态点（闲/忙）、新建与编辑入口、全局待批收件箱入口（P1-5 起为独立整页视图）。
+// 视觉走设计系统（sidebar 令牌）。
 import { BellIcon, BotIcon, InboxIcon, PencilIcon, PinIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getNotifications, listApprovals } from "./api";
+import type { Approval } from "./model";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -17,13 +19,13 @@ export type BotListProps = {
 	onSelect: (id: string) => void;
 	onNew: () => void;
 	onEdit: (bot: Bot) => void;
+	onOpenInbox: () => void;
 	onOpenSettings: () => void;
 	onOpenNotifications: () => void;
 };
 
-export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdit, onOpenSettings, onOpenNotifications }: BotListProps) {
-	const [approvals, setApprovals] = useState<unknown[]>([]);
-	const [inboxOpen, setInboxOpen] = useState(false);
+export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdit, onOpenInbox, onOpenSettings, onOpenNotifications }: BotListProps) {
+	const [approvals, setApprovals] = useState<Approval[]>([]);
 	const [notifUnread, setNotifUnread] = useState(0);
 
 	useEffect(() => {
@@ -123,7 +125,7 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 
 			<Separator />
 			<div className="p-3">
-				<Button type="button" variant="ghost" className="w-full justify-start" onClick={() => setInboxOpen((v) => !v)}>
+				<Button type="button" variant="ghost" className="w-full justify-start" onClick={onOpenInbox}>
 					<InboxIcon />
 					待批收件箱
 					{approvals.length ? (
@@ -132,13 +134,6 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 						</Badge>
 					) : null}
 				</Button>
-				{inboxOpen ? (
-					<div className="mt-2 rounded-lg border bg-card px-3 py-2.5 text-sm text-muted-foreground">
-						{approvals.length
-							? `${approvals.length} 条待批请求（雏形占位）。`
-							: "暂无待批请求。权限网关在后续迭代接入，写操作请求会汇集到这里。"}
-					</div>
-				) : null}
 				<Button type="button" variant="ghost" className="mt-1 w-full justify-start" onClick={onOpenNotifications}>
 					<BellIcon />
 					通知

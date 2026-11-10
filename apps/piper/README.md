@@ -149,6 +149,9 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
   校验在写入边界：无 evidenceUrl、非法 type/status/writeIntent 一律拒绝。只读 API：
   `GET /api/findings`（可按 status/repo/botId 过滤）、`GET /api/findings/:id`。
   文件路径可用环境变量 `PIPER_FINDINGS_FILE` 覆盖（仅供单元测试 / 评测隔离，缺省即此文件）
+- 待批收件箱不另存数据（P1-5）：`lib/approvals.mjs` 把带 writeIntent 的 Finding 整形成
+  审批视图（id 与 findingId 同值），批准/驳回即改 Finding 状态；过期 open 项在读列表时
+  惰性转 expired
 - `about-me.md`：账号级「关于我」，只有一份——设置页（`PUT /api/about-me`，需登录）、右栏记忆
   与对话注入读的都是它；上限 20000 字符，超限拒绝且不写坏原文件（L0-3）
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
@@ -164,7 +167,8 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 见 `server.mjs` 文件头注释（逐条列明）。要点：SSE 事件类型固定为
 `session / delta / tool / system / draft / error / done`；草案卡结构
 `{name, systemPrompt, tools, repos, memoryScope, source}`，经 `POST /api/bots/draft-confirm` 确认才落库；
-`GET /api/approvals` 雏形恒返回空数组（收件箱占位）。
+`GET /api/approvals` 自 P1-5 起读真实存储：待批项即带 `writeIntent` 的 open/approved
+Finding 的审批视图（不另存一份），`POST /api/approvals/:id/approve|reject` 写回状态。
 定时调度（P1-4）：`server.mjs` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
 （缺省 08:00，时区读基础资料），与手动触发走同一执行函数、同一通知语义；
 只读状态端点 `GET /api/schedule/status` 给出时区、下次运行、上次运行与结果。
@@ -178,7 +182,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 | 与任意 bot 真对话（Pi 内核、流式） | 已实现（agent-core Agent + pi-ai streamSimple，SSE delta）；需自备模型 Key 实测真回复，无 Key 时明确「未配置模型」 |
 | 每 bot 独立会话与工作区 | 已实现（sessions/<botId>.jsonl、workspaces/<botId>/） |
 | Routine 示例：晨间只读扫描出拍板清单 + 日报 | 已实现（GitHub 公开 REST；主产物为 Finding（P1-2，响应带 `findings`），日报存 artifacts 且清单在前、观察在后，右栏可读） |
-| 待批收件箱空架子 | 已实现（GET /api/approvals 恒空数组，前端有入口与空状态） |
+| 待批收件箱 | 已实现（P1-5：独立整页视图，列表读真实 Finding 存储，批准/驳回写回状态；网关执行在 P1-6） |
 | 不做：权限网关 / 记忆自动沉淀 / 多模型 / 移动端 | 按规格未做；记忆页签只读 |
 
 实测记录见本文件末尾「实测」节（随提交更新）。
@@ -200,7 +204,9 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
 清除恢复未配置）；L0-3 至 L0-5 续扩至 43 项；P1-1 续扩第 44-46 项覆盖 Finding 只读 API
 （未登录 401、列表结构、不存在 404）；P1-2 把第 22 项改成产物 + 清单结构口径并续扩第 47-48 项
 （扫描响应带 findings、与只读 API 同一存储）；P1-4 续扩第 49-52 项（调度状态端点 401 与
-结构、schedule 机器可解析且带 nextRunAt），当前共 **52 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
+结构、schedule 机器可解析且带 nextRunAt）；P1-5 把第 23 项 approvals 断言按切片授权
+改成「来自真实存储且结构合法」口径并续扩第 53-56 项（未登录读写 401、不存在项批准/
+驳回 404、例程与产物带 botId），当前共 **56 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
 其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
 整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
 
@@ -538,3 +544,36 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 明确不做核对：未加外部调度依赖、未起新服务、未用系统 cron；未接 CI/review 事件
   触发；未改 `packages/`、未改 SSE 事件名。本切片无新页面（右栏例程卡多一行下次运行），
   截图以接口与状态机测试证据替代，留待用户本地目检。
+
+### P1-5 待批收件箱独立视图 + 桌面按 bot 隔离实测（2026-11-10，分支 feat/p1-5-inbox-view）
+
+- 读模型：新增 `lib/approvals.mjs`。待批项不另存一份——`GET /api/approvals` 返回带
+  writeIntent 且状态为 open / approved 的 Finding 的审批视图（id 与 findingId 同值），
+  字段含 bot、repo、type、title、summary、evidenceUrl、suggestedAction、writeIntent
+  全文（仓库由 repo 给出、正文与 PR 号在 writeIntent 里）、expiresAt、status。
+  读列表时惰性清理：open 且已过 expiresAt 的 Finding 自动转 expired 并退出列表。
+  `POST /api/approvals/:id/approve` 把 open 转 approved（已 approved 重复批准幂等返回；
+  已关闭状态回 409；无 writeIntent 回 400；不存在回 404），`reject` 转 rejected；
+  本切片批准只改状态，不执行任何对外写操作（网关在 P1-6 接入同一入口）。
+- 界面：左栏「待批收件箱」改为打开独立整页视图（`web/src/Inbox.tsx`，与设置同模式、
+  有返回路径），删除原底部展开面板与「雏形占位 / 后续迭代接入」等开发口吻文案。
+  空状态为「现在没有需要你批准的写操作。」；有数据时每条卡片展示类型徽标、证据链接、
+  建议、过期时间与「批准后将执行的写操作」参数块（仓库、PR 号、评论正文全文），
+  批准后的提示文案如实写明「写入会经网关执行（网关接入后生效），当前尚未向 GitHub
+  发送任何内容」，不声称已执行。左栏徽标计数改走同一列表。
+- 桌面隔离修复：`Desktop.tsx` 的例程与产物改为按当前选中 bot 的 botId 过滤
+  （此前是全量展示）——选中主 bot Piper 时不再出现仓库管家的「晨间仓库扫描」与日报，
+  选中仓库管家时只含它的例程与产物；空状态文案改为「该 bot 暂无例程/产物」。
+- 回归：脚本扩展至 56 项，`node scripts/regression.mjs` **56/56 通过**。其中第 23 项
+  按切片授权改口径：从「恒为空数组」改成「来自真实存储且结构合法」（数组元素带
+  findingId、writeIntent.kind=pr_comment、status ∈ open/approved；当前真实数据里
+  尚无带 writeIntent 的 Finding，列表为空仍合法）；新增 53-56：未登录 GET 401、
+  未登录 POST approve 401、不存在项批准/驳回均 404、例程与产物均带 botId。
+  同批复跑：eval:scan 5/5、test-schedule 12/12、`npm run check` 无错误、
+  `npm run build:web` 成功（bundle 含收件箱空状态文案）。
+- 如实说明：当前扫描（P1-2）产出的 Finding 不带 writeIntent（建议先用规则模板、
+  writeIntent 由 P1-6 的网关切片接上扫描模板），因此本切片交付时收件箱在真实数据
+  下为空列表——这是切片预期的合法状态，契约与界面均已就绪，P1-6 合入后即有数据。
+- 明确不做核对：未实现任何写仓库操作、未做网关判定；未改 `packages/`、未改 SSE
+  事件名、未重做视觉。截图（收件箱空状态、主 bot 右栏隔离）本环境做不了，以构建产物
+  文案断言 + 契约回归替代，留待用户本地目检。

@@ -94,6 +94,31 @@ export type Connector = {
 	tokenHint?: string;
 };
 
+// 待批项（GET /api/approvals 的线格式，P1-5）：带 writeIntent 的 Finding 的审批视图，
+// id 与 findingId 同值（Finding 是唯一事实源，不另存一份 approvals）。
+export type WriteIntent = {
+	kind: string;
+	prNumber: number;
+	body: string;
+};
+
+export type Approval = {
+	id: string;
+	findingId: string;
+	botId: string;
+	repo: string;
+	type: string;
+	title: string;
+	summary: string;
+	evidenceUrl: string;
+	suggestedAction: string;
+	writeIntent: WriteIntent;
+	status: string;
+	expiresAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+};
+
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
 export type HistoryEntry = {
 	ts?: string;

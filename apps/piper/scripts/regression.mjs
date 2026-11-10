@@ -200,8 +200,18 @@ async function main() {
 		);
 
 		// ---- 收件箱与记忆（23-25）----
+		// P1-5 起 approvals 改读真实存储（带 writeIntent 的 Finding 审批视图），断言改成
+		// 「结构合法」口径：是数组，且每条带 findingId / writeIntent / 合法 status，不再要求恒空。
 		const approvals = await req("/api/approvals");
-		check('GET /api/approvals 返回 {"approvals":[]}', approvals.status === 200 && Array.isArray(approvals.json?.approvals) && approvals.json.approvals.length === 0, `实际 ${approvals.status}`);
+		check(
+			"GET /api/approvals 来自真实存储且结构合法（数组；每条带 findingId、writeIntent 与 open/approved 状态）",
+			approvals.status === 200 &&
+				Array.isArray(approvals.json?.approvals) &&
+				(approvals.json?.approvals ?? []).every(
+					(a) => typeof a.findingId === "string" && a.writeIntent?.kind === "pr_comment" && ["open", "approved"].includes(a.status),
+				),
+			`实际 ${approvals.status} 条数=${approvals.json?.approvals?.length}`,
+		);
 
 		const memory = await req("/api/memory/repo-keeper");
 		check("GET /api/memory/repo-keeper 返回 markdown 字段", memory.status === 200 && typeof memory.json?.markdown === "string", `实际 ${memory.status}`);
@@ -231,6 +241,7 @@ async function main() {
 		await runFindingChecks({ req, check, anon });
 		await runScanFindingChecks({ req, check, run });
 		await runScheduleChecks({ req, check, anon });
+		await runApprovalChecks({ req, check, anon });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -584,6 +595,34 @@ async function runScheduleChecks({ req, check, anon }) {
 		"nextRunAt 落在未来 25 小时内（调度已规划，不是空文案）",
 		next > Date.now() - 60 * 1000 && next < Date.now() + 25 * 3600 * 1000,
 		`nextRunAt=${morning?.nextRunAt}`,
+	);
+}
+
+// P1-5（53-56）：待批收件箱独立视图的服务端契约——未登录读写均 401；对不存在的待批项
+// 批准/驳回返回 404（不假成功）；例程与产物都带 botId（桌面按 bot 隔离的数据前提）。
+// 批准/驳回的状态迁移与过期清理在 lib/approvals.mjs，由本组的结构断言 + P1-6 网关测试覆盖。
+async function runApprovalChecks({ req, check, anon }) {
+	const unauthGet = await anon("/api/approvals");
+	check("未登录 GET /api/approvals 返回 401", unauthGet.status === 401, `实际 ${unauthGet.status}`);
+
+	const unauthPost = await anon("/api/approvals/f-whatever/approve", { method: "POST", body: "{}" });
+	check("未登录 POST /api/approvals/:id/approve 返回 401", unauthPost.status === 401, `实际 ${unauthPost.status}`);
+
+	const approve404 = await req("/api/approvals/f-no-such-item/approve", { method: "POST", body: "{}" });
+	const reject404 = await req("/api/approvals/f-no-such-item/reject", { method: "POST", body: "{}" });
+	check(
+		"对不存在的待批项批准/驳回均返回 404（不假成功）",
+		approve404.status === 404 && reject404.status === 404,
+		`approve=${approve404.status} reject=${reject404.status}`,
+	);
+
+	const routines = await req("/api/routines");
+	const artifacts = await req("/api/artifacts");
+	check(
+		"例程与产物均带 botId 字段（桌面按当前 bot 隔离过滤的数据前提）",
+		(routines.json?.routines ?? []).every((r) => typeof r.botId === "string") &&
+			(artifacts.json?.artifacts ?? []).every((a) => "botId" in a),
+		`routines=${(routines.json?.routines ?? []).length} artifacts=${(artifacts.json?.artifacts ?? []).length}`,
 	);
 }
 

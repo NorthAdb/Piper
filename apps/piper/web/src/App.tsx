@@ -8,6 +8,7 @@ import { BotForm } from "./BotForm";
 import { BotList } from "./BotList";
 import { ChatPane } from "./ChatPane";
 import { Desktop } from "./Desktop";
+import { Inbox } from "./Inbox";
 import { Settings } from "./Settings";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -26,7 +27,7 @@ export function App() {
 	const [currentBotId, setCurrentBotId] = useState<string | null>(null);
 	const [busyBotIds, setBusyBotIds] = useState<ReadonlySet<string>>(new Set());
 	const [form, setForm] = useState<FormState>({ open: false, bot: null });
-	const [view, setView] = useState<"main" | "settings">("main");
+	const [view, setView] = useState<"main" | "settings" | "inbox">("main");
 	const [settingsTab, setSettingsTab] = useState("model");
 	const [token, setToken] = useState("");
 	const [loginErr, setLoginErr] = useState("");
@@ -122,6 +123,10 @@ export function App() {
 
 	const currentBot = bots.find((b) => b.id === currentBotId) ?? null;
 
+	if (view === "inbox") {
+		return <Inbox bots={bots} onBack={() => setView("main")} onUnauthorized={onUnauthorized} />;
+	}
+
 	if (view === "settings") {
 		return (
 			<Settings
@@ -147,6 +152,7 @@ export function App() {
 					onSelect={setCurrentBotId}
 					onNew={() => setForm({ open: true, bot: null })}
 					onEdit={(bot) => setForm({ open: true, bot })}
+					onOpenInbox={() => setView("inbox")}
 					onOpenSettings={() => {
 						setSettingsTab("model");
 						setView("settings");
