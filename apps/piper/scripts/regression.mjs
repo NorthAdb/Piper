@@ -348,6 +348,7 @@ async function main() {
 		await runAuditChecks({ req, check, anon });
 		await runSecurityChecks({ check, cookie });
 		await runTimezoneChecks({ req, check });
+		await runSecretsChecks({ req, check });
 	} finally {
 		proc.kill("SIGTERM");
 		cleanup();
@@ -827,6 +828,28 @@ async function runTimezoneChecks({ req, check }) {
 			body: JSON.stringify({ displayName: origProfile.displayName ?? "", timezone: origProfile.timezone ?? "" }),
 		});
 	}
+}
+
+// R7（67-69）：秘密面——短 Key（≤8 位）读回为固定掩码；模型测试接口只传 baseUrl
+// 回 400（不得把已保存 Key 发往请求体给定的地址）；baseUrl 非 http/https 回 400。
+// 本组在最后运行（会改动已保存的模型 Key），隔离临时目录随回归结束整体丢弃，无需还原。
+async function runSecretsChecks({ req, check }) {
+	const put = await req("/api/settings/model", { method: "PUT", body: JSON.stringify({ apiKey: "k1234567" }) });
+	const view = await req("/api/settings/model");
+	check(
+		"短 Key（8 位）保存后 GET /api/settings/model 的 apiKeyHint 为固定掩码（不含真实末位）",
+		put.status === 200 && view.json?.apiKeyHint === "••••••••",
+		`put=${put.status} hint=${JSON.stringify(view.json?.apiKeyHint)}`,
+	);
+
+	const onlyBase = await req("/api/settings/model/test", { method: "POST", body: JSON.stringify({ baseUrl: "http://127.0.0.1:9/v1" }) });
+	check("POST /api/settings/model/test 只传 baseUrl 返回 400（不外送已保存 Key）", onlyBase.status === 400, `实际 ${onlyBase.status}`);
+
+	const badProto = await req("/api/settings/model/test", {
+		method: "POST",
+		body: JSON.stringify({ baseUrl: "ftp://example.invalid/v1", apiKey: "sk-bad-1234567890" }),
+	});
+	check("POST /api/settings/model/test 非 http/https 的 baseUrl 返回 400", badProto.status === 400, `实际 ${badProto.status}`);
 }
 
 main().catch((err) => {

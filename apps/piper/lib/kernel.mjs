@@ -23,6 +23,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { readModelSettingsFile } from "./settings.mjs";
+import { redact } from "./redact.mjs";
 import { APP_DIR } from "./store.mjs";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
@@ -132,6 +133,16 @@ function textOf(message) {
 		.join("");
 }
 
+// 模型厂商错误的安全出口（R7）：厂商错误文本会回显请求里的 Key（实测 401 响应体
+// 原样带 Key），进会话 JSONL / SSE / 接口返回值之前只保留状态码 + 截断 200 字的
+// 脱敏文本，绝不把原文抛给上层。
+export function modelErrorMessage(raw) {
+	const text = String(raw ?? "");
+	const status = /\b([45]\d\d)\b/.exec(text)?.[1];
+	const clean = redact(text).slice(0, 200);
+	return status ? `模型调用失败（HTTP ${status}）：${clean}` : `模型调用失败：${clean}`;
+}
+
 // 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"tool",phase,name,detail}。
 // 返回最终助手文本。失败抛错（err.code 区分 BASE_NOT_BUILT / MODEL_ERROR 等），由路由层转 SSE error 事件。
 export async function streamChat({ systemPrompt, history = [], message, onEvent }) {
@@ -171,11 +182,13 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent 
 	});
 	try {
 		await agent.prompt(message);
+	} catch (err) {
+		throw Object.assign(new Error(modelErrorMessage(err?.message ?? err)), { code: "MODEL_ERROR" });
 	} finally {
 		unsubscribe();
 	}
 	if (agent.state?.errorMessage) {
-		throw Object.assign(new Error(`模型调用失败：${agent.state.errorMessage}`), { code: "MODEL_ERROR" });
+		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
 	}
 	return { text: finalText };
 }
@@ -199,11 +212,11 @@ export async function testModelConfig(overrides = {}) {
 			{ maxTokens: 8, signal: AbortSignal.timeout(15000) },
 		);
 		if (res?.stopReason === "error") {
-			return { ok: false, error: String(res.errorMessage || "模型返回错误").slice(0, 300) };
+			return { ok: false, error: redact(String(res.errorMessage || "模型返回错误")).slice(0, 300) };
 		}
 		return { ok: true };
 	} catch (err) {
-		return { ok: false, error: String(err?.message || err).slice(0, 300) };
+		return { ok: false, error: redact(String(err?.message || err)).slice(0, 300) };
 	}
 }
 

@@ -98,11 +98,12 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
 
 注（L0-2）：模型三项（端点、模型名、Key）可在设置页保存到 `data/settings-model.json`，
 **设置文件优先于环境变量**，保存即热生效、不必重启；环境变量只作文件缺失时的初值，
-不会被自动写进文件。设置读回只给是否已配置与 Key 末四位掩码（`GET /api/settings/model`）。
+不会被自动写进文件。设置读回只给是否已配置与 Key 掩码（`GET /api/settings/model`；
+掩码口径见 R7：长 Key 给末四位，≤8 位短 Key 给固定掩码）。
 
 注（L0-4）：GitHub 令牌同样可在设置页「连接器」组保存到 `data/settings-github.json`，
 文件优先于 `GITHUB_TOKEN` 环境变量；扫描经 `lib/settings.mjs` 的 `githubToken()` 统一读取
-（唯一的令牌入口），读回只给末四位掩码（`GET /api/settings/connectors`）。
+（唯一的令牌入口），读回只给掩码（`GET /api/settings/connectors`，口径同模型 Key）。
 
 ## Pi 接入
 
@@ -390,8 +391,8 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 设置存储：`lib/settings.mjs` 读写 `data/settings-model.json`（`git check-ignore` 实测命中
   `data/*` 规则，不可追踪）。`modelConfig()` 改为设置文件优先、环境变量兜底，每次现读，
   保存后下一次 prompt 即用新配置；环境变量里的秘密不被自动写入文件。
-- 接口：`GET /api/settings/model`（`{configured, baseUrl, modelId, apiKeyHint}`，hint 只有
-  `••••` + 末四位）、`PUT /api/settings/model`（部分字段单独更新；`apiKey:""` 清除）、
+- 接口：`GET /api/settings/model`（`{configured, baseUrl, modelId, apiKeyHint}`，hint 口径
+  见 R7 的 `secretHint`）、`PUT /api/settings/model`（部分字段单独更新；`apiKey:""` 清除）、
   `POST /api/settings/model/test`（候选配置打一次最小请求，15 秒超时，回 `{ok}` 或
   `{ok:false, error}`，不抛 5xx）。设置页「模型」组为真表单（端点、模型名、Key 密码框、
   测试连接、保存、清除 Key）；保存成功后顶栏「未配置模型」徽标随 `modelConfigured` 刷新。
@@ -935,3 +936,54 @@ APPROVED」改成锁定语义，并补上扫描前对账与网关规则前提复
   test-listen 6/6、test-badtz 4/4，`npm run check` 无错误、`npm run build:web` 成功。
 - 明确不做核对：未加新规则类型（仍只有 ci_failed / pr_needs_review）；
   未碰 R7 及以后；未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。
+
+### R7 秘密面收口实测（2026-11-11，分支 fix/r7-secrets-surface，堆叠在 R6 上）
+
+审计 M4 + M5 的收口：设置文件权限、统一脱敏、模型测试接口不外送已保存 Key、
+短 Key 掩码、厂商错误脱敏。先红后修（新增 `scripts/test-secrets.mjs` 与回归
+67–69 项，用例先行、实现未改时）：
+
+- 先红：`test-secrets` **3/21**——三份设置文件保存后权限均为 644（期望 600）；
+  `lib/redact.mjs` 不存在，全部 redact/containsSecret 用例无从谈起；
+  `secretHint` 不存在，短 Key 掩码用例红；`POST /api/settings/model/test`
+  只传 baseUrl 回 200 **且本地模型桩实收到 1 次请求**（已保存 Key 被发往请求体
+  给定的地址，P-HTTP-3 复现）；非 http/https 的 baseUrl 回 200；厂商桩以 401
+  响应体回显请求里的 Key 时，test 接口返回值、chat 的 SSE error、会话 JSONL
+  三处都原样含 Key 全文。回归 **66/69**——67：8 位短 Key 的 hint 是
+  `••••4567`（暴露一半）；68/69：test 接口两种非法请求都回 200。
+- 设置文件 0600：`lib/settings.mjs` 三个保存函数统一走 `writeSettingsFile`
+  （`writeFileSync` 带 `mode: 0o600` + 写后 `chmodSync(0600)` 收紧已存在文件），
+  覆盖 settings-model / settings-github / settings-profile。
+- 统一 `redact(text)`（新文件 `lib/redact.mjs`，全仓唯一脱敏出口）：
+  - 精确值层：每次调用时收集——设置文件现存的 GitHub 令牌与模型 Key、
+    环境变量（`GITHUB_TOKEN` / `PIPER_MODEL_API_KEY` / `OPENAI_API_KEY`）的值，
+    并把见过的值留在进程内集合里：**曾经保存过、后来被轮换掉的旧值在本进程
+    生命周期内仍会被脱敏**；进程重启后旧值靠前缀层兜底。
+  - 前缀模式层：`github_pat_`（≥20 字符）、`gh[pousr]_`（≥20 字符）、
+    `sk-` / `sk-proj-` / `sk-svcacct-`（≥12 字符），从未保存过的同形秘密也替换。
+  - 取值太短（<6 字符）的精确值不替换，避免误伤普通文本；本模块不写任何日志。
+  - 实现注记：redact 直接读设置文件而不 import settings.mjs——store/settings/
+    redact 三者互相引用，经 settings 读会在模块求值期形成循环 import 撞 TDZ
+    （实测 server 起不来），文件名与 settings.mjs 的定义保持一致。
+  - 应用点：审计摘要与 reason（`lib/audit.mjs`，替换掉原先只脱当前 GitHub
+    令牌的窄逻辑）、通知标题与正文（`lib/notify.mjs` 落盘单点）、产物标题与
+    正文（`store.saveArtifact`）、会话条目 text（`store.appendSession`）、SSE
+    error 与路由兜底 error（`server.mjs`）、模型厂商错误（`lib/kernel.mjs`）、
+    网关正文检查（`containsSecret`，不再只查当前令牌）。
+- 模型测试接口守卫（`server.mjs`）：请求体给了 `baseUrl` 就必须同时给
+  `apiKey`，缺一回 400，桩零请求；`baseUrl` 非 http/https 回 400。
+  baseUrl + apiKey 一起给时行为不变，且桩实收到的只有请求体给的 Key。
+- 短 Key 掩码：`secretHint()`（settings.mjs，全仓唯一实现，模型 hint 与连接器
+  tokenHint 共用）——≤8 位回固定掩码 `••••••••`，长秘密仍 `••••` + 末四位，
+  空秘密回空串。
+- 厂商错误只留状态码与脱敏文本：`kernel.modelErrorMessage()` 从错误文本里
+  提取 HTTP 状态码，消息形如「模型调用失败（HTTP 401）：<脱敏后截断 200 字>」；
+  `streamChat` 的抛错与 `state.errorMessage` 两条路径都过它；`testModelConfig`
+  的错误返回同样先 redact 再截断。实测桩 401 回显 Key 后，test 返回值、SSE、
+  会话 JSONL 三处均不含 Key，SSE 里能看到状态码与 `[REDACTED]`。
+- 改绿（本分支）：`test-secrets` **21/21**、回归 **69/69**（66 基线 + R7 新增
+  3 项）、`eval:scan` 18/18、test-findings 27/27、test-scan 10/10、
+  test-gateway 19/19、test-schedule 14/14、test-listen 6/6、test-badtz 4/4，
+  `npm run check` 无错误、`npm run build:web` 成功。
+- 明确不做核对：未做密钥加密存储 / 系统钥匙串；未做秘密轮换流程；未碰
+  R8 及以后；未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。

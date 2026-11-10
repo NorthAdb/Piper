@@ -2,9 +2,25 @@
 // 文件：apps/piper/data/settings-{model,profile,github}.json（data/ 已 gitignore，秘密不进 git）。
 // 语义：设置文件是配置的第一来源；模型文件不存在或字段缺失时，kernel 回退环境变量。
 // 本模块只负责读写文件——绝不把环境变量里的秘密自动写进文件。
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, ensureData, listBots } from "./store.mjs";
+
+// 设置文件含秘密（模型 Key、GitHub 令牌）：写盘权限钉死 0600（R7）。writeFileSync 的
+// mode 只对新建文件生效，已存在的文件靠随后的 chmodSync 收紧，两条都走。
+function writeSettingsFile(file, data) {
+	ensureData();
+	writeFileSync(file, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+	chmodSync(file, 0o600);
+}
+
+// 秘密读回掩码的唯一口径：≤8 位的短秘密回固定掩码——末四位掩码在短秘密上等于
+// 暴露大半（如 8 位 Key 暴露 4 位），不许回真实末位（R7）；长秘密仍给末四位便于辨认。
+export function secretHint(secret) {
+	if (!secret) return "";
+	if (secret.length <= 8) return "••••••••";
+	return `••••${secret.slice(-4)}`;
+}
 
 const MODEL_SETTINGS_FILE = join(DATA_DIR, "settings-model.json");
 
@@ -27,8 +43,7 @@ export function saveModelSettingsFile(patch) {
 		if (patch.apiKey) next.apiKey = String(patch.apiKey);
 		else delete next.apiKey;
 	}
-	ensureData();
-	writeFileSync(MODEL_SETTINGS_FILE, JSON.stringify(next, null, 2) + "\n", "utf8");
+	writeSettingsFile(MODEL_SETTINGS_FILE, next);
 	return next;
 }
 
@@ -92,8 +107,7 @@ export function saveProfileSettings(patch) {
 		}
 		next.timezone = tz || DEFAULT_TIMEZONE;
 	}
-	ensureData();
-	writeFileSync(PROFILE_SETTINGS_FILE, JSON.stringify(next, null, 2) + "\n", "utf8");
+	writeSettingsFile(PROFILE_SETTINGS_FILE, next);
 	return next;
 }
 
@@ -118,8 +132,7 @@ export function saveGithubSettingsFile(patch) {
 		if (patch.token) next.token = String(patch.token);
 		else delete next.token;
 	}
-	ensureData();
-	writeFileSync(GITHUB_SETTINGS_FILE, JSON.stringify(next, null, 2) + "\n", "utf8");
+	writeSettingsFile(GITHUB_SETTINGS_FILE, next);
 	return next;
 }
 
@@ -149,7 +162,7 @@ export function listConnectors() {
 			bots: githubBots.length ? githubBots : ["repo-keeper"],
 			access: "read",
 			configurable: true,
-			tokenHint: token ? `••••${token.slice(-4)}` : "",
+			tokenHint: token ? secretHint(token) : "",
 		},
 		{
 			id: "web",

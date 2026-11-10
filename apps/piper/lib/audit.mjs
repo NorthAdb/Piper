@@ -7,7 +7,7 @@
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, ensureData } from "./store.mjs";
-import { githubToken } from "./settings.mjs";
+import { redact } from "./redact.mjs";
 
 // executing（R1）：网关领取执行、真正发出评论之前先落一条，进程崩溃后能看到「发到一半」。
 // expired（R5）：扫描前对账把失效的 open/approved Finding 自动退役时落一条，
@@ -19,19 +19,18 @@ function auditFile() {
 }
 
 // 意图摘要：正文只留长度与前 120 字符预览（收件箱里有全文，审计是追责用的摘要）。
-// 脱敏是硬要求：正文若含当前 GitHub 令牌（正是网关 secret_in_body 要拦的情形），
-// 预览里先把令牌替换掉再落盘——审计文件本身绝不能成为秘密的第二个落点。
+// 脱敏是硬要求：预览先经统一 redact（lib/redact.mjs，覆盖当前/历史令牌、模型 Key 与
+// 前缀模式）再落盘——审计文件本身绝不能成为秘密的第二个落点。R7 前这里只替换当前
+// GitHub 令牌，旧令牌与模型 Key 都漏（审计 M4）。
 export function summarizeIntent(intent) {
 	if (!intent || typeof intent !== "object") return null;
 	const rawBody = typeof intent.body === "string" ? intent.body : "";
-	const token = githubToken();
-	const body = token && rawBody.includes(token) ? rawBody.split(token).join("[REDACTED]") : rawBody;
 	return {
 		kind: intent.kind ?? null,
 		repo: intent.repo ?? null,
 		prNumber: intent.prNumber ?? null,
 		bodyLength: rawBody.length,
-		bodyPreview: body.slice(0, 120),
+		bodyPreview: redact(rawBody).slice(0, 120),
 	};
 }
 
@@ -43,7 +42,8 @@ export function appendAudit({ botId = null, intent = null, result, reason = null
 		botId,
 		intent: summarizeIntent(intent),
 		result,
-		reason,
+		// reason 常含外部错误原文（如 GitHub/模型厂商回显），落盘前统一脱敏（R7）。
+		reason: typeof reason === "string" ? redact(reason) : reason,
 		findingId,
 		approvalId,
 		commentUrl,

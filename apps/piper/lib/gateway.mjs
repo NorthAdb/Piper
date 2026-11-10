@@ -13,7 +13,8 @@
 //   5. Finding 已被批准（status=approved）——未经批准的直调一律拒绝；已在 executing
 //      说明有另一路正在执行，拒绝防并发双发；
 //   6. Finding 未过期（过期则顺手转 expired）；
-//   7. 评论正文不含当前 GitHub 令牌（发送前防秘密外泄）；
+//   7. 评论正文不含任何已知秘密或令牌形状（统一 redact 口径：当前/历史令牌、
+//      模型 Key、前缀模式，见 lib/redact.mjs；R7 前只查当前 GitHub 令牌）；
 //   8. 有令牌（无令牌 failed/no_token，明确失败不假成功）。
 // 领取与执行（领取 = approved→executing 的同步段，单进程内即互斥）：
 //   - 领取后先写一条审计 executing，再做网络调用——进程崩溃后能看到「发到一半」；
@@ -27,6 +28,7 @@
 //   - 任一网络步失败：Finding 从 executing 退回 approved、写审计 failed，错误可见可重试。
 // 凭证只经 lib/settings.mjs 的 githubToken() 读取，本文件不直读环境变量与设置文件。
 import { githubToken } from "./settings.mjs";
+import { containsSecret } from "./redact.mjs";
 import { getBot } from "./store.mjs";
 import { getFinding, updateFinding } from "./findings.mjs";
 import { appendAudit } from "./audit.mjs";
@@ -97,7 +99,7 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 	}
 
 	const token = githubToken();
-	if (token && typeof snapshot.body === "string" && snapshot.body.includes(token)) return denied("secret_in_body");
+	if (typeof snapshot.body === "string" && containsSecret(snapshot.body)) return denied("secret_in_body");
 	if (!token) return failed("no_token");
 
 	// 领取执行：读—判—写在本同步段内完成（上面的 getFinding 与这里的 updateFinding

@@ -9,6 +9,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { redact } from "./redact.mjs";
 
 export const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 // 数据目录：缺省 apps/piper/data；可用 PIPER_DATA_DIR 覆盖（相对路径按进程 cwd 解析）。
@@ -197,7 +198,10 @@ function sessionFile(botId) {
 
 export function appendSession(botId, entry) {
 	ensureDir(join(DATA_DIR, "sessions"));
-	appendFileSync(sessionFile(botId), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n", "utf8");
+	// 会话 JSONL 是秘密禁入面（切片共同约束）：text 落盘前统一脱敏（R7），厂商错误
+	// 回显 Key、用户误粘贴的令牌都不进流水。draft 等结构化字段不走文本脱敏。
+	const safe = typeof entry?.text === "string" ? { ...entry, text: redact(entry.text) } : entry;
+	appendFileSync(sessionFile(botId), JSON.stringify({ ts: new Date().toISOString(), ...safe }) + "\n", "utf8");
 }
 
 export function readSession(botId) {
@@ -237,8 +241,9 @@ export function saveArtifact({ botId, kind, title, body }) {
 	ensureDir(join(DATA_DIR, "artifacts"));
 	const ts = new Date();
 	const id = `${ts.toISOString().slice(0, 10)}-${kind}-${ts.getTime().toString(36)}`;
-	const meta = { id, botId, kind, title, createdAt: ts.toISOString() };
-	writeFileSync(join(DATA_DIR, "artifacts", `${id}.md`), `<!-- piper-artifact ${JSON.stringify(meta)} -->\n${body}`, "utf8");
+	// 产物正文拼外部数据（GitHub 响应、错误原文等），落盘前统一脱敏（R7）。
+	const meta = { id, botId, kind, title: redact(String(title ?? "")), createdAt: ts.toISOString() };
+	writeFileSync(join(DATA_DIR, "artifacts", `${id}.md`), `<!-- piper-artifact ${JSON.stringify(meta)} -->\n${redact(String(body ?? ""))}`, "utf8");
 	return meta;
 }
 

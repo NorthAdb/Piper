@@ -75,7 +75,8 @@ readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
+import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, secretHint} from "./lib/settings.mjs";
+import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
@@ -176,7 +177,7 @@ return {
 configured: cfg.configured,
 baseUrl: cfg.baseUrl,
 modelId: cfg.modelId,
-apiKeyHint: cfg.apiKey? `••••${cfg.apiKey.slice(-4)}`: "",
+apiKeyHint: secretHint(cfg.apiKey),
 };
 }
 
@@ -218,8 +219,11 @@ else if (e.type === "tool") emit("tool", { phase: e.phase, name: e.name, detail:
 });
 appendSession(bot.id, { role: "assistant", text, sessionId});
 } catch (err) {
-appendSession(bot.id, { role: "system", kind: "error", text: err.message, code: err.code?? "ERROR"});
-emit("error", { code: err.code?? "ERROR", message: err.message});
+// 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
+// 这里是其余错误路径的兜底出口。
+const safeMessage = redact(String(err?.message?? err)).slice(0, 300);
+appendSession(bot.id, { role: "system", kind: "error", text: safeMessage, code: err.code?? "ERROR"});
+emit("error", { code: err.code?? "ERROR", message: safeMessage});
 }
 emit("done", { botId: bot.id});
 res.end();
@@ -341,10 +345,16 @@ return sendJson(res, 200, modelSettingsView());
 }
 if (path === "/api/settings/model/test" && req.method === "POST") {
 const body = await readBody(req);
+const hasBaseUrl = typeof body.baseUrl === "string" && Boolean(body.baseUrl);
+const hasApiKey = typeof body.apiKey === "string" && Boolean(body.apiKey);
+// R7：请求体给了 baseUrl 就必须同时给 apiKey——否则会把已保存的 Key 发往请求体
+// 指定的地址，等于一个现成的 Key 外送口。baseUrl 本身也只许 http/https。
+if (hasBaseUrl && !hasApiKey) return sendJson(res, 400, { error: "指定 baseUrl 时必须同时提供 apiKey（不会把已保存的 Key 发往请求体给定的地址）"});
+if (hasBaseUrl && !/^https?:\/\//i.test(body.baseUrl.trim())) return sendJson(res, 400, { error: "baseUrl 必须是 http/https 地址"});
 const overrides = {};
-if (typeof body.baseUrl === "string" && body.baseUrl) overrides.baseUrl = body.baseUrl;
+if (hasBaseUrl) overrides.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string" && body.modelId) overrides.modelId = body.modelId;
-if (typeof body.apiKey === "string" && body.apiKey) overrides.apiKey = body.apiKey;
+if (hasApiKey) overrides.apiKey = body.apiKey;
 return sendJson(res, 200, await testModelConfig(overrides));
 }
 if (path === "/api/settings/connectors" && req.method === "GET") return sendJson(res, 200, { connectors: listConnectors()});
@@ -463,7 +473,7 @@ const types = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": 
 res.writeHead(200, { "Content-Type": types[extname(file)] || "application/octet-stream"});
 return res.end(readFileSync(file));
 } catch (err) {
-return sendJson(res, err.status || 500, { error: err.message});
+return sendJson(res, err.status || 500, { error: redact(String(err?.message?? err))});
 }
 });
 
