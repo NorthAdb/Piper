@@ -33,8 +33,9 @@
 // GET /api/settings/model 模型设置读回（configured/baseUrl/modelId/apiKeyHint，绝无 Key 全文）
 // PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除），保存即热生效
 // POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
-// GET /api/settings/profile 基础资料读回（displayName/timezone，时区缺省 Asia/Hong_Kong）
-// PUT /api/settings/profile 保存基础资料（部分字段可单独更新）
+// GET /api/settings/profile 基础资料读回（displayName/timezone，时区缺省 Asia/Hong_Kong；
+//   存量文件里的非法时区回落缺省并在日志提示一次，不把坏值交给调度层）
+// PUT /api/settings/profile 保存基础资料（部分字段可单独更新；时区非法回 400 且文件不变，R3）
 // PUT /api/about-me 写入账号级「关于我」（需登录；与 GET 同源一份 about-me.md；超 20000 字符回 413，原文件不动）
 // GET /api/settings/connectors 连接器列表（统一形状；GitHub 带 tokenHint 末四位掩码，绝无令牌全文）
 // PUT /api/settings/connectors/github 保存 GitHub 令牌（token 传空串清除），保存即被 scan 使用
@@ -97,6 +98,12 @@ if (USING_DEFAULT_TOKEN && !isLoopbackHost(HOST)) {
 console.error(`拒绝启动：未设置 PIPER_TOKEN 时使用默认口令，只允许回环监听（127.0.0.1），但 PIPER_HOST=${HOST}。请先设置 PIPER_TOKEN 环境变量再放开监听地址。`);
 process.exit(1);
 }
+
+// 常驻进程底线（R3）：未处理的 Promise 拒绝只记日志、不退出——调度 tick、扫描等
+// 后台路径的一次异常不该把整个服务带走。同步异常仍走各路径自己的 try/catch。
+process.on("unhandledRejection", (err) => {
+console.error(`[piper] unhandledRejection（已记录，进程继续运行）：${err?.stack ?? err}`);
+});
 
 // 登录限速（R2）：同一来源连续错口令超过 10 次后锁定 60 秒，锁定期间一律 429；
 // 登录成功清零计数。来源以 TCP 对端地址计（单用户单进程，内存态即可）。
@@ -280,6 +287,11 @@ return result.skipped? "skipped": result.failed? "failed": "ok";
 getRoutineState: () => morningRoutine()?? {},
 timezoneFn: () => profileTimezone(),
 timeFn: () => parseScheduleTime(morningRoutine()?.schedule)?? parseScheduleTime("08:00"),
+// 调度自身异常（如时区换算失败）不杀进程：记日志并落一条 routine.failed 通知（R3）。
+onError: (err) => {
+console.error(`[piper] 调度 tick 异常（已拦截，进程继续运行）：${err?.stack ?? err}`);
+addNotification({ type: "routine.failed", title: "晨间仓库扫描调度异常", body: String(err?.message?? err), routineId: "morning-scan"});
+},
 });
 
 const server = createServer(async (req, res) => {

@@ -719,3 +719,37 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   未碰 R3 的时区保存校验与调度防崩、未碰 R4 测试隔离、未碰 R5 及以后；返工稿
   建议随 R2 一并做的 R7「测试接口不外送已保存 Key」未在本 PR 做（保持单一
   主题），留 R7 处理。未改 `packages/`；未改 SSE 事件名。
+
+### R3 时区校验与调度防崩实测（2026-11-10，分支 fix/r3-timezone-scheduler，堆叠在 R2 上）
+
+审计 B3 的收口：一个时区错别字不再能让常驻进程「启动即崩且界面里修不好」。先红
+后修（用例先行，红输出留档在仓库外 `~/workspace/piper-r3-red.log`，PR 描述摘录）：
+
+- 先红（未改实现时）：新脚本 `test-badtz` **0/4**——把 `settings-profile.json` 的
+  时区手改成 `Foo/Bar` 后启动，进程 exit=1，栈为启动 tick 里
+  `RangeError: Invalid time zone specified: Foo/Bar`（与审计 `logs/15-bad-tz-restart.log`
+  一致）；回归新增 R3 组后 **64/66**——`PUT /api/settings/profile {"timezone":
+  "Foo/Bar"}` 回 200 且坏值真落盘（64/65 红），合法时区保存的守卫项 66 绿；
+  `test-schedule` 新增 2 条后 **12/14**——`timezoneFn` 抛错时 `tick` 直接把异常抛给
+  调用方（server 侧是 `void tick(...)`，即 unhandledRejection 杀进程的路径）。
+- 保存校验（`lib/settings.mjs`）：新增 `isValidTimezone`（以 `Intl.DateTimeFormat`
+  试构造为准）；`saveProfileSettings` 对非空时区先校验，非法抛 400 且不写文件。
+  `readProfileSettings` 对存量文件里的非法时区回落缺省 `Asia/Hong_Kong` 并按坏值
+  去重、只在日志提示一次（文件不改写，设置页保存一次即可修好）。
+- 调度防崩（`lib/schedule.mjs` + `server.mjs`）：`createScheduler` 的 `tick` 整体
+  包一层 try/catch——规划/推进阶段抛错时复位 `running`、经新增 `onError` 钩子通知
+  并返回 `{action:"error"}`，绝不抛给调用方；server 侧钩子记日志并落一条
+  `routine.failed` 通知。`server.mjs` 另加 `process.on("unhandledRejection")`，
+  只记日志不退出，作为常驻进程的底线兜底。
+- 前端（`SettingsProfile.tsx`）：时区从 7 项 datalist 改为全量 IANA 下拉
+  （`Intl.supportedValuesOf("timeZone")`，shadcn Select），另保留手动输入框
+  （填了优先）；提交前先校验，非法时给出提示且不调用保存接口。不在下拉列表里
+  的存量值会进手动输入框，让用户看得见、改得掉。
+- 改绿（本分支）：回归 **66/66**（63 基线 + R3 组 3 项，只增不减）；`test-schedule`
+  **14/14**（12 基线 + 2：tick 不抛 + onError 一次、无 onError 亦不抛；恢复后调度
+  未楔死、到点真正执行）；`test-badtz` **4/4**（坏文件启动存活、日志含回落提示、
+  `/api/schedule/status` 回缺省时区、从设置接口 PUT 合法时区后调度状态随之更新）；
+  同批复跑 test-findings 27/27、test-gateway 18/18、test-scan 5/5、test-listen 6/6、
+  eval:scan 5/5，`npm run check` 无错误、`npm run build:web` 成功。
+- 明确不做核对：未做每 bot 独立时区；未引入调度库；未碰 R4 测试隔离、未碰 R5
+  及以后；未改 `packages/`；未改 SSE 事件名。

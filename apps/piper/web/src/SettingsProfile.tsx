@@ -9,13 +9,34 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 
-const COMMON_TIMEZONES = ["Asia/Hong_Kong", "Asia/Shanghai", "Asia/Tokyo", "Asia/Singapore", "UTC", "Europe/London", "America/New_York"];
+const FALLBACK_TIMEZONES = ["Asia/Hong_Kong", "Asia/Shanghai", "Asia/Tokyo", "Asia/Singapore", "UTC", "Europe/London", "America/New_York"];
+
+// 时区下拉给全量 IANA 列表（R3）：避免用户手打错别字把非法时区存进设置、进而让
+// 调度在启动时崩溃。仍保留手动输入（填了优先），但提交前先在前端校验一次。
+const ALL_TIMEZONES: string[] = (() => {
+	try {
+		return Intl.supportedValuesOf("timeZone");
+	} catch {
+		return FALLBACK_TIMEZONES;
+	}
+})();
+
+function isValidTimezone(value: string): boolean {
+	try {
+		new Intl.DateTimeFormat(undefined, { timeZone: value });
+		return true;
+	} catch {
+		return false;
+	}
+}
 
 export function ProfileSettingsForm({ onUnauthorized }: { onUnauthorized: () => void }) {
 	const [displayName, setDisplayName] = useState("");
 	const [timezone, setTimezone] = useState("Asia/Hong_Kong");
+	const [customTimezone, setCustomTimezone] = useState("");
 	const [aboutMe, setAboutMe] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [notice, setNotice] = useState("");
@@ -24,7 +45,15 @@ export function ProfileSettingsForm({ onUnauthorized }: { onUnauthorized: () => 
 		Promise.all([getProfileSettings(), getAboutMe()])
 			.then(([profile, markdown]) => {
 				setDisplayName(profile.displayName);
-				setTimezone(profile.timezone);
+				if (ALL_TIMEZONES.includes(profile.timezone)) {
+					setTimezone(profile.timezone);
+					setCustomTimezone("");
+				} else {
+					// 不在下拉列表里的存量值（含手改文件写坏的值）放进手动输入框，
+					// 让用户看得见、改得掉，而不是被悄悄替换。
+					setTimezone("Asia/Hong_Kong");
+					setCustomTimezone(profile.timezone);
+				}
 				setAboutMe(markdown);
 			})
 			.catch((e) => {
@@ -34,10 +63,15 @@ export function ProfileSettingsForm({ onUnauthorized }: { onUnauthorized: () => 
 
 	const onSave = async (e: FormEvent) => {
 		e.preventDefault();
+		const effectiveTimezone = customTimezone.trim() || timezone;
+		if (!isValidTimezone(effectiveTimezone)) {
+			setNotice(`保存失败：时区「${effectiveTimezone}」不是合法的 IANA 时区名，请从下拉中选择或检查拼写。未保存任何内容。`);
+			return;
+		}
 		setBusy(true);
 		setNotice("");
 		try {
-			await saveProfileSettings({ displayName: displayName.trim(), timezone: timezone.trim() });
+			await saveProfileSettings({ displayName: displayName.trim(), timezone: effectiveTimezone });
 			const saved = await saveAboutMe(aboutMe);
 			setAboutMe(saved);
 			setNotice("已保存。新的「关于我」会注入下一轮对话。");
@@ -65,12 +99,25 @@ export function ProfileSettingsForm({ onUnauthorized }: { onUnauthorized: () => 
 					</div>
 					<div className="flex flex-col gap-2">
 						<Label htmlFor="profile-timezone">时区</Label>
-						<Input id="profile-timezone" list="piper-timezones" value={timezone} onChange={(e) => setTimezone(e.target.value)} />
-						<datalist id="piper-timezones">
-							{COMMON_TIMEZONES.map((tz) => (
-								<option key={tz} value={tz} />
-							))}
-						</datalist>
+						<Select value={timezone} onValueChange={setTimezone}>
+							<SelectTrigger id="profile-timezone" className="w-full">
+								<SelectValue placeholder="选择时区" />
+							</SelectTrigger>
+							<SelectContent>
+								{ALL_TIMEZONES.map((tz) => (
+									<SelectItem key={tz} value={tz}>
+										{tz}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+						<Input
+							id="profile-timezone-custom"
+							placeholder="或手动输入 IANA 时区（如 Asia/Hong_Kong），填了优先于下拉"
+							value={customTimezone}
+							onChange={(e) => setCustomTimezone(e.target.value)}
+						/>
+						<p className="text-xs text-muted-foreground">手动输入的时区会在提交前校验，非法时区不会被保存。</p>
 					</div>
 					<div className="flex flex-col gap-2">
 						<Label htmlFor="profile-about-me">关于我（about-me.md）</Label>

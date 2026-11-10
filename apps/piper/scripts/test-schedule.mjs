@@ -227,6 +227,62 @@ check(
 	);
 }
 
+// ---- R3：timezoneFn 抛错时 tick 不抛（外层 try/catch + onError 失败通知钩子） ----
+{
+	let broken = true;
+	let calls = 0;
+	const errors = [];
+	const state = { lastRunAt: null, lastStatus: null };
+	const sched = createScheduler({
+		run: async () => {
+			calls += 1;
+			return "ok";
+		},
+		getRoutineState: () => state,
+		timezoneFn: () => {
+			if (broken) throw new Error("Invalid time zone specified: Foo/Bar");
+			return TZ;
+		},
+		timeFn: () => TIME,
+		onError: (err) => errors.push(err),
+	});
+	let threw = false;
+	let res = null;
+	try {
+		res = await sched.tick(T_0800);
+	} catch {
+		threw = true;
+	}
+	// 不带 onError 的调度器同样不得把异常抛给调用方（server 是 void tick(...)）。
+	const schedBare = createScheduler({
+		run: async () => "ok",
+		getRoutineState: () => state,
+		timezoneFn: () => {
+			throw new Error("Invalid time zone specified: Foo/Bar");
+		},
+		timeFn: () => TIME,
+	});
+	let threwBare = false;
+	try {
+		await schedBare.tick(T_0800);
+	} catch {
+		threwBare = true;
+	}
+	check(
+		"R3 timezoneFn 抛错：tick 不抛、返回 error 结果、onError 收到一次通知（无 onError 亦不抛）",
+		!threw && res?.action === "error" && errors.length === 1 && !threwBare && calls === 0,
+		`threw=${threw} res=${JSON.stringify(res)} errors=${errors.length} threwBare=${threwBare} calls=${calls}`,
+	);
+
+	broken = false;
+	const after = await sched.tick(T_0800);
+	check(
+		"R3 timezoneFn 恢复后调度器未楔死：running 已复位，到点能真正执行",
+		after.action === "ran" && after.result === "ok" && calls === 1 && errors.length === 1,
+		`after=${JSON.stringify(after)} calls=${calls}`,
+	);
+}
+
 // ---- 状态端点形状 ----
 {
 	const state = { lastRunAt: "2026-11-10T00:01:00.000Z", lastStatus: "ok" };

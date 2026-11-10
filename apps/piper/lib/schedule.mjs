@@ -109,7 +109,11 @@ export function shouldCatchUp({ now, timeZone, time, lastRunAt, lastStatus }) {
 // 不计成败、不推进计划，等下一次 tick）；抛错按 "failed" 处理。
 // getRoutineState() 返回存储中的例程状态（{ lastRunAt, lastStatus }），供启动补跑与状态端点。
 // timezoneFn / timeFn 每次规划时现读，使设置变更无需重启即生效。
-export function createScheduler({ run, getRoutineState, timezoneFn, timeFn, retryDelaysMs = RETRY_DELAYS_MS }) {
+// 防崩（审计 B3）：tick 整体包一层 try/catch——规划阶段（时区换算等）或状态推进抛错时
+// 不把异常抛给调用方（server 用 void tick(...) 驱动，抛出去就是 unhandledRejection 杀
+// 进程），改为复位 running、经 onError 钩子通知（server 侧落 routine.failed 通知）并
+// 返回 { action: "error" }，调度器保持可用。
+export function createScheduler({ run, getRoutineState, timezoneFn, timeFn, retryDelaysMs = RETRY_DELAYS_MS, onError = null }) {
 	let running = false;
 	let attempts = 0;
 	let nextDueAt = null;
@@ -127,6 +131,22 @@ export function createScheduler({ run, getRoutineState, timezoneFn, timeFn, retr
 	}
 
 	async function tick(now = new Date()) {
+		try {
+			return await tickInner(now);
+		} catch (err) {
+			running = false;
+			if (onError) {
+				try {
+					onError(err);
+				} catch {
+					/* 通知钩子自身失败不得再拖垮调度 */
+				}
+			}
+			return { action: "error", error: String(err?.message ?? err) };
+		}
+	}
+
+	async function tickInner(now) {
 		if (running) return { action: "busy" };
 		if (!nextDueAt) plan(now);
 		const dueAt = nextRetryAt ?? nextDueAt;

@@ -37,6 +37,20 @@ export function saveModelSettingsFile(patch) {
 const PROFILE_SETTINGS_FILE = join(DATA_DIR, "settings-profile.json");
 export const DEFAULT_TIMEZONE = "Asia/Hong_Kong";
 
+// IANA 时区合法性：以 Intl 试构造为准（与 lib/schedule.mjs 的实际用法同一判据）。
+export function isValidTimezone(timezone) {
+	if (typeof timezone !== "string" || !timezone) return false;
+	try {
+		new Intl.DateTimeFormat(undefined, { timeZone: timezone });
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// 手改文件写入的非法时区只提示一次（按坏值去重），避免每次读设置都刷日志。
+const warnedBadTimezones = new Set();
+
 export function readProfileSettings() {
 	let saved = {};
 	if (existsSync(PROFILE_SETTINGS_FILE)) {
@@ -47,17 +61,37 @@ export function readProfileSettings() {
 			saved = {};
 		}
 	}
+	// 存量文件里的时区若非法（多为手改文件打错字），回落缺省而不是把坏值交给调度层——
+	// 坏时区曾让调度在启动 tick 阶段抛 RangeError、整进程退出（审计 B3）。回落只影响
+	// 读回与调度，文件本身不改写，用户在设置页保存一次即可修好。
+	let timezone = typeof saved.timezone === "string" && saved.timezone ? saved.timezone : DEFAULT_TIMEZONE;
+	if (!isValidTimezone(timezone)) {
+		if (!warnedBadTimezones.has(timezone)) {
+			warnedBadTimezones.add(timezone);
+			console.warn(`[piper] settings-profile.json 的时区 "${timezone}" 不是合法 IANA 时区，已回落缺省时区 ${DEFAULT_TIMEZONE}，请在设置页修正。`);
+		}
+		timezone = DEFAULT_TIMEZONE;
+	}
 	return {
 		displayName: typeof saved.displayName === "string" ? saved.displayName : "",
-		timezone: typeof saved.timezone === "string" && saved.timezone ? saved.timezone : DEFAULT_TIMEZONE,
+		timezone,
 	};
 }
 
-// 部分更新：字段出现才改。时区传空串视为恢复缺省。
+// 部分更新：字段出现才改。时区传空串视为恢复缺省；非空时区必须合法，非法抛 400
+// 且不写文件——错别字不能落盘，更不能让常驻进程下次启动时崩在坏时区上（审计 B3）。
 export function saveProfileSettings(patch) {
 	const next = { ...readProfileSettings() };
 	if (patch.displayName !== undefined) next.displayName = String(patch.displayName).trim().slice(0, 40);
-	if (patch.timezone !== undefined) next.timezone = String(patch.timezone).trim() || DEFAULT_TIMEZONE;
+	if (patch.timezone !== undefined) {
+		const tz = String(patch.timezone).trim();
+		if (tz && !isValidTimezone(tz)) {
+			const err = new Error(`时区无效："${tz}" 不是合法的 IANA 时区名，未保存`);
+			err.status = 400;
+			throw err;
+		}
+		next.timezone = tz || DEFAULT_TIMEZONE;
+	}
 	ensureData();
 	writeFileSync(PROFILE_SETTINGS_FILE, JSON.stringify(next, null, 2) + "\n", "utf8");
 	return next;

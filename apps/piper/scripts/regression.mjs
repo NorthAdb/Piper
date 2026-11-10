@@ -249,6 +249,7 @@ async function main() {
 		await runApprovalChecks({ req, check, anon });
 		await runAuditChecks({ req, check, anon });
 		await runSecurityChecks({ check, cookie });
+		await runTimezoneChecks({ req, check });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -697,6 +698,40 @@ async function runSecurityChecks({ check, cookie }) {
 		statuses.slice(0, 11).every((s) => s === 401) && statuses[11] === 429,
 		`实际 ${statuses.join(",")}`,
 	);
+}
+
+// R3（64-66）：时区保存校验——非法 IANA 时区回 400 且 settings-profile.json 字节不变；
+// 合法时区仍可正常保存（校验不误杀）。运行前快照 profile 与文件字节，结束时还原。
+async function runTimezoneChecks({ req, check }) {
+	const { existsSync, readFileSync } = await import("node:fs");
+	const profileFile = join(APP_DIR, "data", "settings-profile.json");
+	const origProfile = (await req("/api/settings/profile")).json ?? {};
+	const origBytes = existsSync(profileFile) ? readFileSync(profileFile, "utf8") : null;
+	try {
+		const bad = await req("/api/settings/profile", { method: "PUT", body: JSON.stringify({ timezone: "Foo/Bar" }) });
+		check("PUT /api/settings/profile 非法时区 Foo/Bar 返回 400", bad.status === 400, `实际 ${bad.status}`);
+
+		const afterBad = await req("/api/settings/profile");
+		const afterBytes = existsSync(profileFile) ? readFileSync(profileFile, "utf8") : null;
+		check(
+			"非法时区被拒后 profile 读回与 settings-profile.json 文件字节均不变",
+			afterBad.json?.timezone === (origProfile.timezone ?? "Asia/Hong_Kong") && afterBytes === origBytes,
+			`读回=${JSON.stringify(afterBad.json)} 文件一致=${afterBytes === origBytes}`,
+		);
+
+		const good = await req("/api/settings/profile", { method: "PUT", body: JSON.stringify({ timezone: "Asia/Singapore" }) });
+		const readGood = await req("/api/settings/profile");
+		check(
+			"合法时区 Asia/Singapore 仍可保存（200）并读回一致",
+			good.status === 200 && readGood.json?.timezone === "Asia/Singapore",
+			`put=${good.status} 读回=${JSON.stringify(readGood.json)}`,
+		);
+	} finally {
+		await req("/api/settings/profile", {
+			method: "PUT",
+			body: JSON.stringify({ displayName: origProfile.displayName ?? "", timezone: origProfile.timezone ?? "" }),
+		});
+	}
 }
 
 main().catch((err) => {
