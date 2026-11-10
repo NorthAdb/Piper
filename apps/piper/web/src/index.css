@@ -1,0 +1,241 @@
+/* Piper 设计系统入口（Tailwind v4 + shadcn 主题变量）。
+   单主题应用：深色 bot 控制台。主题变量直接定义在 :root（html 带 .dark 类，
+   以便 dark: 变体与 Radix 组件按深色工作），颜色用 oklch，规范见 README「设计系统」节。 */
+@import "tailwindcss";
+@import "tw-animate-css";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+	--radius: 0.625rem;
+
+	/* 基础面与文字（zinc 系深灰，带极轻蓝灰色相） */
+	--background: oklch(0.135 0.006 264);
+	--foreground: oklch(0.955 0.004 264);
+	--card: oklch(0.178 0.007 264);
+	--card-foreground: oklch(0.955 0.004 264);
+	--popover: oklch(0.195 0.008 264);
+	--popover-foreground: oklch(0.955 0.004 264);
+
+	/* 主色：信号靛蓝（按钮、选中态、焦点环） */
+	--primary: oklch(0.655 0.165 276);
+	--primary-foreground: oklch(0.985 0.004 276);
+
+	--secondary: oklch(0.245 0.008 264);
+	--secondary-foreground: oklch(0.955 0.004 264);
+	--muted: oklch(0.225 0.007 264);
+	--muted-foreground: oklch(0.685 0.012 264);
+	--accent: oklch(0.265 0.01 264);
+	--accent-foreground: oklch(0.97 0.004 264);
+
+	/* 语义色：destructive 用规范红，成功/运行中在组件里用 emerald/amber 色阶 */
+	--destructive: oklch(0.63 0.21 25);
+
+	--border: oklch(1 0 0 / 9%);
+	--input: oklch(1 0 0 / 13%);
+	--ring: oklch(0.56 0.14 276);
+
+	--chart-1: oklch(0.655 0.165 276);
+	--chart-2: oklch(0.7 0.14 185);
+	--chart-3: oklch(0.75 0.13 85);
+	--chart-4: oklch(0.65 0.18 330);
+	--chart-5: oklch(0.68 0.16 40);
+
+	/* 侧栏（左 bot 列表 / 右桌面） */
+	--sidebar: oklch(0.158 0.006 264);
+	--sidebar-foreground: oklch(0.955 0.004 264);
+	--sidebar-primary: oklch(0.655 0.165 276);
+	--sidebar-primary-foreground: oklch(0.985 0.004 276);
+	--sidebar-accent: oklch(0.235 0.008 264);
+	--sidebar-accent-foreground: oklch(0.97 0.004 264);
+	--sidebar-border: oklch(1 0 0 / 8%);
+	--sidebar-ring: oklch(0.56 0.14 276);
+}
+
+@theme inline {
+	--color-background: var(--background);
+	--color-foreground: var(--foreground);
+	--color-card: var(--card);
+	--color-card-foreground: var(--card-foreground);
+	--color-popover: var(--popover);
+	--color-popover-foreground: var(--popover-foreground);
+	--color-primary: var(--primary);
+	--color-primary-foreground: var(--primary-foreground);
+	--color-secondary: var(--secondary);
+	--color-secondary-foreground: var(--secondary-foreground);
+	--color-muted: var(--muted);
+	--color-muted-foreground: var(--muted-foreground);
+	--color-accent: var(--accent);
+	--color-accent-foreground: var(--accent-foreground);
+	--color-destructive: var(--destructive);
+	--color-border: var(--border);
+	--color-input: var(--input);
+	--color-ring: var(--ring);
+	--color-chart-1: var(--chart-1);
+	--color-chart-2: var(--chart-2);
+	--color-chart-3: var(--chart-3);
+	--color-chart-4: var(--chart-4);
+	--color-chart-5: var(--chart-5);
+	--color-sidebar: var(--sidebar);
+	--color-sidebar-foreground: var(--sidebar-foreground);
+	--color-sidebar-primary: var(--sidebar-primary);
+	--color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+	--color-sidebar-accent: var(--sidebar-accent);
+	--color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+	--color-sidebar-border: var(--sidebar-border);
+	--color-sidebar-ring: var(--sidebar-ring);
+
+	--font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+		"Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+	--font-mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+	--radius-sm: calc(var(--radius) - 4px);
+	--radius-md: calc(var(--radius) - 2px);
+	--radius-lg: var(--radius);
+	--radius-xl: calc(var(--radius) + 4px);
+	--radius-2xl: calc(var(--radius) + 8px);
+}
+
+@layer base {
+	* {
+		@apply border-border outline-ring/50;
+	}
+	html,
+	body,
+	#root {
+		height: 100%;
+	}
+	body {
+		@apply bg-background font-sans text-foreground antialiased;
+	}
+	::selection {
+		background: oklch(0.655 0.165 276 / 40%);
+	}
+}
+
+/* ---- assistant-ui Markdown 正文排版（消息区 .aui-md） ---- */
+@layer components {
+	.aui-md {
+		font-size: 0.875rem;
+		line-height: 1.65;
+		word-break: break-word;
+	}
+	.aui-md > :first-child {
+		margin-top: 0;
+	}
+	.aui-md > :last-child {
+		margin-bottom: 0;
+	}
+	.aui-md p {
+		margin: 0.5em 0;
+	}
+	.aui-md h1,
+	.aui-md h2,
+	.aui-md h3,
+	.aui-md h4 {
+		margin: 0.9em 0 0.4em;
+		font-weight: 600;
+		line-height: 1.3;
+	}
+	.aui-md h1 {
+		font-size: 1.15rem;
+	}
+	.aui-md h2 {
+		font-size: 1.05rem;
+	}
+	.aui-md h3 {
+		font-size: 0.95rem;
+	}
+	.aui-md ul,
+	.aui-md ol {
+		margin: 0.5em 0;
+		padding-left: 1.4em;
+	}
+	.aui-md ul {
+		list-style: disc;
+	}
+	.aui-md ol {
+		list-style: decimal;
+	}
+	.aui-md li {
+		margin: 0.2em 0;
+	}
+	.aui-md a {
+		color: var(--primary);
+		text-decoration: underline;
+		text-underline-offset: 2px;
+	}
+	.aui-md blockquote {
+		margin: 0.6em 0;
+		border-left: 3px solid var(--border);
+		padding-left: 0.9em;
+		color: var(--muted-foreground);
+	}
+	.aui-md hr {
+		margin: 1em 0;
+		border-color: var(--border);
+	}
+	.aui-md table {
+		margin: 0.6em 0;
+		border-collapse: collapse;
+		font-size: 0.8125rem;
+	}
+	.aui-md th,
+	.aui-md td {
+		border: 1px solid var(--border);
+		padding: 0.3em 0.6em;
+		text-align: left;
+	}
+	.aui-md th {
+		background: var(--muted);
+		font-weight: 600;
+	}
+	.aui-md pre {
+		margin: 0.6em 0;
+		overflow-x: auto;
+		border: 1px solid var(--border);
+		border-radius: var(--radius-md);
+		background: oklch(0.105 0.005 264);
+		padding: 0.75rem 0.9rem;
+	}
+	.aui-md code {
+		font-family: var(--font-mono);
+		font-size: 0.8125em;
+	}
+	.aui-md :not(pre) > code {
+		border-radius: 0.375rem;
+		background: var(--muted);
+		padding: 0.1em 0.35em;
+	}
+
+	/* 流式生成指示点 */
+	.typing {
+		display: inline-flex;
+		gap: 4px;
+		padding: 4px 0;
+	}
+	.typing i {
+		width: 7px;
+		height: 7px;
+		border-radius: 50%;
+		background: var(--muted-foreground);
+		animation: typing-blink 1.2s infinite;
+	}
+	.typing i:nth-child(2) {
+		animation-delay: 0.2s;
+	}
+	.typing i:nth-child(3) {
+		animation-delay: 0.4s;
+	}
+}
+
+@keyframes typing-blink {
+	0%,
+	80%,
+	100% {
+		opacity: 0.3;
+	}
+	40% {
+		opacity: 1;
+	}
+}
