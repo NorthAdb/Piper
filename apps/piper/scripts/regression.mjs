@@ -211,6 +211,7 @@ async function main() {
 
 		await runExtraChecks({ req, chatEvents, check });
 		await runProfileChecks({ req, check, anon });
+		await runConnectorChecks({ req, check });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -337,6 +338,92 @@ async function runProfileChecks({ req, check, anon }) {
 			restoredProfile.json?.timezone === (origProfile.timezone ?? "Asia/Hong_Kong"),
 		`about一致=${restoredAbout.json?.markdown === origAbout} profile=${JSON.stringify(restoredProfile.json)}`,
 	);
+}
+
+// L0-4（36-39）：连接器列表与 GitHub 配置——四卡与状态、保存不回显全文、scan 走唯一令牌入口、清除回到无令牌。
+// 保护：若 data/settings-github.json 运行前已存在（用户真实令牌），整组跳过，绝不覆盖或清除。
+// 本组在脚本进程内临时剔除 GITHUB_TOKEN，使 githubToken() 的断言不受外层环境影响（结束恢复）。
+async function runConnectorChecks({ req, check }) {
+	const { existsSync, rmSync, readFileSync } = await import("node:fs");
+	const githubFile = join(APP_DIR, "data", "settings-github.json");
+	if (existsSync(githubFile)) {
+		console.log("SKIP 36-39 已存在 data/settings-github.json（视为用户真实令牌），跳过连接器组断言以免覆盖");
+		return;
+	}
+	const FAKE_TOKEN = "ghp_regressiontoken1234567890wxyz";
+	const savedEnvToken = process.env.GITHUB_TOKEN;
+	delete process.env.GITHUB_TOKEN;
+	try {
+		const list = await req("/api/settings/connectors");
+		const byId = Object.fromEntries((list.json?.connectors ?? []).map((c) => [c.id, c]));
+		check(
+			"GET /api/settings/connectors 返回四张卡且日历/邮件为 placeholder、GitHub 无令牌时 unconfigured",
+			list.status === 200 &&
+				["github", "web", "calendar", "mail"].every((id) => byId[id]) &&
+				byId.calendar?.status === "placeholder" &&
+				byId.mail?.status === "placeholder" &&
+				byId.github?.status === "unconfigured" &&
+				String(byId.mail?.statusNote ?? "").includes("收件箱"),
+			`实际 ${JSON.stringify((list.json?.connectors ?? []).map((c) => `${c.id}:${c.status}`))}`,
+		);
+
+		const put = await req("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token: FAKE_TOKEN }) });
+		const after = await req("/api/settings/connectors");
+		const ghAfter = (after.json?.connectors ?? []).find((c) => c.id === "github");
+		check(
+			"PUT 保存 GitHub 令牌后状态 connected、只回末四位掩码且响应不含令牌全文",
+			put.status === 200 &&
+				put.json?.connector?.status === "connected" &&
+				ghAfter?.status === "connected" &&
+				String(ghAfter?.tokenHint ?? "").endsWith("wxyz") &&
+				!JSON.stringify(after.json).includes(FAKE_TOKEN),
+			`实际 put=${put.status} hint=${ghAfter?.tokenHint}`,
+		);
+
+		// scan 的令牌来源只能是 settings.githubToken()：源码断言（无第二套入口）+ 同文件读回断言
+		// + 进程内 fetch 替身实际跑一次扫描，断言出站请求带了刚保存的令牌（不打活网、不打印令牌）。
+		const { githubToken } = await import("../lib/settings.mjs");
+		const scanSrc = readFileSync(join(APP_DIR, "lib", "scan.mjs"), "utf8");
+		const { runMorningScan } = await import("../lib/scan.mjs");
+		const seenAuth = [];
+		const realFetch = globalThis.fetch;
+		globalThis.fetch = async (url, init = {}) => {
+			seenAuth.push(init.headers?.Authorization ?? "");
+			const u = String(url);
+			const payload = u.includes("/actions/runs")
+				? { workflow_runs: [] }
+				: u.includes("/commits") || u.includes("/pulls") || u.includes("/issues")
+					? []
+					: { stargazers_count: 1, forks_count: 0, default_branch: "main", pushed_at: "2026-11-10T00:00:00Z" };
+			return { ok: true, status: 200, json: async () => payload };
+		};
+		try {
+			await runMorningScan({ repos: ["NorthAdb/LinkForge"], botId: "repo-keeper", saveArtifact: () => ({ id: "stub-artifact" }) });
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+		check(
+			"scan.mjs 经 githubToken() 取令牌（无 env 直读）且替身扫描的出站请求带 Bearer 已保存令牌",
+			scanSrc.includes("githubToken()") &&
+				!scanSrc.includes("process.env.GITHUB_TOKEN") &&
+				githubToken() === FAKE_TOKEN &&
+				seenAuth.length > 0 &&
+				seenAuth.every((a) => a === `Bearer ${FAKE_TOKEN}`),
+			`请求数=${seenAuth.length} 全部带对令牌=${seenAuth.every((a) => a === `Bearer ${FAKE_TOKEN}`)}`,
+		);
+
+		const cleared = await req("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token: "" }) });
+		const afterClear = await req("/api/settings/connectors");
+		const ghClear = (afterClear.json?.connectors ?? []).find((c) => c.id === "github");
+		check(
+			"清除令牌后 GitHub 回到 unconfigured 且 githubToken() 为空",
+			cleared.status === 200 && ghClear?.status === "unconfigured" && githubToken() === "",
+			`实际 status=${ghClear?.status} token空=${githubToken() === ""}`,
+		);
+	} finally {
+		if (existsSync(githubFile)) rmSync(githubFile);
+		if (savedEnvToken !== undefined) process.env.GITHUB_TOKEN = savedEnvToken;
+	}
 }
 
 main().catch((err) => {

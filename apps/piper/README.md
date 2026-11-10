@@ -100,6 +100,10 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
 **设置文件优先于环境变量**，保存即热生效、不必重启；环境变量只作文件缺失时的初值，
 不会被自动写进文件。设置读回只给是否已配置与 Key 末四位掩码（`GET /api/settings/model`）。
 
+注（L0-4）：GitHub 令牌同样可在设置页「连接器」组保存到 `data/settings-github.json`，
+文件优先于 `GITHUB_TOKEN` 环境变量；扫描经 `lib/settings.mjs` 的 `githubToken()` 统一读取
+（唯一的令牌入口），读回只给末四位掩码（`GET /api/settings/connectors`）。
+
 ## Pi 接入
 
 结论：**源码级真接入**，不是 SDK 嵌入、不是子进程调 CLI。`apps/piper` 作为 monorepo 内新增 app，
@@ -137,6 +141,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `bots.json`：bot 元数据（雏形用 JSON 文件代替规格中的 SQLite，接口不变，后续可平滑替换）
 - `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
 - `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
+- `settings-github.json`：设置页保存的 GitHub 令牌（明文只存此文件，L0-4；经 `githubToken()` 读取）
 - `about-me.md`：账号级「关于我」，只有一份——设置页（`PUT /api/about-me`，需登录）、右栏记忆
   与对话注入读的都是它；上限 20000 字符，超限拒绝且不写坏原文件（L0-3）
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
@@ -314,3 +319,27 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
   「关于我」事实后新开对话问 bot）。
 - 截图类验收（设置页基础资料组）本环境做不了（无浏览器工具），以构建 + 契约证据替代，
   留待用户本地目检。
+
+### L0-4 连接器列表与 GitHub 配置实测（2026-11-10，分支 feat/l0-4-connectors）
+
+- 统一槽位：连接器形状在 `lib/settings.mjs` 的 `listConnectors()` 定义（id / name / purpose /
+  status（placeholder | unconfigured | connected）/ statusNote / bots / access / configurable），
+  接口 `GET /api/settings/connectors`；设置页「连接器」组渲染为卡片（`web/src/SettingsConnectors.tsx`），
+  每卡可展开看状态与口径。GitHub 卡的 bots 范围按 bot 的 `github*` 工具动态得出。
+- GitHub 令牌：`PUT /api/settings/connectors/github` 保存到 `data/settings-github.json`
+  （空串清除）；`githubToken()`（设置文件优先、`GITHUB_TOKEN` 环境变量兜底）是唯一读取入口，
+  `lib/scan.mjs` 已改走它、删掉原来的环境变量直读。读回只有 `tokenHint` 末四位掩码。
+- 占位卡口径：网页查询为 unconfigured（注明 L0-6 接入、只读 + SSRF 防护）；日历、邮件为
+  placeholder，展开文案写明「尚未接入，真连接排在有闸分诊闭环之后」，邮件另注明「发必须
+  先成草稿、经全局收件箱确认后才发出」。
+- 回归：脚本扩展至 39 项，`node scripts/regression.mjs` **39/39 通过**（无令牌默认环境；
+  若运行前已有真实 `settings-github.json`，连接器组整组跳过以免覆盖）；新增断言：四卡与
+  状态正确；保存假令牌后状态 connected、只回掩码、响应不含全文；源码断言 scan 无第二套
+  令牌入口，且用进程内 fetch 替身实际跑一次扫描、捕获出站请求头，断言每条请求都带
+  `Bearer <已保存令牌>`（不打活网、日志不打印令牌）；清除后回到 unconfigured 且
+  `githubToken()` 为空。无令牌时手动扫描仍走公开 API（原 20-22 项继续通过）。
+  `npm run check` 无错误；`npm run build:web` 成功。
+- 明确不做核对：无 GitHub 写操作、无 OAuth 流、日历 / 邮件未做真同步、网页查询未实现
+  （仍是占位状态，L0-6 才做）。
+- 截图类验收（连接器四卡与展开口径）本环境做不了（无浏览器工具），以构建 + 契约证据
+  替代，留待用户本地目检。

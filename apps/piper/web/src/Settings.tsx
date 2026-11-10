@@ -1,10 +1,11 @@
-// 设置视图（L0-1 骨架 + L0-2 模型组 + L0-3 基础资料组真接入）：独立整页，四组——模型 / 基础资料 / 连接器 / 通知。
-// 模型组（SettingsModel.tsx）与基础资料组（SettingsProfile.tsx）已是真表单；连接器、通知仍为占位，后续切片接入。
+// 设置视图（L0-1 骨架起，模型 / 基础资料 / 连接器组已真接入）：独立整页，四组——模型 / 基础资料 / 连接器 / 通知。
+// 通知组仍为占位，L0-5 接入。
 import { ArrowLeftIcon, BellIcon, BlocksIcon, SlidersHorizontalIcon, UserRoundIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ConnectorsSettings } from "./SettingsConnectors";
 import { ModelSettingsForm } from "./SettingsModel";
 import { ProfileSettingsForm } from "./SettingsProfile";
 
@@ -73,11 +74,7 @@ export function Settings({
 						<ProfileSettingsForm onUnauthorized={onUnauthorized} />
 					</TabsContent>
 					<TabsContent value="connectors">
-						<PendingGroup
-							title="连接器"
-							description="GitHub、网页查询、日历、邮件的统一槽位与状态。"
-							note="连接器列表即将在后续切片接入；日历、邮件先以占位卡出现，真连接排在分诊闭环之后。"
-						/>
+						<ConnectorsSettings onUnauthorized={onUnauthorized} />
 					</TabsContent>
 					<TabsContent value="notifications">
 						<PendingGroup

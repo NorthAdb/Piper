@@ -22,6 +22,8 @@
 // GET /api/settings/profile 基础资料读回（displayName/timezone，时区缺省 Asia/Hong_Kong）
 // PUT /api/settings/profile 保存基础资料（部分字段可单独更新）
 // PUT /api/about-me 写入账号级「关于我」（需登录；与 GET 同源一份 about-me.md；超 20000 字符回 413，原文件不动）
+// GET /api/settings/connectors 连接器列表（统一形状；GitHub 带 tokenHint 末四位掩码，绝无令牌全文）
+// PUT /api/settings/connectors/github 保存 GitHub 令牌（token 传空串清除），保存即被 scan 使用
 //
 // POST /api/chat 的 SSE 事件（event 名 + JSON data）：
 // session {botId, sessionId} 本轮开始
@@ -55,7 +57,7 @@ readArtifact,
 readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
-import { readProfileSettings, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
+import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
@@ -183,6 +185,13 @@ if (typeof body.baseUrl === "string" && body.baseUrl) overrides.baseUrl = body.b
 if (typeof body.modelId === "string" && body.modelId) overrides.modelId = body.modelId;
 if (typeof body.apiKey === "string" && body.apiKey) overrides.apiKey = body.apiKey;
 return sendJson(res, 200, await testModelConfig(overrides));
+}
+if (path === "/api/settings/connectors" && req.method === "GET") return sendJson(res, 200, { connectors: listConnectors()});
+if (path === "/api/settings/connectors/github" && req.method === "PUT") {
+const body = await readBody(req);
+if (typeof body.token!== "string") return sendJson(res, 400, { error: "token 必填且须为字符串（空串表示清除）"});
+saveGithubSettingsFile({ token: body.token});
+return sendJson(res, 200, { connector: listConnectors().find((c) => c.id === "github")});
 }
 if (path === "/api/bots" && req.method === "GET") return sendJson(res, 200, { bots: listBots()});
 if (path === "/api/bots" && req.method === "POST") return sendJson(res, 201, { bot: createBot(await readBody(req))});

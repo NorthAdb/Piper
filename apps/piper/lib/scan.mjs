@@ -1,9 +1,13 @@
 // 晨间仓库扫描 routine：只读拉 GitHub 公开 REST API，生成 Markdown 日报存为产物。
 // 数据源：api.github.com/repos/<owner>/<repo> 的 repo / commits / pulls / issues / actions runs。
-// 可选 GITHUB_TOKEN 提高限额；无 token 走公开限额。单仓失败不中断整体，失败原因写进日报。
+// 令牌经 lib/settings.mjs 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
+// 本文件不再直读环境变量；无令牌走公开限额。单仓失败不中断整体，失败原因写进日报。
+import { githubToken } from "./settings.mjs";
+
 async function gh(path) {
 	const headers = { Accept: "application/vnd.github+json", "User-Agent": "piper-morning-scan" };
-	if (process.env.GITHUB_TOKEN) headers.Authorization = `Bearer ${process.env.GITHUB_TOKEN}`;
+	const token = githubToken();
+	if (token) headers.Authorization = `Bearer ${token}`;
 	const res = await fetch(`https://api.github.com${path}`, { headers });
 	if (!res.ok) throw new Error(`GitHub API ${res.status} ${path}`);
 	return res.json();

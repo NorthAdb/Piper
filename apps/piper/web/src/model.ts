@@ -66,6 +66,19 @@ export type ProfileSettings = {
 	timezone: string;
 };
 
+// 连接器（GET /api/settings/connectors 的线格式）：统一槽位形状；tokenHint 只有末四位掩码
+export type Connector = {
+	id: string;
+	name: string;
+	purpose: string;
+	status: "placeholder" | "unconfigured" | "connected";
+	statusNote: string;
+	bots: string[];
+	access: string;
+	configurable: boolean;
+	tokenHint?: string;
+};
+
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
 export type HistoryEntry = {
 	ts?: string;

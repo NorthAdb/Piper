@@ -5,6 +5,7 @@ import type {
 	Bot,
 	BotDraft,
 	ChatEvent,
+	Connector,
 	HistoryEntry,
 	ModelSettings,
 	ModelSettingsInput,
@@ -115,6 +116,14 @@ export async function getAboutMe(): Promise<string> {
 
 export async function saveAboutMe(markdown: string): Promise<string> {
 	return (await api<{ markdown: string }>("/api/about-me", { method: "PUT", body: JSON.stringify({ markdown }) })).markdown;
+}
+
+export async function getConnectors(): Promise<Connector[]> {
+	return (await api<{ connectors: Connector[] }>("/api/settings/connectors")).connectors;
+}
+
+export async function saveGithubToken(token: string): Promise<Connector> {
+	return (await api<{ connector: Connector }>("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token }) })).connector;
 }
 
 // POST /api/chat 的 SSE 流：逐事件回调；事件形状保持后端契约（session/delta/tool/system/draft/error/done）
