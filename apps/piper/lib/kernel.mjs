@@ -50,14 +50,16 @@ async function loadRuntime() {
 			}
 			const ai = await import(pathToFileURL(aiDist).href);
 			const agentCore = await import(pathToFileURL(agentDist).href);
-			return { ai, agentCore };
+			// openAICompletionsApi 不在 pi-ai 主入口导出，位于 api 子路径（package exports 的 "./api/*"）
+			const completions = await import(pathToFileURL(join(REPO_ROOT, "packages", "ai", "dist", "api", "openai-completions.lazy.js")).href);
+			return { ai, agentCore, openAICompletionsApi: completions.openAICompletionsApi };
 		})();
 	}
 	return runtimePromise;
 }
 
 async function buildModelsAndModel(cfg) {
-	const { ai } = await loadRuntime();
+	const { ai, openAICompletionsApi } = await loadRuntime();
 	const model = {
 		id: cfg.modelId,
 		name: cfg.modelId,
@@ -77,7 +79,7 @@ async function buildModelsAndModel(cfg) {
 		baseUrl: cfg.baseUrl,
 		auth: { apiKey: keyAuth },
 		models: [model],
-		api: ai.openAICompletionsApi(),
+		api: openAICompletionsApi(),
 	});
 	const models = ai.createModels();
 	models.setProvider(provider);
