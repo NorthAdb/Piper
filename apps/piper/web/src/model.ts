@@ -30,7 +30,10 @@ export type Routine = {
 	botId: string;
 	name: string;
 	description: string;
+	// schedule 是机器可解析的 "HH:MM"（P1-4），scheduleText 是给人看的文案，nextRunAt 由调度状态附带
 	schedule: string;
+	scheduleText?: string;
+	nextRunAt?: string | null;
 	lastRunAt: string | null;
 	lastArtifactId: string | null;
 	lastStatus: string | null;

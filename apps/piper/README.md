@@ -154,7 +154,8 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
 - `sessions/<botId>.jsonl`：每 bot 独立会话流水
 - `artifacts/<id>.md`：产物，文件头 HTML 注释内嵌结构化元数据
-- `routines.json`：routine 定义与上次运行结果
+- `routines.json`：routine 定义与上次运行结果；`schedule` 为机器可解析的 `"HH:MM"`（P1-4），
+  `scheduleText` 为展示文案，旧版纯文本 schedule 在服务启动时自动迁移
 
 预置 bot：主 bot「Piper」（置顶、`canManageBots`）与运维 bot「仓库管家」（绑定 NorthAdb/LinkForge、NorthAdb/Loom，挂 morning-scan 例程）。
 
@@ -164,6 +165,9 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 `session / delta / tool / system / draft / error / done`；草案卡结构
 `{name, systemPrompt, tools, repos, memoryScope, source}`，经 `POST /api/bots/draft-confirm` 确认才落库；
 `GET /api/approvals` 雏形恒返回空数组（收件箱占位）。
+定时调度（P1-4）：`server.mjs` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
+（缺省 08:00，时区读基础资料），与手动触发走同一执行函数、同一通知语义；
+只读状态端点 `GET /api/schedule/status` 给出时区、下次运行、上次运行与结果。
 
 ## 验收线对照（规格六）
 
@@ -195,7 +199,8 @@ npm run regression       # 或 node scripts/regression.mjs
 L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显全文、测试连接坏端点不崩溃、
 清除恢复未配置）；L0-3 至 L0-5 续扩至 43 项；P1-1 续扩第 44-46 项覆盖 Finding 只读 API
 （未登录 401、列表结构、不存在 404）；P1-2 把第 22 项改成产物 + 清单结构口径并续扩第 47-48 项
-（扫描响应带 findings、与只读 API 同一存储），当前共 **48 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
+（扫描响应带 findings、与只读 API 同一存储）；P1-4 续扩第 49-52 项（调度状态端点 401 与
+结构、schedule 机器可解析且带 nextRunAt），当前共 **52 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
 其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
 整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
 
@@ -208,6 +213,15 @@ npm run test:findings    # 或 node scripts/test-findings.mjs
 
 覆盖写入补齐字段、按 status/repo/botId 过滤、缺 evidenceUrl / 非法 status / 非法 type /
 非法 writeIntent 被拒绝、改状态后去重不再命中、新进程从文件读回（重启不丢）、删除。
+
+调度状态机另有假时钟测试 `scripts/test-schedule.mjs`（注入 now 与运行函数，不等真实时间）：
+
+```bash
+npm run test:schedule    # 或 node scripts/test-schedule.mjs
+```
+
+覆盖下一次运行的时区换算、到点只触发一次、失败 15 分钟内补跑 3 次后放弃、补跑成功即停、
+启动补跑（已过点未成功才补）、并发重入返回 busy、skipped 不推进计划、status 形状。
 
 扫描规则另有替身测试 `scripts/test-scan.mjs`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
 
@@ -490,3 +504,37 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   本切片无产品界面与行为改动（只加测试资产），无截图项。
 - 明确不做核对：未用活仓做通过断言；未把评测 gate 到记忆或 RSI 验收（那些模块尚不存在）；
   未改 `packages/`、未改 SSE 事件名、未动 L0-5 的 approvals 回归断言口径。
+
+### P1-4 真定时调度实测（2026-11-10，分支 feat/p1-4-schedule）
+
+- 实现：新增 `lib/schedule.mjs`（零外部依赖）。`server.mjs` 进程内装配一个调度状态机，
+  每 30 秒 tick 一次；时区每次规划现读基础资料（`readProfileSettings().timezone`，缺省
+  `Asia/Hong_Kong`），计划时刻读 `routines.json` 中 morning-scan 的 `schedule` 字段。
+  `schedule` 已从旧版中文描述迁移为机器可解析的 `"08:00"`（启动时自动迁移，抠不出时刻
+  则回退 08:00），展示文案走 `scheduleText`，由服务端按当前时区现算。
+- 执行路径统一：手动 `POST /api/routines/morning-scan/run` 与定时触发共用
+  `executeMorningScan()`——同一扫描函数、同一例程状态更新、同一 L0-5 通知语义（整轮
+  失败记 failed + 失败通知，部分失败仍算完成）。执行层带重入防护：已有扫描在途时
+  手动触发回 409、调度 tick 返回 busy/skipped，不会并行开两轮。
+- 补跑语义：到点整轮失败（或抛错）后，15 分钟窗口内最多补跑 3 次（每次间隔 5 分钟），
+  补跑成功即停；用尽则保持失败状态等下一周期。启动补跑：进程启动时若今日计划时刻
+  已过且今日尚未成功（按存储的 lastRunAt/lastStatus 判定），补跑一次；今日已成功绝不补。
+- 只读状态：`GET /api/schedule/status` 返回 `{ timezone, routines: [{ id, nextRunAt,
+  nextRetryAt, running, attempts, lastRunAt, lastStatus }] }`；`GET /api/routines` 给
+  morning-scan 附带现算的 `scheduleText` 与 `nextRunAt`，右栏例程卡显示计划/上次/下次运行，
+  不再出现「仅手动触发」。
+- 测试：`node scripts/test-schedule.mjs` **12/12 通过**（假时钟驱动状态机，不等真实
+  时间）：nextRunAfter 时区换算（HKT 08:00 = UTC 00:00、跨日、恰到点算已过）、
+  parseScheduleTime 与旧文本迁移、shouldCatchUp 四象限、到点只跑一次且次日再跑、
+  失败 +5/+10/+15 分钟补跑共 4 跑后放弃、补跑成功清零 attempts、启动补跑两种状态、
+  并发 tick 返回 busy 且 run 只调一次、skipped 不推进计划、status 形状。
+- 回归：脚本扩展至 52 项，`node scripts/regression.mjs` **52/52 通过**（新增 49-52：
+  状态端点未登录 401、结构完整、schedule 为 HH:MM 且文案无「仅手动触发」并带 nextRunAt、
+  nextRunAt 在未来 25 小时内）。回归 harness 另加一段「等调度空闲」：服务端启动瞬间
+  可能正跑启动补跑，先等其结束再数产物，避免与手动扫描的 +1 断言竞态（断言未放宽）。
+  同批复跑：test-findings 18/18、test-scan 5/5、eval:scan 5/5、`npm run check` 无错误、
+  `npm run build:web` 成功。本机真实 data 的 routines.json 已实测完成迁移
+  （schedule 变为 "08:00" 并生成 scheduleText）。
+- 明确不做核对：未加外部调度依赖、未起新服务、未用系统 cron；未接 CI/review 事件
+  触发；未改 `packages/`、未改 SSE 事件名。本切片无新页面（右栏例程卡多一行下次运行），
+  截图以接口与状态机测试证据替代，留待用户本地目检。

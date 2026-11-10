@@ -10,8 +10,11 @@
 // GET /api/bots/:id/messages 该 bot 的会话流水（JSONL 读出）
 // GET /api/about-me 账号级「关于我」全文
 // POST /api/chat {botId, message} SSE 流式对话（事件见下方 sse 注释）
-// GET /api/routines routine 列表（含上次运行）
-// POST /api/routines/morning-scan/run 手动跑晨间扫描，生成日报产物
+// GET /api/routines routine 列表（含上次运行；morning-scan 附带 nextRunAt）
+// POST /api/routines/morning-scan/run 手动跑晨间扫描，生成日报产物（与定时触发同一执行函数；正在运行时回 409）
+// GET /api/schedule/status 定时调度只读状态（时区、下次运行、上次运行/结果、是否运行中、补跑次数）
+// 定时（P1-4）：进程内调度，默认每天 08:00（routines.schedule 的 "HH:MM"），时区读基础资料；
+// 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.mjs）
 // GET /api/artifacts 产物列表
 // GET /api/artifacts/:id 产物正文
 // GET /api/approvals 待批收件箱（雏形占位，恒为空数组）
@@ -65,6 +68,7 @@ import { addNotification, countUnread, listNotifications, markNotificationsRead}
 import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
+import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
 const TOKEN = process.env.PIPER_TOKEN || "piper-dev";
@@ -156,6 +160,66 @@ emit("done", { botId: bot.id});
 res.end();
 }
 
+// ---------- 晨间扫描执行（手动触发与定时调度共用同一条路径，L0-5 通知语义只写一份） ----------
+// 重入防护：同一时刻只允许一轮扫描；已有运行在途时返回 { skipped: true }，手动路由据此回 409、
+// 调度器据此跳过本 tick。整轮失败（全部仓库取证失败）不报成功：状态记 failed 并发失败通知；
+// 意料外抛错同样记 failed + 通知后把错误回传（手动路由保持原 500 行为）。
+let scanInFlight = false;
+
+async function executeMorningScan() {
+if (scanInFlight) return { skipped: true};
+scanInFlight = true;
+try {
+const routine = listRoutines().find((r) => r.id === "morning-scan");
+const bot = getBot(routine?.botId || "repo-keeper");
+const repos = bot?.repos?.length? bot.repos: ["NorthAdb/LinkForge", "NorthAdb/Loom"];
+const routineName = routine?.name?? "晨间仓库扫描";
+try {
+const { artifact, report, failures, total, findings} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
+if (total > 0 && failures >= total) {
+updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "failed"});
+addNotification({ type: "routine.failed", title: `${routineName}失败`, body: `${total} 个仓库全部取证失败，详情见日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
+if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描失败（全部仓库取证失败），日报：${artifact.title}`});
+return { failed: true, artifact, report, findings};
+}
+updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "ok"});
+addNotification({ type: "routine.completed", title: `${routineName}已完成`, body: `日报：${artifact.title}（本轮新开 ${findings.length} 条待拍板事项，见日报开头的拍板清单）`, routineId: "morning-scan", artifactId: artifact.id});
+if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描完成，日报：${artifact.title}`});
+return { failed: false, artifact, report, findings};
+} catch (err) {
+updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastStatus: "failed"});
+addNotification({ type: "routine.failed", title: `${routineName}失败`, body: String(err.message?? err), routineId: "morning-scan"});
+return { failed: true, error: err};
+}
+} finally {
+scanInFlight = false;
+}
+}
+
+// ---------- 定时调度（P1-4）：进程内，启动时迁移旧版 schedule 文本并装配 ----------
+
+function morningRoutine() {
+return listRoutines().find((r) => r.id === "morning-scan")?? null;
+}
+
+{
+const routine = morningRoutine();
+if (routine) {
+const migrated = migrateScheduleFields(routine, profileTimezone());
+if (migrated) updateRoutine(routine.id, migrated);
+}
+}
+
+const scheduler = createScheduler({
+run: async () => {
+const result = await executeMorningScan();
+return result.skipped? "skipped": result.failed? "failed": "ok";
+},
+getRoutineState: () => morningRoutine()?? {},
+timezoneFn: () => profileTimezone(),
+timeFn: () => parseScheduleTime(morningRoutine()?.schedule)?? parseScheduleTime("08:00"),
+});
+
 const server = createServer(async (req, res) => {
 const url = new URL(req.url, `http://${req.headers.host}`);
 const path = url.pathname;
@@ -233,30 +297,26 @@ if (typeof body.timezone === "string") patch.timezone = body.timezone;
 return sendJson(res, 200, saveProfileSettings(patch));
 }
 if (path === "/api/chat" && req.method === "POST") return await handleChat(req, res);
-if (path === "/api/routines" && req.method === "GET") return sendJson(res, 200, { routines: listRoutines()});
+if (path === "/api/routines" && req.method === "GET") {
+const tz = profileTimezone();
+const status = scheduler.status(new Date());
+return sendJson(res, 200, {
+routines: listRoutines().map((r) => {
+if (r.id!== "morning-scan") return r;
+const time = parseScheduleTime(r.schedule)?? parseScheduleTime("08:00");
+return { ...r, scheduleText: formatScheduleText(time, tz), nextRunAt: status.nextRunAt};
+}),
+});
+}
+if (path === "/api/schedule/status" && req.method === "GET") {
+const s = scheduler.status(new Date());
+return sendJson(res, 200, { timezone: s.timezone, routines: [{ id: "morning-scan", nextRunAt: s.nextRunAt, nextRetryAt: s.nextRetryAt, running: s.running, attempts: s.attempts, lastRunAt: s.lastRunAt, lastStatus: s.lastStatus}]});
+}
 if (path === "/api/routines/morning-scan/run" && req.method === "POST") {
-const routine = listRoutines().find((r) => r.id === "morning-scan");
-const bot = getBot(routine?.botId || "repo-keeper");
-const repos = bot?.repos?.length? bot.repos: ["NorthAdb/LinkForge", "NorthAdb/Loom"];
-const routineName = routine?.name?? "晨间仓库扫描";
-try {
-const { artifact, report, failures, total, findings} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
-// 整轮失败（全部仓库取证失败）不报成功：状态记 failed 并发失败通知（L0-5）；部分失败仍算完成，失败细节在日报里。
-if (total > 0 && failures >= total) {
-updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "failed"});
-addNotification({ type: "routine.failed", title: `${routineName}失败`, body: `${total} 个仓库全部取证失败，详情见日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
-if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描失败（全部仓库取证失败），日报：${artifact.title}`});
-return sendJson(res, 200, { artifact, report, failed: true, findings});
-}
-updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "ok"});
-addNotification({ type: "routine.completed", title: `${routineName}已完成`, body: `日报：${artifact.title}（本轮新开 ${findings.length} 条待拍板事项，见日报开头的拍板清单）`, routineId: "morning-scan", artifactId: artifact.id});
-if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描完成，日报：${artifact.title}`});
-return sendJson(res, 200, { artifact, report, findings});
-} catch (err) {
-updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastStatus: "failed"});
-addNotification({ type: "routine.failed", title: `${routineName}失败`, body: String(err.message?? err), routineId: "morning-scan"});
-throw err;
-}
+const result = await executeMorningScan();
+if (result.skipped) return sendJson(res, 409, { error: "晨间扫描正在运行中，请稍后再试"});
+if (result.error) throw result.error;
+return sendJson(res, 200, result.failed? { artifact: result.artifact, report: result.report, failed: true, findings: result.findings}: { artifact: result.artifact, report: result.report, findings: result.findings});
 }
 if (path === "/api/notifications" && req.method === "GET") return sendJson(res, 200, { notifications: listNotifications(), unread: countUnread()});
 if (path === "/api/notifications/read" && req.method === "POST") {
@@ -304,4 +364,8 @@ return sendJson(res, err.status || 500, { error: err.message});
 
 server.listen(PORT, () => {
 console.log(`Piper prototype listening on http://localhost:${PORT} (token: ${process.env.PIPER_TOKEN? "from env": "default piper-dev"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
+// 定时调度启动：先 tick 一次（处理启动补跑与首次规划），之后每 30 秒推进状态机。
+void scheduler.tick(new Date());
+const timer = setInterval(() => void scheduler.tick(new Date()), 30 * 1000);
+timer.unref();
 });

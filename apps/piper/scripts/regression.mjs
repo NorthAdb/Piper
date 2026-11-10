@@ -170,6 +170,13 @@ async function main() {
 		check("删除草案 bot 后列表恢复为两个预置 bot", (restored.json?.bots ?? []).length === 2, `实际 ${(restored.json?.bots ?? []).length}`);
 
 		// ---- 晨间扫描与产物（20-22，真实调用 GitHub 公开 API）----
+		// P1-4：服务端启动时可能触发一次启动补跑（今日已过点且未成功时）。先等调度空闲，
+		// 避免补跑与下面手动扫描的产物计数竞态（补跑产物会计入 before，断言仍是手动 +1）。
+		for (let i = 0; i < 160; i++) {
+			const st = await req("/api/schedule/status");
+			if (st.json?.routines?.[0]?.running === false) break;
+			await new Promise((r) => setTimeout(r, 500));
+		}
 		const before = await req("/api/artifacts");
 		const beforeCount = before.json?.artifacts?.length ?? 0;
 		const run = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
@@ -223,6 +230,7 @@ async function main() {
 		await runNotificationChecks({ req, check, anon });
 		await runFindingChecks({ req, check, anon });
 		await runScanFindingChecks({ req, check, run });
+		await runScheduleChecks({ req, check, anon });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -536,6 +544,46 @@ async function runScanFindingChecks({ req, check, run }) {
 		"GET /api/findings?botId=repo-keeper 可读回扫描落盘的 Finding（同一存储）",
 		list.status === 200 && Array.isArray(list.json?.findings),
 		`实际 ${list.status} 条数=${list.json?.findings?.length}`,
+	);
+}
+
+// P1-4（49-52）：真定时调度——状态端点未登录 401、结构完整（时区/下次运行/上次结果）；
+// 例程 schedule 已是机器可解析 HH:MM 且文案不再是「仅手动触发」，并带 nextRunAt；
+// 状态机本身（到点/补跑/启动补跑/重入）由 scripts/test-schedule.mjs 假时钟覆盖。
+async function runScheduleChecks({ req, check, anon }) {
+	const unauth = await anon("/api/schedule/status");
+	check("未登录 GET /api/schedule/status 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
+
+	const st = await req("/api/schedule/status");
+	const s0 = st.json?.routines?.[0];
+	check(
+		"GET /api/schedule/status 结构完整：时区为字符串、含 nextRunAt（可解析时间）/lastRunAt/lastStatus/running",
+		st.status === 200 &&
+			typeof st.json?.timezone === "string" &&
+			s0?.id === "morning-scan" &&
+			!Number.isNaN(Date.parse(s0?.nextRunAt ?? "")) &&
+			"lastRunAt" in (s0 ?? {}) &&
+			"lastStatus" in (s0 ?? {}) &&
+			s0?.running === false,
+		`实际 ${JSON.stringify(st.json)}`,
+	);
+
+	const routines = await req("/api/routines");
+	const morning = (routines.json?.routines ?? []).find((r) => r.id === "morning-scan");
+	check(
+		"morning-scan 的 schedule 为 HH:MM、scheduleText 不含「仅手动触发」且带 nextRunAt",
+		/^\d{2}:\d{2}$/.test(morning?.schedule ?? "") &&
+			typeof morning?.scheduleText === "string" &&
+			!morning.scheduleText.includes("仅手动触发") &&
+			!Number.isNaN(Date.parse(morning?.nextRunAt ?? "")),
+		`实际 ${JSON.stringify({ schedule: morning?.schedule, scheduleText: morning?.scheduleText, nextRunAt: morning?.nextRunAt })}`,
+	);
+
+	const next = Date.parse(morning?.nextRunAt ?? "");
+	check(
+		"nextRunAt 落在未来 25 小时内（调度已规划，不是空文案）",
+		next > Date.now() - 60 * 1000 && next < Date.now() + 25 * 3600 * 1000,
+		`nextRunAt=${morning?.nextRunAt}`,
 	);
 }
 

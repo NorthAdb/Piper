@@ -145,12 +145,18 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 									<div className="flex flex-col gap-1 text-xs text-muted-foreground">
 										<span className="flex items-center gap-1.5">
 											<CalendarClockIcon className="size-3.5" />
-											计划：{r.schedule}
+											计划：{r.scheduleText || `每日 ${r.schedule}`}
 										</span>
 										<span className="flex items-center gap-1.5">
 											<HistoryIcon className="size-3.5" />
 											上次运行：{r.lastRunAt || "从未"}
 										</span>
+										{r.nextRunAt ? (
+											<span className="flex items-center gap-1.5">
+												<CalendarClockIcon className="size-3.5" />
+												下次运行：{new Date(r.nextRunAt).toLocaleString()}
+											</span>
+										) : null}
 									</div>
 									{r.id === "morning-scan" ? (
 										<div>
