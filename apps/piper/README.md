@@ -987,3 +987,46 @@ APPROVED」改成锁定语义，并补上扫描前对账与网关规则前提复
   `npm run check` 无错误、`npm run build:web` 成功。
 - 明确不做核对：未做密钥加密存储 / 系统钥匙串；未做秘密轮换流程；未碰
   R8 及以后；未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。
+
+### R8 CI 与 PR 流程实测（2026-11-11，分支 fix/r8-ci-piper-job，堆叠在 R7 上）
+
+审计 M7 的收口：Piper 的离线硬门禁进 CI，推送与 PR 自动跑；本机聚合一条命令。
+
+- `ci.yml` 新增 `piper` job（与上游 build-check / test / mcp-conformance 并列，
+  未动上游三个 job）：checkout → setup-node 22 → 根 `npm ci --ignore-scripts`
+  → 构建基座链 → `cd apps/piper && npm run test`。
+  - 依赖关系按仓库现状核实：`apps/piper` 是根 workspaces（`apps/*`）成员，
+    依赖在根 lockfile 里（piper-app 已核实在根 `package-lock.json`），根安装即
+    覆盖，apps/piper 没有独立 lockfile。
+  - 基座链一步是返工稿清单之外的必要补充：piper 运行时只 import
+    `@earendil-works/pi-agent-core` 与 `pi-ai`，两者的包 exports 都指向
+    `dist/`，干净检出没有 dist 必然起不来server。按根 build 的顺序只构建
+    这条链：pi-telemetry → pi-schema → pi-ai → pi-agent-core，不跑全量
+    `npm run build`。
+  - `regression:live` **不在** CI 里（活网、非门禁，口径与 R4 一致）。
+- `apps/piper` 新增聚合脚本 `npm run test`：`build:web → check →
+  test:findings → test:scan → test:schedule → test:gateway → test:listen →
+  test:badtz → test:secrets → eval:scan → regression`，任一非 0 即失败。
+  返工稿清单里的 test-listen / test-badtz（R2/R3 新增）与 test-secrets
+  （R7 新增）按「离线套件以实际为准全纳入」一并收进聚合与 CI。
+- 本地实测（主检出，依赖与 dist 已在位）：基座链四包构建成功；
+  `npm run test` 一次全绿——build:web 成功、check 无错误、test-findings
+  27/27、test-scan 10/10、test-schedule 14/14、test-gateway 19/19、
+  test-listen 6/6、test-badtz 4/4、test-secrets 21/21、eval:scan 18/18、
+  regression 69/69，退出码 0。ci.yml 已用 python yaml 解析校验（jobs 含
+  piper、5 个 step 形状正确；本机无 actionlint）。
+- 干净环境实测（等价 CI 的本地证明）：从本分支 HEAD 拉全新 worktree
+  （无 node_modules、无 dist），按 job 的 steps 原样跑——根
+  `npm ci --ignore-scripts` 成功 → 基座链四包构建成功 → `apps/piper`
+  `npm run test` 退出码 0，各套数字与主检出完全一致。证明 piper job 在
+  干净 runner 上不需要预置状态即可绿。
+- 已知缺口（如实）：返工稿验收的「故意改坏规则的 PR 在 GitHub 上 CI 先红
+  再绿」本轮**未做**——当前返工 PR 均为堆叠分支且按用户口径暂不合并、
+  开 PR 的审批在用户休息时段不可用，无法在 GitHub 上触发对 main 的 PR
+  检查；留待合并链推进时补做，不以本地全绿冒充该项已完成。本地等价证据
+  为上述聚合一次全绿 + YAML 语法校验。
+- 追认说明：`ba67176` 删除 14 个上游 workflow 的计划外改动，已在根
+  `BASE.md`「CI 精简」节后补「事后追认说明」段（独立 docs 提交），请
+  PA—design 复审追认；除补记说明外不回滚、不改动那次删除本身。
+- 明确不做核对：未把 live 套件放进 CI；未引入新外部服务；未碰 R9 及
+  以后；未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。
