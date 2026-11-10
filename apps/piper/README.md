@@ -345,8 +345,10 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   主 bot 历史流水含 draft 条目（新前端渲染为只读草案卡）；bot POST/PUT/DELETE 回归通过、删主 bot 仍被拒的
   后端行为未变；晨间扫描真实生成日报 `2026-11-10-morning-scan-*`（`lastStatus:"ok"`），产物列表/单篇读取正常；
   `/api/approvals` 恒 `{"approvals":[]}`；`/api/memory/repo-keeper` 返回 memory.md 与「关于我」全文。
-- 说明：本子任务环境无浏览器，页面级交互（流式渲染观感、草案卡点击确认）未做浏览器实测，
+- 说明：本子任务当时环境无浏览器，页面级交互（流式渲染观感、草案卡点击确认）未做浏览器实测，
   以上均为服务端与契约层证据；前端事件处理与后端契约一一对应（见 `web/src/ChatPane.tsx` 的 SSE 分发）。
+  后续 R9 已用 headless Chromium 对主要界面补了真实浏览器截图（`docs/screens/`，见文末
+  R9 实测节）；流式渲染观感与草案卡点击确认仍未做浏览器级实测，如实保留本条。
 
 ### 视觉升级实测（2026-11-10，分支 feat/web-visual-upgrade）
 
@@ -370,8 +372,10 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 如实记录：首轮脚本有 2 项假失败（POST /api/bots、draft-confirm），定位为脚本误期望
   状态码 200、实际后端契约一直是 201（server.mjs 未改），修正脚本后 26/26 通过；
   与前端迁移时那次 grep 误匹配同类，均为验收脚本问题、非接口回归。
-- 说明：本环境无浏览器，页面观感（深色主题、卡片层次、流式渲染）未做浏览器目检，
-  由用户本地 `npm start` 后确认；以上为构建、托管与契约层证据。
+- 说明：本切片当时环境无浏览器，页面观感（深色主题、卡片层次、流式渲染）未做浏览器目检，
+  由用户本地 `npm start` 后确认；以上为构建、托管与契约层证据。后续 R9 已用 headless
+  Chromium 对主要界面补了真实浏览器截图（`docs/screens/`，深色主题与卡片层次可直接
+  目检，见文末 R9 实测节）；流式渲染观感仍未做浏览器级实测，如实保留本条。
 
 ### L0-1 设置页骨架实测（2026-11-10，分支 feat/l0-1-settings-shell）
 
@@ -384,7 +388,8 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   设置视图在登录门之后（未登录先见登录页，原 401 行为不变）。
 - 验证：`npm run check`（tsc）无错误；`npm run build:web` 成功，bundle 内含「设置」入口与
   四组文案；`node scripts/regression.mjs` 26/26 通过（无 Key 默认环境）。
-- 未做浏览器截图：本环境无浏览器工具，设置页观感以构建产物 + 契约证据替代，留待用户本地目检。
+- 截图：本切片当时未做；已由 R9 用 headless Chromium 对种子实例补齐，见
+  `docs/screens/`（设置四组为 04–07）与文末 R9 实测节。
 
 ### L0-2 模型与真 Key 实测（2026-11-10，分支 feat/l0-2-model-key）
 
@@ -411,8 +416,11 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   3. 任选一个 bot 发一句话，应收到流式回复（多个 delta），且该 bot 的 `data/sessions/<botId>.jsonl` 出现助手消息；
   4. 对主 bot 说「创建一个代码审查 bot，负责审查 PR 的代码质量」，草案卡来源应标注模型抽取；确认后落库；
   5. 回设置页点「清除 Key」，顶栏徽标应回「未配置模型」，再发消息应回 `MODEL_NOT_CONFIGURED`。
-- 截图类验收（设置页已配置状态、Key 掩码）本环境做不了（无浏览器工具），以以上构建 +
-  接口 + stub 链路证据替代，留待用户本地目检。
+- 截图类验收（设置页已配置状态、Key 掩码）已由 R9 补齐：
+  `docs/screens/04-settings-model-configured.png`（模型组「已配置」，API Key 区只有
+  末四位掩码 `••••wxyz`，种子假 Key）；stub 链路已由 R9 固化为离线回归
+  `scripts/test-model-stub.mjs`（见文末 R9 实测节）。真 Key 对话仍待用户本人执行
+  （返工稿 R9 第③项），本节的 stub 证据不替代它。
 
 ### L0-3 基础资料与「关于我」实测（2026-11-10，分支 feat/l0-3-profile-about）
 
@@ -433,8 +441,8 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 验收第 3 条（新对话注入含新文本）在无 Key 环境无法从对话层直接观测：以「每轮现读文件」
   的代码路径 + 读取同源断言作为证据；有真 Key 时可按 L0-2 人工复验步骤顺带核对（改一条
   「关于我」事实后新开对话问 bot）。
-- 截图类验收（设置页基础资料组）本环境做不了（无浏览器工具），以构建 + 契约证据替代，
-  留待用户本地目检。
+- 截图类验收（设置页基础资料组）已由 R9 补齐：`docs/screens/05-settings-profile.png`
+  （称呼 / 时区下拉 / 「关于我」正文），见文末 R9 实测节。
 
 ### L0-4 连接器列表与 GitHub 配置实测（2026-11-10，分支 feat/l0-4-connectors）
 
@@ -457,8 +465,8 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   `npm run check` 无错误；`npm run build:web` 成功。
 - 明确不做核对：无 GitHub 写操作、无 OAuth 流、日历 / 邮件未做真同步、网页查询未实现
   （仍是占位状态，L0-6 才做）。
-- 截图类验收（连接器四卡与展开口径）本环境做不了（无浏览器工具），以构建 + 契约证据
-  替代，留待用户本地目检。
+- 截图类验收（连接器四卡）已由 R9 补齐：`docs/screens/06-settings-connectors.png`
+  （GitHub / 网页查询 / 日历 / 邮件四卡与状态），见文末 R9 实测节。
 
 ### L0-5 应用内通知实测（2026-11-10，分支 feat/l0-5-notifications）
 
@@ -482,8 +490,9 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   GitHub 未授权请求（扫描 3 次），短时间连跑多轮可能再次撞限。
 - 明确不做核对：无邮箱 / 企微等外部渠道、无通知偏好设置、前端无实时推送（进视图时拉取）；
   未接 P1 的待批事项（仅预留类型）。
-- 截图类验收（通知入口徽标、通知列表观感）本环境做不了（无浏览器工具），以构建 +
-  契约证据替代，留待用户本地目检。
+- 截图类验收已由 R9 补齐：`docs/screens/07-settings-notifications.png`（通知列表含
+  一条例程完成记录）、`docs/screens/01-main-piper-desktop.png`（左栏通知未读徽标），
+  见文末 R9 实测节。
 
 ### P1-1 Finding 模型与存储实测（2026-11-10，分支 feat/p1-1-finding-model）
 
@@ -589,7 +598,8 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   （schedule 变为 "08:00" 并生成 scheduleText）。
 - 明确不做核对：未加外部调度依赖、未起新服务、未用系统 cron；未接 CI/review 事件
   触发；未改 `packages/`、未改 SSE 事件名。本切片无新页面（右栏例程卡多一行下次运行），
-  截图以接口与状态机测试证据替代，留待用户本地目检。
+  右栏例程卡（含计划 / 上次 / 下次运行）截图已由 R9 补齐：
+  `docs/screens/02-main-repo-keeper-desktop.png`，见文末 R9 实测节。
 
 ### P1-5 待批收件箱独立视图 + 桌面按 bot 隔离实测（2026-11-10，分支 feat/p1-5-inbox-view）
 
@@ -621,8 +631,10 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   writeIntent 由 P1-6 的网关切片接上扫描模板），因此本切片交付时收件箱在真实数据
   下为空列表——这是切片预期的合法状态，契约与界面均已就绪，P1-6 合入后即有数据。
 - 明确不做核对：未实现任何写仓库操作、未做网关判定；未改 `packages/`、未改 SSE
-  事件名、未重做视觉。截图（收件箱空状态、主 bot 右栏隔离）本环境做不了，以构建产物
-  文案断言 + 契约回归替代，留待用户本地目检。
+  事件名、未重做视觉。截图已由 R9 补齐：收件箱空状态
+  `docs/screens/08-inbox-empty.png`、主 bot 右栏隔离
+  `docs/screens/01-main-piper-desktop.png`（选中 Piper 时右栏无仓库管家的例程）与
+  `docs/screens/02-main-repo-keeper-desktop.png`，见文末 R9 实测节。
 
 ### P1-6 薄网关 + PR 评论 + 正负审计实测（2026-11-10，分支 feat/p1-6-gateway-comment）
 
@@ -665,8 +677,9 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   成功（bundle 含「批准并执行」）。全部网关测试走替身，未对任何真实仓库发评论——
   真实写入的验收在 P1-7 试用切片。
 - 明确不做核对：未做打标签 / 合并 PR / 改代码 / 自动合并；未接第二种写意图；网关
-  未打进 `packages/`；未改 SSE 事件名。截图（待批详情）本环境做不了，以替身测试的
-  参数断言 + 审计样例替代，留待 P1-7 真实试用时一并目检。
+  未打进 `packages/`；未改 SSE 事件名。待批详情截图已由 R9 补齐：
+  `docs/screens/09-inbox-detail.png`（种子 Finding 的完整写参数：仓库 / PR 号 /
+  评论正文），见文末 R9 实测节；真实写入的目检仍留待 P1-7。
 
 ### R1 审批执行返工实测（2026-11-10，分支 fix/r1-approval-execution）
 
@@ -1030,3 +1043,51 @@ APPROVED」改成锁定语义，并补上扫描前对账与网关规则前提复
   PA—design 复审追认；除补记说明外不回滚、不改动那次删除本身。
 - 明确不做核对：未把 live 套件放进 CI；未引入新外部服务；未碰 R9 及
   以后；未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。
+
+### R9 证据补齐实测（2026-11-11，分支 fix/r9-evidence，堆叠在 R8 上）
+
+审计 M8 的收口（实施方能做的部分）：截图补齐 + L0-2 stub 链路固化为离线回归。
+返工稿 R9 第③项「一次真 Key 对话」按返工稿由用户本人执行，**本节未做、不冒充**；
+P1-7 前置清单第 8 条仍以那次真 Key 对话为准。
+
+- 浏览器探查（先探环境再动手）：系统 PATH 与 `CHROMIUM_BIN` 均无 Chrome；但
+  `~/.cache/ms-playwright` 下有现成的 Chromium 1248 与 chrome-headless-shell 1248
+  （INSTALLATION_COMPLETE、依赖已校验）。无需下载任何东西：新增
+  `scripts/shots.mjs` 直接用该二进制，经 CDP（Node 内置 WebSocket，零新依赖）
+  驱动已构建前端。找不到二进制时脚本明确报错退出（退出码 2），不下载、不冒充。
+- 截图（`npm run shots`，共 9 张，存 `docs/screens/`）：对一个
+  `PIPER_DATA_DIR` 隔离的种子实例截图——种子含假模型配置（Key 为
+  `sk-r9-fake-…wxyz`，界面只应出现末四位掩码）、一条例程完成通知、一条日报
+  产物；待批 Finding 在空态截图后才播种。GitHub 走本地桩，全程不打活网。
+  逐张已目检（内容与掩码）：
+  - `01-main-piper-desktop.png`：选中 Piper 主界面，右栏「该 bot 暂无例程」
+    （与仓库管家隔离），左栏通知未读徽标 1，顶栏「模型已配置」；
+  - `02-main-repo-keeper-desktop.png`：选中仓库管家，右栏晨间仓库扫描例程卡
+    （计划 / 上次运行 / 下次运行、状态 ok）；
+  - `03-main-repo-keeper-artifacts.png`：仓库管家产物页签，日报一条；
+  - `04-settings-model-configured.png`：设置-模型组已配置态，API Key 区只有
+    「已配置（••••wxyz）」末四位掩码，无 Key 全文；
+  - `05-settings-profile.png`：设置-基础资料组（称呼、时区下拉、「关于我」正文）；
+  - `06-settings-connectors.png`：设置-连接器组四卡（GitHub / 网页查询 / 日历 / 邮件）；
+  - `07-settings-notifications.png`：设置-通知组，列表含「晨间仓库扫描已完成」一条；
+  - `08-inbox-empty.png`：待批收件箱空态「现在没有需要你批准的写操作。」；
+  - `09-inbox-detail.png`：待批详情（种子 Finding），含证据链接与「批准后将执行的
+    写操作」完整参数（仓库、PR #42、评论正文）。
+  各切片实测节里「截图本环境做不了」的旧说法已逐处改写为上述图路径（前端迁移 /
+  视觉升级两节关于流式渲染观感的说明属实保留——那部分仍未做浏览器级实测）。
+- stub 链路离线回归（新增 `scripts/test-model-stub.mjs`，`npm run test:model-stub`，
+  已纳入 `npm run test` 聚合）：本地 OpenAI 兼容 stub（流式 SSE 分片 + 非流式
+  JSON），在隔离实例上断言 10/10：保存 stub 配置后读回只有掩码、响应不含 Key
+  全文；测试连接走已保存配置回 ok:true；一次对话 delta **3 个**（≥2）且拼合等于
+  stub 回复全文、无 error 事件；stub 收到的 Authorization 正是设置里保存的 Key；
+  会话 JSONL 落了助手全文且不含 Key 全文；清除 Key 后对话回
+  `MODEL_NOT_CONFIGURED`。
+- 失败分类可区分（返工稿指回归第 28 项；按现行编号对应模型组内的「测试连接坏
+  端点」项，即回归现行第 29 项）：旧断言只看 ok:false，基座 dist 未构建时
+  （`BASE_NOT_BUILT`）也会误绿。已改：回归该项加「error 不含『基座未构建』」的
+  反向断言并改名注明分类；`test-model-stub.mjs` 另在对话链路上逐项区分——死
+  端点对话的 SSE error code 为 `MODEL_ERROR`（端点不通），明确不是
+  `BASE_NOT_BUILT`、也不是 `MODEL_NOT_CONFIGURED`，清除 Key 后则回
+  `MODEL_NOT_CONFIGURED`。
+- 明确不做核对：未做视觉重写；未执行真 Key 对话（用户本人项）；未碰 R10/R11；
+  未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。

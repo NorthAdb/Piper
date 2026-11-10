@@ -398,9 +398,19 @@ async function runExtraChecks({ req, chatEvents, check }) {
 			body: JSON.stringify({ baseUrl: "http://127.0.0.1:9/v1", apiKey: "sk-bad" }),
 		});
 		const alive = await req("/api/session");
+		// R9：这一项必须能区分两类失败——「端点不通」（本项的死端口）与「基座未构建」
+		// （packages dist 缺失时内核报 BASE_NOT_BUILT、error 含「基座未构建」）。旧断言只看
+		// ok:false，基座没构建时也会误绿；现加 error 不含「基座未构建」的反向断言钉死分类。
+		// 对话链路上的三类失败（MODEL_NOT_CONFIGURED / MODEL_ERROR / 成功流）由
+		// scripts/test-model-stub.mjs 以错误 code 逐项区分，不在这里重复。
 		check(
-			"POST /api/settings/model/test 坏端点返回 ok:false 且进程存活",
-			test.status === 200 && test.json?.ok === false && typeof test.json?.error === "string" && alive.status === 200,
+			"POST /api/settings/model/test 坏端点返回 ok:false（端点不通类：error 不含「基座未构建」）且进程存活",
+			test.status === 200 &&
+				test.json?.ok === false &&
+				typeof test.json?.error === "string" &&
+				test.json.error.length > 0 &&
+				!test.json.error.includes("基座未构建") &&
+				alive.status === 200,
 			`实际 ${test.status} ${JSON.stringify(test.json)}`,
 		);
 
