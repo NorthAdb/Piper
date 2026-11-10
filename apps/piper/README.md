@@ -21,9 +21,47 @@ npm --prefix packages/agent run build
 
 ```bash
 cd apps/piper
-npm start            # 或 node server.mjs
+npm start            # 先构建前端（vite build -> public/）再启动 node server.mjs
 # 打开 http://localhost:4310 ，口令默认 piper-dev
 ```
+
+（前端已构建过时也可直接 `node server.mjs`；改完前端源码重新 `npm start` 或 `npm run build:web` 即可。）
+
+## 前端
+
+技术栈（2026-11-10 定案并落地，分支 feat/web-assistant-ui）：**React 19 + TypeScript + Vite**，
+源码在 `web/`，构建产物输出 `public/` 由 `server.mjs` 静态托管（`public/` 已 gitignore，不入库）。
+后端 API 与 SSE 事件契约（`session / delta / tool / system / draft / error / done`）**一律未动**，
+本次迁移只换前端实现，逐项回归结果见文末实测节。
+
+以 **assistant-ui（MIT，`@assistant-ui/react` 0.15.33）** 为主要组件底，实际用到的组件/API：
+
+- `AssistantRuntimeProvider` + `useExternalStoreRuntime`：前端自持消息状态（按 bot 隔离，
+  父级以 `key={botId}` 挂载），`convertMessage` 把自有 part 模型映射为 `ThreadMessageLike`；
+- `ThreadPrimitive.Root / Viewport / Messages / Empty`、`ComposerPrimitive.Root / Input / Send`：中栏对话区与输入区；
+- `MessagePrimitive.Root / Parts`：消息渲染分发——文本走 `Text` 槽位（助手消息用
+  `@assistant-ui/react-markdown` 的 `MarkdownTextPrimitive` + `remark-gfm` 流式渲染，用户消息纯文本），
+  工具事件走 `tool-call` part + `tools.Fallback` 自定义渲染，草案/系统/错误走 `data-*` part +
+  `data.by_name` 分发到对应卡片；
+- 草案卡是自定义 data part 渲染器（确认/放弃按钮，对接既有 `draft` 事件与 `draft-confirm` 接口，
+  回调经 React context 注入），不是 assistant-ui 内置件。
+
+**shadcn/ui AI Elements 借鉴清单**（组合方式借鉴，未引入其代码）：AI Elements 以 shadcn 方式
+拷源码进项目，整套引入需 Tailwind + Radix 脚手架，成本高于收益，故按其公开形态自行实现等价组件：
+
+| AI Elements 件 | Piper 中的等价实现 | 形态借鉴点 |
+|---|---|---|
+| Tool | `web/src/parts.tsx` 的 `ToolCard` | 标题行（工具名 + 状态徽标）+ 可折叠内容区（详情 JSON） |
+| Artifact | `web/src/Desktop.tsx` 的产物卡 | 标题栏（标题 + 元信息 + 收起）+ 内容区 |
+| Message / Conversation | 中栏消息气泡布局（`styles.css`） | 用户右对齐、助手左对齐的会话流排布 |
+| Prompt Input | `ComposerPrimitive` 的组合方式 | 输入区 + 发送按钮的贴底布局（实现用 assistant-ui 原语） |
+
+未借鉴：Reasoning（后端 SSE 契约无推理事件，暂无落点）、Queue/Plan 等（当前形态用不上）。
+样式为自有 CSS（`web/src/styles.css`），未引入 Tailwind。
+
+三栏布局保持规格：左栏 bot 列表与右栏「bot 桌面」（例程/产物/记忆）是业务组件自研
+（`BotList.tsx` / `Desktop.tsx`），借鉴 assistant-ui ThreadList 的列表组织思路，数据走既有 API；
+登录页沿用既有 cookie 口令机制。
 
 ## 环境变量
 
@@ -89,7 +127,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 
 | 验收项 | 状态 |
 |---|---|
-| 壳：单口令登录 + 三栏 | 已实现（`POST /api/login` cookie 会话；左 bot 列表 / 中 chat / 右三页签） |
+| 壳：单口令登录 + 三栏 | 已实现（`POST /api/login` cookie 会话；左 bot 列表 / 中 chat / 右三页签；前端为 React + assistant-ui，见「前端」节） |
 | bot 建改删双入口 | 界面表单（POST/PUT/DELETE /api/bots）+ 主 bot 对话草案卡（draft 事件 → draft-confirm 落库） |
 | 与任意 bot 真对话（Pi 内核、流式） | 已实现（agent-core Agent + pi-ai streamSimple，SSE delta）；需自备模型 Key 实测真回复，无 Key 时明确「未配置模型」 |
 | 每 bot 独立会话与工作区 | 已实现（sessions/<botId>.jsonl、workspaces/<botId>/） |
@@ -120,3 +158,23 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `GET /api/approvals`：返回 `{"approvals":[]}`（占位符合规格）。
 - `GET /api/memory/repo-keeper`：返回该 bot 的 memory.md（种子阶段为空串）与账号级 about-me 全文。
 - 前端首页 `GET /` 返回 200（单页三栏，人工目检结构，未做视觉 polish——后续迭代可能换 React 组件库，后端 API 与数据层不变）。
+
+### 前端迁移实测（2026-11-10，分支 feat/web-assistant-ui）
+
+原生前端已由 React + assistant-ui 实现替代（源码 `web/`），同环境复测（Node v24.22.1，端口 4310，无模型 Key）：
+
+- 构建：`npm run check`（tsc --noEmit）无错误；`npm run build:web`（vite 8.3.4）成功，
+  产物 `public/index.html` + `assets/index-*.js`（约 774KB，gzip 233KB；有 >500KB chunk 警告，
+  雏形阶段接受，后续可按需代码分割）+ `assets/index-*.css`。`npm start` 已串联构建，实测从构建到监听全流程通。
+- 静态托管：`GET /` 返回新构建的 index.html（引用哈希 bundle），bundle JS/CSS 均 200；
+  bundle 内含新前端代码（「Bot 草案卡」）与 assistant-ui 运行时，确认托管的是新产物而非旧原生页。
+- 回归（与迁移前逐项一致）：未登录 `/api/bots` 401；登录 `{"ok":true}`；`/api/session` 显示
+  `modelConfigured:false`；`/api/bots` 两预置 bot 且主 bot 置顶；
+  chat 普通消息 SSE 依次 `session` → `error {code:"MODEL_NOT_CONFIGURED", message:"未配置模型：…"}` → `done`；
+  对主 bot 说建 bot 意图，SSE `system`（规则兜底标注）→ `draft {name:"代码审查", source:"rules"}` → `done`，
+  `draft-confirm` 后落库并出现在列表中（测试 bot 已删除，数据恢复为两个种子 bot）；
+  主 bot 历史流水含 draft 条目（新前端渲染为只读草案卡）；bot POST/PUT/DELETE 回归通过、删主 bot 仍被拒的
+  后端行为未变；晨间扫描真实生成日报 `2026-11-10-morning-scan-*`（`lastStatus:"ok"`），产物列表/单篇读取正常；
+  `/api/approvals` 恒 `{"approvals":[]}`；`/api/memory/repo-keeper` 返回 memory.md 与「关于我」全文。
+- 说明：本子任务环境无浏览器，页面级交互（流式渲染观感、草案卡点击确认）未做浏览器实测，
+  以上均为服务端与契约层证据；前端事件处理与后端契约一一对应（见 `web/src/ChatPane.tsx` 的 SSE 分发）。
