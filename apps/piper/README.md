@@ -685,3 +685,37 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 明确不做核对：未接第二种写意图；未做通用权限语言；未改 `packages/`；未改 SSE
   事件名；未做多用户审批。R2–R11 不在本 PR（时区校验、Origin、测试隔离、去重
   冷却与对账等均未动）。全部测试走替身，未对真实仓库发评论。
+
+### R2 监听与跨源写入收口实测（2026-11-10，分支 fix/r2-listen-origin，堆叠在 R1 上）
+
+审计 B2 的收口：默认安装不再把「可写 GitHub 评论 + 模型 Key 末四位可见 + 能触发
+测试连接」的服务面暴露给局域网，跨站表单/脚本也打不进来。先红后修：
+
+- 先红（未改实现时）：回归新增 R2 组（59–63）**59/63**——SameSite 还是 Lax、
+  evil Origin 的 PUT 回 200、text/plain 的 PUT 回 200、12 次错口令全 401 无限速；
+  新脚本 `test-listen` **2/6**——默认监听是 `*`（全接口）、`PIPER_HOST=0.0.0.0` +
+  默认口令照常启动。与审计探针 P-HTTP-4/P-HTTP-6 的结论一致。红输出留档在
+  仓库外 `~/workspace/piper-r2-red.log`，PR 描述中摘录。
+- 监听（`server.mjs`）：新增 `PIPER_HOST`（默认 `127.0.0.1`），`listen` 显式绑定；
+  未设 `PIPER_TOKEN`（默认口令）且监听地址非回环（127.0.0.1 / ::1 / localhost
+  之外）→ 进程在做任何事之前 `exit(1)` 并在 stderr 写明原因与解法。启动日志保留
+  口令来源提示；登录页删除「本地开发默认 piper-dev」文案，改为通用提示（构建
+  产物已 grep 核对旧文案消失）。
+- 写请求守卫：所有 `/api/` 写方法（POST/PUT/PATCH/DELETE）在路由分发前统一过
+  一道——`Origin` 有则必须与 `Host` 同源（解析失败按跨源处理），不符 403；
+  `Content-Type` 必须以 `application/json` 开头，不符 415。无 Origin 的非浏览器
+  客户端（curl、脚本、回归）不受影响；同源 Origin 的 PUT 回归断言为 200 放行。
+  会话 Cookie 改为 `SameSite=Strict`。
+- 登录限速：内存态按来源（TCP 对端地址）计连续失败，超过 10 次锁定 60 秒，
+  锁定期间登录一律 429（正确口令亦然），登录成功清零。回归口径与返工稿验收
+  一致：连续 11 次错口令均 401、第 12 次 429。
+- 改绿（本分支）：回归 **63/63**（58 基线 + R2 组 5 项，只增不减）；`test-listen`
+  **6/6**（默认 ss 实查 127.0.0.1、非回环 + 默认口令拒绝启动且退出码非 0 且输出
+  含原因、非回环 + 显式口令监听 0.0.0.0）；同批复跑 test-findings 27/27、
+  test-gateway 18/18、test-scan 5/5、test-schedule 12/12、eval:scan 5/5、
+  `npm run check` 无错误、`npm run build:web` 成功。回归起 server 的方式与新默认
+  监听天然兼容（本来就连 127.0.0.1 且显式设了 PIPER_TOKEN），无需适配改动。
+- 明确不做核对：未做账号体系 / OAuth / 多用户；未做 HTTPS 终止（交给反代）；
+  未碰 R3 的时区保存校验与调度防崩、未碰 R4 测试隔离、未碰 R5 及以后；返工稿
+  建议随 R2 一并做的 R7「测试接口不外送已保存 Key」未在本 PR 做（保持单一
+  主题），留 R7 处理。未改 `packages/`；未改 SSE 事件名。

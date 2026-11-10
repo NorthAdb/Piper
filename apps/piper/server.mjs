@@ -1,6 +1,10 @@
 // Piper 雏形服务端：Node 内置 http，零框架依赖。
 // API 契约（JSON；chat 为 SSE）：
-// POST /api/login {token} 单口令登录，种 cookie 会话
+// POST /api/login {token} 单口令登录，种 cookie 会话（同来源连续 11 次错口令后锁定 60 秒，超限回 429）
+// 监听与写请求守卫（R2）：默认只监听 127.0.0.1，PIPER_HOST 显式放开；未设 PIPER_TOKEN
+// （默认口令）且监听非回环地址时进程拒绝启动。所有写方法（POST/PUT/PATCH/DELETE）
+// 校验 Origin（有则必须与 Host 同源，不符 403）并要求 Content-Type: application/json
+// （不符 415）；会话 Cookie 为 SameSite=Strict。
 // GET /api/session {authenticated, modelConfigured}
 // GET /api/bots bot 列表（主 bot 置顶）
 // POST /api/bots 界面填卡建 bot
@@ -78,8 +82,55 @@ import { approveApproval, listApprovals, rejectApproval} from "./lib/approvals.m
 import { listAudit} from "./lib/audit.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
+const HOST = process.env.PIPER_HOST || "127.0.0.1";
 const TOKEN = process.env.PIPER_TOKEN || "piper-dev";
+const USING_DEFAULT_TOKEN = !process.env.PIPER_TOKEN;
 const sessions = new Set();
+
+function isLoopbackHost(host) {
+return host === "127.0.0.1" || host === "::1" || host === "localhost";
+}
+
+// 默认口令只允许回环监听：非回环 + 默认口令的组合会把可写网关与设置面直接暴露给
+// 局域网，进程拒绝启动并写明原因（R2）。显式设置 PIPER_TOKEN 后可自由放开监听。
+if (USING_DEFAULT_TOKEN && !isLoopbackHost(HOST)) {
+console.error(`拒绝启动：未设置 PIPER_TOKEN 时使用默认口令，只允许回环监听（127.0.0.1），但 PIPER_HOST=${HOST}。请先设置 PIPER_TOKEN 环境变量再放开监听地址。`);
+process.exit(1);
+}
+
+// 登录限速（R2）：同一来源连续错口令超过 10 次后锁定 60 秒，锁定期间一律 429；
+// 登录成功清零计数。来源以 TCP 对端地址计（单用户单进程，内存态即可）。
+const loginAttempts = new Map();
+function loginLocked(source) {
+const entry = loginAttempts.get(source);
+return Boolean(entry && entry.lockedUntil > Date.now());
+}
+function noteLoginFailure(source) {
+const entry = loginAttempts.get(source) || { fails: 0, lockedUntil: 0 };
+entry.fails += 1;
+if (entry.fails > 10) entry.lockedUntil = Date.now() + 60 * 1000;
+loginAttempts.set(source, entry);
+}
+
+// 写请求守卫（R2）：跨站表单/脚本不得驱动本服务的任何写接口。Origin 有则必须与
+// Host 同源（不符 403）；Content-Type 必须是 application/json（不符 415）。
+// 无 Origin 的非浏览器客户端（curl、脚本、回归）不受影响。
+const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+function writeGuardViolation(req) {
+const origin = req.headers.origin;
+if (origin) {
+let originHost = null;
+try {
+originHost = new URL(origin).host;
+} catch {
+originHost = null;
+}
+if (originHost !== req.headers.host) return { status: 403, error: "跨源请求被拒绝（Origin 与 Host 不一致）" };
+}
+const contentType = String(req.headers["content-type"] || "").toLowerCase();
+if (!contentType.startsWith("application/json")) return { status: 415, error: "写请求要求 Content-Type: application/json" };
+return null;
+}
 
 ensureData();
 
@@ -235,14 +286,24 @@ const server = createServer(async (req, res) => {
 const url = new URL(req.url, `http://${req.headers.host}`);
 const path = url.pathname;
 try {
+if (path.startsWith("/api/") && WRITE_METHODS.has(req.method)) {
+const violation = writeGuardViolation(req);
+if (violation) return sendJson(res, violation.status, { error: violation.error});
+}
 if (path === "/api/login" && req.method === "POST") {
+const source = req.socket.remoteAddress || "unknown";
+if (loginLocked(source)) return sendJson(res, 429, { error: "登录尝试过于频繁，请 60 秒后再试"});
 const { token} = await readBody(req);
-if (token!== TOKEN) return sendJson(res, 401, { error: "口令不正确"});
+if (token!== TOKEN) {
+noteLoginFailure(source);
+return sendJson(res, 401, { error: "口令不正确"});
+}
+loginAttempts.delete(source);
 const sid = randomBytes(24).toString("hex");
 sessions.add(sid);
 res.writeHead(200, {
 "Content-Type": "application/json; charset=utf-8",
-"Set-Cookie": `piper_session=${sid}; HttpOnly; Path=/; SameSite=Lax`,
+"Set-Cookie": `piper_session=${sid}; HttpOnly; Path=/; SameSite=Strict`,
 });
 return res.end(JSON.stringify({ ok: true}));
 }
@@ -387,8 +448,8 @@ return sendJson(res, err.status || 500, { error: err.message});
 }
 });
 
-server.listen(PORT, () => {
-console.log(`Piper prototype listening on http://localhost:${PORT} (token: ${process.env.PIPER_TOKEN? "from env": "default piper-dev"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
+server.listen(PORT, HOST, () => {
+console.log(`Piper prototype listening on http://${HOST}:${PORT} (token: ${process.env.PIPER_TOKEN? "from env": "default piper-dev"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
 // 定时调度启动：先 tick 一次（处理启动补跑与首次规划），之后每 30 秒推进状态机。
 void scheduler.tick(new Date());
 const timer = setInterval(() => void scheduler.tick(new Date()), 30 * 1000);

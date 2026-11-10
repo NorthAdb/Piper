@@ -248,6 +248,7 @@ async function main() {
 		await runScheduleChecks({ req, check, anon });
 		await runApprovalChecks({ req, check, anon });
 		await runAuditChecks({ req, check, anon });
+		await runSecurityChecks({ check, cookie });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -650,6 +651,51 @@ async function runAuditChecks({ req, check, anon }) {
 			Array.isArray(filtered.json?.records) &&
 			(filtered.json?.records ?? []).every((r) => r.findingId === "f-no-such-item"),
 		`实际 all=${all.status}/${all.json?.records?.length} filtered=${filtered.status}/${filtered.json?.records?.length}`,
+	);
+}
+
+// R2（59-63）：监听与跨源写入收口的服务端契约——会话 Cookie SameSite=Strict；写请求
+// 带跨源 Origin 回 403、Content-Type 非 JSON 回 415、同源 Origin 正常放行；登录限速
+// （连续 11 次错口令均 401、第 12 次 429）。监听地址绑定与「非回环 + 默认口令拒绝
+// 启动」需要另起进程，在 scripts/test-listen.mjs 覆盖。本组放在最后：限速锁定来源后
+// 不应再有依赖登录的断言。
+async function runSecurityChecks({ check, cookie }) {
+	const login = await fetch(`${BASE}/api/login`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ token: TOKEN }),
+	});
+	const setCookie = login.headers.get("set-cookie") || "";
+	check("登录 Cookie 带 SameSite=Strict", login.status === 200 && setCookie.includes("SameSite=Strict"), `status=${login.status} set-cookie=${setCookie}`);
+
+	const put = (headers, body = "{}") =>
+		fetch(`${BASE}/api/settings/profile`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json", Cookie: cookie, ...headers },
+			body,
+		});
+	const evil = await put({ Origin: "http://evil.example" }, JSON.stringify({ displayName: "跨源写入不应生效" }));
+	check("带跨源 Origin（evil.example）的 PUT 返回 403", evil.status === 403, `实际 ${evil.status}`);
+
+	const plain = await put({ "Content-Type": "text/plain" });
+	check("Content-Type 为 text/plain 的 PUT 返回 415", plain.status === 415, `实际 ${plain.status}`);
+
+	const sameOrigin = await put({ Origin: BASE }, JSON.stringify({ displayName: "回归测试" }));
+	check("带同源 Origin 的 PUT 正常放行（200）", sameOrigin.status === 200, `实际 ${sameOrigin.status}`);
+
+	const statuses = [];
+	for (let i = 0; i < 12; i++) {
+		const r = await fetch(`${BASE}/api/login`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ token: `wrong-${i}` }),
+		});
+		statuses.push(r.status);
+	}
+	check(
+		"连续 11 次错口令均 401、第 12 次返回 429（登录限速）",
+		statuses.slice(0, 11).every((s) => s === 401) && statuses[11] === 429,
+		`实际 ${statuses.join(",")}`,
 	);
 }
 

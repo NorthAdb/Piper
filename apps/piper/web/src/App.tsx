@@ -94,7 +94,7 @@ export function App() {
 							<BotIcon className="size-5.5" />
 						</span>
 						<CardTitle className="text-lg tracking-tight">Piper</CardTitle>
-						<CardDescription>单用户口令登录（本地开发默认 piper-dev，可用环境变量 PIPER_TOKEN 修改）。</CardDescription>
+						<CardDescription>单用户口令登录（口令由服务端配置；使用默认口令时仅限本机回环访问）。</CardDescription>
 					</CardHeader>
 					<CardContent className="px-6 pt-4 pb-8">
 						<form onSubmit={onLogin} className="flex flex-col gap-4">
