@@ -60,6 +60,12 @@ export type ModelSettingsInput = {
 	apiKey?: string;
 };
 
+// 基础资料（GET/PUT /api/settings/profile 的线格式）；「关于我」正文走 /api/about-me，不在此重复
+export type ProfileSettings = {
+	displayName: string;
+	timezone: string;
+};
+
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
 export type HistoryEntry = {
 	ts?: string;

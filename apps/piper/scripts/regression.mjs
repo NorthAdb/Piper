@@ -197,7 +197,20 @@ async function main() {
 		const homeHtml = await home.text();
 		check('GET / 返回 200 且 html 带 class="dark"', home.status === 200 && homeHtml.includes('class="dark"'), `实际 ${home.status}`);
 
+		const anon = async (path, init = {}) => {
+			const res = await fetch(BASE + path, { ...init, headers: { "Content-Type": "application/json", ...(init.headers || {}) } });
+			const text = await res.text();
+			let json = null;
+			try {
+				json = JSON.parse(text);
+			} catch {
+				/* 非 JSON */
+			}
+			return { status: res.status, json, text };
+		};
+
 		await runExtraChecks({ req, chatEvents, check });
+		await runProfileChecks({ req, check, anon });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -266,6 +279,64 @@ async function runExtraChecks({ req, chatEvents, check }) {
 	} finally {
 		if (existsSync(settingsFile)) rmSync(settingsFile);
 	}
+}
+
+// L0-3（31-35）：基础资料与「关于我」——未登录写 401、profile 保存读回、about-me 三处同源、
+// 超限拒绝不写坏原文件。运行前快照原 profile 与 about-me，结束时还原，不污染用户真实数据。
+async function runProfileChecks({ req, check, anon }) {
+	const origProfile = (await req("/api/settings/profile")).json ?? {};
+	const origAbout = (await req("/api/about-me")).json?.markdown ?? "";
+	const MARK = "回归标记-L0-3-关于我同源";
+	try {
+		const unauth = await anon("/api/about-me", { method: "PUT", body: JSON.stringify({ markdown: "未登录写入" }) });
+		check("未登录 PUT /api/about-me 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
+
+		const savedProfile = await req("/api/settings/profile", {
+			method: "PUT",
+			body: JSON.stringify({ displayName: "回归称呼", timezone: "Asia/Tokyo" }),
+		});
+		const readProfile = await req("/api/settings/profile");
+		check(
+			"PUT /api/settings/profile 保存后 GET 读回称呼与时区一致",
+			savedProfile.status === 200 && readProfile.json?.displayName === "回归称呼" && readProfile.json?.timezone === "Asia/Tokyo",
+			`实际 ${JSON.stringify(readProfile.json)}`,
+		);
+
+		const withMark = `${origAbout}\n\n- ${MARK}\n`;
+		const putAbout = await req("/api/about-me", { method: "PUT", body: JSON.stringify({ markdown: withMark }) });
+		const getAbout = await req("/api/about-me");
+		const memory = await req("/api/memory/repo-keeper");
+		check(
+			"PUT /api/about-me 后 GET /api/about-me 与记忆接口 aboutMe 均含新标记（同源一份）",
+			putAbout.status === 200 &&
+				String(getAbout.json?.markdown ?? "").includes(MARK) &&
+				String(memory.json?.aboutMe ?? "").includes(MARK),
+			`put=${putAbout.status} get含标记=${String(getAbout.json?.markdown ?? "").includes(MARK)} memory含标记=${String(memory.json?.aboutMe ?? "").includes(MARK)}`,
+		);
+
+		const tooBig = await req("/api/about-me", { method: "PUT", body: JSON.stringify({ markdown: "x".repeat(20001) }) });
+		const afterBig = await req("/api/about-me");
+		check(
+			"超限（20001 字符）PUT /api/about-me 被拒绝且原文件保持上一步内容",
+			(tooBig.status === 413 || tooBig.status === 400) && afterBig.json?.markdown === withMark,
+			`实际 status=${tooBig.status} 内容一致=${afterBig.json?.markdown === withMark}`,
+		);
+	} finally {
+		await req("/api/about-me", { method: "PUT", body: JSON.stringify({ markdown: origAbout }) });
+		await req("/api/settings/profile", {
+			method: "PUT",
+			body: JSON.stringify({ displayName: origProfile.displayName ?? "", timezone: origProfile.timezone ?? "" }),
+		});
+	}
+	const restoredAbout = await req("/api/about-me");
+	const restoredProfile = await req("/api/settings/profile");
+	check(
+		"还原后 about-me 与 profile 与运行前一致",
+		restoredAbout.json?.markdown === origAbout &&
+			restoredProfile.json?.displayName === (origProfile.displayName ?? "") &&
+			restoredProfile.json?.timezone === (origProfile.timezone ?? "Asia/Hong_Kong"),
+		`about一致=${restoredAbout.json?.markdown === origAbout} profile=${JSON.stringify(restoredProfile.json)}`,
+	);
 }
 
 main().catch((err) => {

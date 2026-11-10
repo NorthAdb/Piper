@@ -136,7 +136,9 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 
 - `bots.json`：bot 元数据（雏形用 JSON 文件代替规格中的 SQLite，接口不变，后续可平滑替换）
 - `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
-- `about-me.md`：账号级「关于我」，全 bot 可读；写入仅主 bot（雏形未开写入接口）
+- `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
+- `about-me.md`：账号级「关于我」，只有一份——设置页（`PUT /api/about-me`，需登录）、右栏记忆
+  与对话注入读的都是它；上限 20000 字符，超限拒绝且不写坏原文件（L0-3）
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
 - `sessions/<botId>.jsonl`：每 bot 独立会话流水
 - `artifacts/<id>.md`：产物，文件头 HTML 注释内嵌结构化元数据
@@ -290,3 +292,25 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
   5. 回设置页点「清除 Key」，顶栏徽标应回「未配置模型」，再发消息应回 `MODEL_NOT_CONFIGURED`。
 - 截图类验收（设置页已配置状态、Key 掩码）本环境做不了（无浏览器工具），以以上构建 +
   接口 + stub 链路证据替代，留待用户本地目检。
+
+### L0-3 基础资料与「关于我」实测（2026-11-10，分支 feat/l0-3-profile-about）
+
+- 存储：基础资料（称呼、时区）存 `data/settings-profile.json`（`lib/settings.mjs` 的
+  `readProfileSettings / saveProfileSettings`，时区缺省 `Asia/Hong_Kong`）；「关于我」不另存——
+  仍只有一份 `data/about-me.md`，`store.writeAboutMe` 写入（临时文件 + rename 落盘）。
+- 接口：`GET / PUT /api/settings/profile`（部分字段更新）；`PUT /api/about-me`（需登录，
+  `markdown` 须为字符串；超过 20000 字符回 413 且原文件不动）。设置页「基础资料」组为真表单
+  （`web/src/SettingsProfile.tsx`：称呼、时区（带常用时区候选）、「关于我」正文与字符计数）。
+- 注入核对：对话注入没有缓存问题——`server.mjs` 每轮 chat 都现调 `readAboutMe()` 组装
+  systemPrompt（`readAboutMe` 本身每次读文件），改完保存下一轮即生效，无需改动。
+- 回归：脚本扩展至 35 项，`node scripts/regression.mjs` **35/35 通过**（无 Key 默认环境）；
+  新增断言：未登录 `PUT /api/about-me` 401；profile 保存后读回一致；写入带标记的「关于我」
+  后 `GET /api/about-me` 与 `/api/memory/:botId` 的 `aboutMe` 均含标记（同源一份的两个读口；
+  设置页读同一 `GET /api/about-me`，为第三处）；超限 20001 字符被拒且文件保持上一步内容；
+  脚本结束时把 about-me 与 profile 还原为运行前内容并断言一致。`npm run check` 无错误；
+  `npm run build:web` 成功。
+- 验收第 3 条（新对话注入含新文本）在无 Key 环境无法从对话层直接观测：以「每轮现读文件」
+  的代码路径 + 读取同源断言作为证据；有真 Key 时可按 L0-2 人工复验步骤顺带核对（改一条
+  「关于我」事实后新开对话问 bot）。
+- 截图类验收（设置页基础资料组）本环境做不了（无浏览器工具），以构建 + 契约证据替代，
+  留待用户本地目检。

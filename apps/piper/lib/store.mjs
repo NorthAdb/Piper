@@ -6,7 +6,7 @@
 //   sessions/<botId>.jsonl    每 bot 独立会话流水（一行一条）
 //   artifacts/<id>.md         产物（Markdown），文件头注释里带结构化元数据
 //   routines.json             routine 定义 + 上次运行结果
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -165,8 +165,25 @@ export function deleteBot(id) {
 
 // ---------- about-me ----------
 
+// 「关于我」会注入每一轮对话的 system prompt，体积必须有上限（L0-3）。
+export const ABOUT_ME_MAX_CHARS = 20000;
+
 export function readAboutMe() {
 	return existsSync(ABOUT_ME_FILE) ? readFileSync(ABOUT_ME_FILE, "utf8") : "";
+}
+
+// 写入唯一的 about-me.md（设置页、右栏记忆、对话注入三处同源，只此一份）。
+// 超限在落盘前拒绝，原文件不动；落盘走临时文件 + rename，避免写一半损坏。
+export function writeAboutMe(markdown) {
+	const text = String(markdown ?? "");
+	if (text.length > ABOUT_ME_MAX_CHARS) {
+		throw Object.assign(new Error(`「关于我」超过 ${ABOUT_ME_MAX_CHARS} 字符上限（当前 ${text.length}）`), { status: 413 });
+	}
+	ensureDir(DATA_DIR);
+	const tmp = `${ABOUT_ME_FILE}.tmp`;
+	writeFileSync(tmp, text, "utf8");
+	renameSync(tmp, ABOUT_ME_FILE);
+	return text;
 }
 
 // ---------- sessions ----------

@@ -19,6 +19,9 @@
 // GET /api/settings/model 模型设置读回（configured/baseUrl/modelId/apiKeyHint，绝无 Key 全文）
 // PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除），保存即热生效
 // POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
+// GET /api/settings/profile 基础资料读回（displayName/timezone，时区缺省 Asia/Hong_Kong）
+// PUT /api/settings/profile 保存基础资料（部分字段可单独更新）
+// PUT /api/about-me 写入账号级「关于我」（需登录；与 GET 同源一份 about-me.md；超 20000 字符回 413，原文件不动）
 //
 // POST /api/chat 的 SSE 事件（event 名 + JSON data）：
 // session {botId, sessionId} 本轮开始
@@ -41,6 +44,7 @@ createBot,
 updateBot,
 deleteBot,
 readAboutMe,
+writeAboutMe,
 appendSession,
 readSession,
 listRoutines,
@@ -51,7 +55,7 @@ readArtifact,
 readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
-import { saveModelSettingsFile} from "./lib/settings.mjs";
+import { readProfileSettings, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
@@ -200,6 +204,19 @@ return deleteBot(botMatch[1])? sendJson(res, 200, { ok: true}): sendJson(res, 40
 const msgMatch = path.match(/^\/api\/bots\/([\w-]+)\/messages$/);
 if (msgMatch && req.method === "GET") return sendJson(res, 200, { messages: readSession(msgMatch[1])});
 if (path === "/api/about-me" && req.method === "GET") return sendJson(res, 200, { markdown: readAboutMe()});
+if (path === "/api/about-me" && req.method === "PUT") {
+const body = await readBody(req);
+if (typeof body.markdown!== "string") return sendJson(res, 400, { error: "markdown 必填且须为字符串"});
+return sendJson(res, 200, { markdown: writeAboutMe(body.markdown)});
+}
+if (path === "/api/settings/profile" && req.method === "GET") return sendJson(res, 200, readProfileSettings());
+if (path === "/api/settings/profile" && req.method === "PUT") {
+const body = await readBody(req);
+const patch = {};
+if (typeof body.displayName === "string") patch.displayName = body.displayName;
+if (typeof body.timezone === "string") patch.timezone = body.timezone;
+return sendJson(res, 200, saveProfileSettings(patch));
+}
 if (path === "/api/chat" && req.method === "POST") return await handleChat(req, res);
 if (path === "/api/routines" && req.method === "GET") return sendJson(res, 200, { routines: listRoutines()});
 if (path === "/api/routines/morning-scan/run" && req.method === "POST") {

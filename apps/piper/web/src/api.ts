@@ -1,5 +1,16 @@
 // Piper 后端 API 客户端：cookie 会话（与 server.mjs 一致），401 时抛 UnauthorizedError 交给界面回登录页。
-import type { Artifact, ArtifactMeta, Bot, BotDraft, ChatEvent, HistoryEntry, ModelSettings, ModelSettingsInput, Routine } from "./model";
+import type {
+	Artifact,
+	ArtifactMeta,
+	Bot,
+	BotDraft,
+	ChatEvent,
+	HistoryEntry,
+	ModelSettings,
+	ModelSettingsInput,
+	ProfileSettings,
+	Routine,
+} from "./model";
 
 export class UnauthorizedError extends Error {
 	constructor() {
@@ -88,6 +99,22 @@ export function saveModelSettings(input: ModelSettingsInput): Promise<ModelSetti
 
 export function testModelSettings(input: ModelSettingsInput): Promise<{ ok: boolean; error?: string }> {
 	return api("/api/settings/model/test", { method: "POST", body: JSON.stringify(input) });
+}
+
+export function getProfileSettings(): Promise<ProfileSettings> {
+	return api("/api/settings/profile");
+}
+
+export function saveProfileSettings(input: Partial<ProfileSettings>): Promise<ProfileSettings> {
+	return api("/api/settings/profile", { method: "PUT", body: JSON.stringify(input) });
+}
+
+export async function getAboutMe(): Promise<string> {
+	return (await api<{ markdown: string }>("/api/about-me")).markdown;
+}
+
+export async function saveAboutMe(markdown: string): Promise<string> {
+	return (await api<{ markdown: string }>("/api/about-me", { method: "PUT", body: JSON.stringify({ markdown }) })).markdown;
 }
 
 // POST /api/chat 的 SSE 流：逐事件回调；事件形状保持后端契约（session/delta/tool/system/draft/error/done）

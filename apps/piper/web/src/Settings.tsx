@@ -1,11 +1,12 @@
-// 设置视图（L0-1 骨架 + L0-2 模型组真接入）：独立整页，四组——模型 / 基础资料 / 连接器 / 通知。
-// 模型组已是真表单（SettingsModel.tsx，保存热生效）；其余三组仍为占位空状态，后续切片接入。
+// 设置视图（L0-1 骨架 + L0-2 模型组 + L0-3 基础资料组真接入）：独立整页，四组——模型 / 基础资料 / 连接器 / 通知。
+// 模型组（SettingsModel.tsx）与基础资料组（SettingsProfile.tsx）已是真表单；连接器、通知仍为占位，后续切片接入。
 import { ArrowLeftIcon, BellIcon, BlocksIcon, SlidersHorizontalIcon, UserRoundIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { ModelSettingsForm } from "./SettingsModel";
+import { ProfileSettingsForm } from "./SettingsProfile";
 
 function PendingGroup({ title, description, note }: { title: string; description: string; note: string }) {
 	return (
@@ -69,11 +70,7 @@ export function Settings({
 						<ModelSettingsForm onSaved={onModelSaved} onUnauthorized={onUnauthorized} />
 					</TabsContent>
 					<TabsContent value="profile">
-						<PendingGroup
-							title="基础资料"
-							description="称呼、时区与账号级「关于我」（about-me.md）。"
-							note="编辑入口即将在后续切片接入；右栏记忆页签目前只读展示同一份「关于我」。"
-						/>
+						<ProfileSettingsForm onUnauthorized={onUnauthorized} />
 					</TabsContent>
 					<TabsContent value="connectors">
 						<PendingGroup
