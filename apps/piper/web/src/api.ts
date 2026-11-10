@@ -8,6 +8,7 @@ import type {
 	Connector,
 	HistoryEntry,
 	ModelSettings,
+	NotificationEntry,
 	ModelSettingsInput,
 	ProfileSettings,
 	Routine,
@@ -124,6 +125,14 @@ export async function getConnectors(): Promise<Connector[]> {
 
 export async function saveGithubToken(token: string): Promise<Connector> {
 	return (await api<{ connector: Connector }>("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token }) })).connector;
+}
+
+export function getNotifications(): Promise<{ notifications: NotificationEntry[]; unread: number }> {
+	return api("/api/notifications");
+}
+
+export function markNotificationsRead(ids?: string[]): Promise<{ notifications: NotificationEntry[]; unread: number }> {
+	return api("/api/notifications/read", { method: "POST", body: JSON.stringify(ids ? { ids } : {}) });
 }
 
 // POST /api/chat 的 SSE 流：逐事件回调；事件形状保持后端契约（session/delta/tool/system/draft/error/done）

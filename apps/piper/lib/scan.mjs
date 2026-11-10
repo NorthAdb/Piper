@@ -60,18 +60,22 @@ async function scanRepo(repo) {
 	return lines.join("\n");
 }
 
-// 返回 { artifact, report }：report 为日报正文，artifact 为产物元数据。
+// 返回 { artifact, report, failures, total }：report 为日报正文，artifact 为产物元数据；
+// failures 是取证失败的仓库数（单仓失败不中断整体、原因写进日报），total 为仓库总数。
+// 调用方据此判定整轮成败：全部仓库都失败时不应报成功（L0-5 起用于例程状态与失败通知）。
 export async function runMorningScan({ repos, botId, saveArtifact }) {
 	const now = new Date();
 	const parts = [`# 晨间仓库日报 ${now.toISOString().slice(0, 10)}`, "", `扫描时间：${now.toISOString()} · 仓库数：${repos.length}`, ""];
+	let failures = 0;
 	for (const repo of repos) {
 		try {
 			parts.push(await scanRepo(repo));
 		} catch (err) {
+			failures += 1;
 			parts.push(`## ${repo}\n\n- 扫描失败：${err.message}\n`);
 		}
 	}
 	const body = parts.join("\n");
 	const artifact = saveArtifact({ botId, kind: "morning-scan", title: `晨间仓库日报 ${now.toISOString().slice(0, 10)}`, body });
-	return { artifact, report: body };
+	return { artifact, report: body, failures, total: repos.length };
 }

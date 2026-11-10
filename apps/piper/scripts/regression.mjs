@@ -212,6 +212,7 @@ async function main() {
 		await runExtraChecks({ req, chatEvents, check });
 		await runProfileChecks({ req, check, anon });
 		await runConnectorChecks({ req, check });
+		await runNotificationChecks({ req, check, anon });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -424,6 +425,68 @@ async function runConnectorChecks({ req, check }) {
 		if (existsSync(githubFile)) rmSync(githubFile);
 		if (savedEnvToken !== undefined) process.env.GITHUB_TOKEN = savedEnvToken;
 	}
+}
+
+// L0-5（40-43）：应用内通知——未登录 401、成功扫描写完成通知、标记已读跨进程持久（文件落盘）、
+// 绑定不存在仓库时整轮失败写失败通知且进程不崩溃，恢复后成功扫描再写完成通知。
+// 注意 data/notifications.jsonl 跨运行累积，断言一律按本轮 artifactId / 新增条目定位，不假设列表为空。
+async function runNotificationChecks({ req, check, anon }) {
+	const unauth = await anon("/api/notifications");
+	check("未登录 GET /api/notifications 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
+
+	const routines = await req("/api/routines");
+	const morning = (routines.json?.routines ?? []).find((r) => r.id === "morning-scan");
+	const list1 = await req("/api/notifications");
+	const completed = (list1.json?.notifications ?? []).find((n) => n.type === "routine.completed" && n.artifactId === morning?.lastArtifactId);
+	check(
+		"本轮成功扫描已写 routine.completed 通知（artifactId 对上 lastArtifactId）且初始未读",
+		Boolean(completed) && completed.read === false && (list1.json?.unread ?? 0) >= 1 && completed.routineId === "morning-scan",
+		`找到=${Boolean(completed)} unread=${list1.json?.unread}`,
+	);
+
+	// 标记已读后：接口内状态更新，且脚本进程（相当于重启后的新进程）从文件读到的也是已读——证明文件持久。
+	const unreadBefore = list1.json?.unread ?? 0;
+	const marked = completed ? await req("/api/notifications/read", { method: "POST", body: JSON.stringify({ ids: [completed.id] }) }) : { json: null };
+	const inMarked = (marked.json?.notifications ?? []).find((n) => n.id === completed?.id);
+	const { listNotifications } = await import("../lib/notify.mjs");
+	const fromFile = listNotifications().find((n) => n.id === completed?.id);
+	check(
+		"POST /api/notifications/read 标记后 unread 减一且文件落盘（新进程读回为已读）",
+		Boolean(completed) && inMarked?.read === true && marked.json?.unread === unreadBefore - 1 && fromFile?.read === true,
+		`unread ${unreadBefore} -> ${marked.json?.unread} 文件已读=${fromFile?.read}`,
+	);
+
+	// 失败路径：把仓库管家临时绑到不存在的仓库，整轮取证失败应记 failed + 失败通知；恢复后再跑成功。
+	const botsRes = await req("/api/bots");
+	const keeper = (botsRes.json?.bots ?? []).find((b) => b.id === "repo-keeper");
+	const keeperBody = { name: keeper.name, systemPrompt: keeper.systemPrompt, tools: keeper.tools, memoryScope: keeper.memoryScope, repos: keeper.repos };
+	const countFailed = async () => ((await req("/api/notifications")).json?.notifications ?? []).filter((n) => n.type === "routine.failed").length;
+	const failedBefore = await countFailed();
+	let failOk = false;
+	let restoreOk = false;
+	try {
+		await req("/api/bots/repo-keeper", { method: "PUT", body: JSON.stringify({ ...keeperBody, repos: ["NorthAdb/piper-no-such-repo-zzz"] }) });
+		const run = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
+		const afterFail = await req("/api/routines");
+		const morningAfterFail = (afterFail.json?.routines ?? []).find((r) => r.id === "morning-scan");
+		failOk =
+			run.status === 200 && morningAfterFail?.lastStatus === "failed" && (await countFailed()) === failedBefore + 1;
+	} finally {
+		await req("/api/bots/repo-keeper", { method: "PUT", body: JSON.stringify(keeperBody) });
+	}
+	const rerun = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
+	const afterRestore = await req("/api/routines");
+	const morningRestored = (afterRestore.json?.routines ?? []).find((r) => r.id === "morning-scan");
+	const listEnd = await req("/api/notifications");
+	const restoredCompleted = (listEnd.json?.notifications ?? []).find(
+		(n) => n.type === "routine.completed" && n.artifactId === morningRestored?.lastArtifactId,
+	);
+	restoreOk = rerun.status === 200 && morningRestored?.lastStatus === "ok" && Boolean(restoredCompleted);
+	check(
+		"绑不存在仓库时整轮失败：lastStatus=failed 且新增 routine.failed 通知；恢复绑定后再跑成功并写完成通知",
+		failOk && restoreOk,
+		`failOk=${failOk} restoreOk=${restoreOk}`,
+	);
 }
 
 main().catch((err) => {

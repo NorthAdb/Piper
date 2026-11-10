@@ -66,6 +66,18 @@ export type ProfileSettings = {
 	timezone: string;
 };
 
+// 应用内通知（GET /api/notifications 的线格式）：approval.pending 仅为预留类型，第一件才真正写入
+export type NotificationEntry = {
+	id: string;
+	type: "routine.completed" | "routine.failed" | "approval.pending";
+	title: string;
+	body: string;
+	routineId: string | null;
+	artifactId: string | null;
+	read: boolean;
+	createdAt: string;
+};
+
 // 连接器（GET /api/settings/connectors 的线格式）：统一槽位形状；tokenHint 只有末四位掩码
 export type Connector = {
 	id: string;

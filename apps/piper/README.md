@@ -142,6 +142,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
 - `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
 - `settings-github.json`：设置页保存的 GitHub 令牌（明文只存此文件，L0-4；经 `githubToken()` 读取）
+- `notifications.jsonl`：应用内通知一行一条（L0-5），扫描完成 / 整轮失败时写入；`approval.pending` 只预留类型、未写入
 - `about-me.md`：账号级「关于我」，只有一份——设置页（`PUT /api/about-me`，需登录）、右栏记忆
   与对话注入读的都是它；上限 20000 字符，超限拒绝且不写坏原文件（L0-3）
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
@@ -343,3 +344,28 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
   （仍是占位状态，L0-6 才做）。
 - 截图类验收（连接器四卡与展开口径）本环境做不了（无浏览器工具），以构建 + 契约证据
   替代，留待用户本地目检。
+
+### L0-5 应用内通知实测（2026-11-10，分支 feat/l0-5-notifications）
+
+- 通知存储：`lib/notify.mjs` 管 `data/notifications.jsonl`（一行一条，文件持久化）；
+  接口 `GET /api/notifications`（列表新在前 + 未读数）、`POST /api/notifications/read`
+  （`{ids}` 只标记这些、无 ids 全部标记）。左栏「通知」入口带未读徽标，直达设置页通知组
+  （`web/src/SettingsNotifications.tsx`：列表、逐条 / 全部标已读）。
+- 写入点（本批只有例程）：晨间扫描成功写 `routine.completed`；全部仓库取证失败视为整轮
+  失败——日报照常落盘，但 routine 状态记 `failed`、写 `routine.failed` 通知（扫描函数返回
+  失败计数后由路由判定，单仓失败不中断整体）；意料外抛错同样记 failed 通知后回 500，
+  进程不崩溃。`approval.pending` 只在类型枚举与前端标签里预留，没有造假待批数据。
+- 回归：脚本扩展至 43 项，`node scripts/regression.mjs` **43/43 通过**；新增断言：未登录
+  401；本轮成功扫描的完成通知与 `lastArtifactId` 对得上且初始未读；标记已读后未读数减一，
+  且脚本以新进程从文件读回同一条为已读（等价重启后不丢）；把仓库管家临时绑到不存在的
+  仓库后整轮失败（状态 failed + 新增失败通知、进程存活），恢复绑定后再跑成功并写完成
+  通知。`npm run check` 无错误；`npm run build:web` 成功。
+- 环境备注（如实记录）：实测中途出现过两轮 20/41/42（及一次 43 恢复段）失败，定性为本机
+  出口共享 IP 被 GitHub 二级限流的瞬时 403（同刻 `rate_limit` 显示 core 限额未满、curl
+  与 Node 直连随后均恢复 200）；等待约一分钟后完整回归 43/43。这同时真实触发了一次
+  「整轮失败」路径，与注入坏仓库的失败断言互为印证。注意：回归每跑一轮约消耗 25 次
+  GitHub 未授权请求（扫描 3 次），短时间连跑多轮可能再次撞限。
+- 明确不做核对：无邮箱 / 企微等外部渠道、无通知偏好设置、前端无实时推送（进视图时拉取）；
+  未接 P1 的待批事项（仅预留类型）。
+- 截图类验收（通知入口徽标、通知列表观感）本环境做不了（无浏览器工具），以构建 +
+  契约证据替代，留待用户本地目检。

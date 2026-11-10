@@ -27,6 +27,7 @@ export function App() {
 	const [busyBotIds, setBusyBotIds] = useState<ReadonlySet<string>>(new Set());
 	const [form, setForm] = useState<FormState>({ open: false, bot: null });
 	const [view, setView] = useState<"main" | "settings">("main");
+	const [settingsTab, setSettingsTab] = useState("model");
 	const [token, setToken] = useState("");
 	const [loginErr, setLoginErr] = useState("");
 
@@ -124,6 +125,7 @@ export function App() {
 	if (view === "settings") {
 		return (
 			<Settings
+				initialTab={settingsTab}
 				onBack={() => setView("main")}
 				onModelSaved={() => {
 					void getSession()
@@ -145,7 +147,14 @@ export function App() {
 					onSelect={setCurrentBotId}
 					onNew={() => setForm({ open: true, bot: null })}
 					onEdit={(bot) => setForm({ open: true, bot })}
-					onOpenSettings={() => setView("settings")}
+					onOpenSettings={() => {
+						setSettingsTab("model");
+						setView("settings");
+					}}
+					onOpenNotifications={() => {
+						setSettingsTab("notifications");
+						setView("settings");
+					}}
 				/>
 			</aside>
 

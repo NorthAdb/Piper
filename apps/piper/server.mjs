@@ -24,6 +24,8 @@
 // PUT /api/about-me 写入账号级「关于我」（需登录；与 GET 同源一份 about-me.md；超 20000 字符回 413，原文件不动）
 // GET /api/settings/connectors 连接器列表（统一形状；GitHub 带 tokenHint 末四位掩码，绝无令牌全文）
 // PUT /api/settings/connectors/github 保存 GitHub 令牌（token 传空串清除），保存即被 scan 使用
+// GET /api/notifications 应用内通知列表（新在前）+ 未读数；扫描成功写 routine.completed、整轮失败写 routine.failed
+// POST /api/notifications/read 标记已读：{ids:[...]} 只标记这些，无 ids 则全部标记
 //
 // POST /api/chat 的 SSE 事件（event 名 + JSON data）：
 // session {botId, sessionId} 本轮开始
@@ -57,6 +59,7 @@ readArtifact,
 readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
+import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
 import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 
@@ -232,10 +235,31 @@ if (path === "/api/routines/morning-scan/run" && req.method === "POST") {
 const routine = listRoutines().find((r) => r.id === "morning-scan");
 const bot = getBot(routine?.botId || "repo-keeper");
 const repos = bot?.repos?.length? bot.repos: ["NorthAdb/LinkForge", "NorthAdb/Loom"];
-const { artifact, report} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
+const routineName = routine?.name?? "晨间仓库扫描";
+try {
+const { artifact, report, failures, total} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
+// 整轮失败（全部仓库取证失败）不报成功：状态记 failed 并发失败通知（L0-5）；部分失败仍算完成，失败细节在日报里。
+if (total > 0 && failures >= total) {
+updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "failed"});
+addNotification({ type: "routine.failed", title: `${routineName}失败`, body: `${total} 个仓库全部取证失败，详情见日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
+if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描失败（全部仓库取证失败），日报：${artifact.title}`});
+return sendJson(res, 200, { artifact, report, failed: true});
+}
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "ok"});
+addNotification({ type: "routine.completed", title: `${routineName}已完成`, body: `日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
 if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描完成，日报：${artifact.title}`});
 return sendJson(res, 200, { artifact, report});
+} catch (err) {
+updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastStatus: "failed"});
+addNotification({ type: "routine.failed", title: `${routineName}失败`, body: String(err.message?? err), routineId: "morning-scan"});
+throw err;
+}
+}
+if (path === "/api/notifications" && req.method === "GET") return sendJson(res, 200, { notifications: listNotifications(), unread: countUnread()});
+if (path === "/api/notifications/read" && req.method === "POST") {
+const body = await readBody(req);
+markNotificationsRead(Array.isArray(body.ids)? body.ids: undefined);
+return sendJson(res, 200, { notifications: listNotifications(), unread: countUnread()});
 }
 if (path === "/api/artifacts" && req.method === "GET") return sendJson(res, 200, { artifacts: listArtifacts()});
 const artMatch = path.match(/^\/api\/artifacts\/([\w.-]+)$/);
