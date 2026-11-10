@@ -204,11 +204,16 @@ async function main() {
 		// 「结构合法」口径：是数组，且每条带 findingId / writeIntent / 合法 status，不再要求恒空。
 		const approvals = await req("/api/approvals");
 		check(
-			"GET /api/approvals 来自真实存储且结构合法（数组；每条带 findingId、writeIntent 与 open/approved 状态）",
+			"GET /api/approvals 来自真实存储且结构合法（数组；每条带 findingId、writeIntent、intentHash 与 open/approved/executing 状态）",
 			approvals.status === 200 &&
 				Array.isArray(approvals.json?.approvals) &&
 				(approvals.json?.approvals ?? []).every(
-					(a) => typeof a.findingId === "string" && a.writeIntent?.kind === "pr_comment" && ["open", "approved"].includes(a.status),
+					(a) =>
+						typeof a.findingId === "string" &&
+						a.writeIntent?.kind === "pr_comment" &&
+						typeof a.intentHash === "string" &&
+						a.intentHash.length > 0 &&
+						["open", "approved", "executing"].includes(a.status),
 				),
 			`实际 ${approvals.status} 条数=${approvals.json?.approvals?.length}`,
 		);
@@ -531,7 +536,7 @@ async function runFindingChecks({ req, check, anon }) {
 		list.status === 200 &&
 			Array.isArray(list.json?.findings) &&
 			(list.json?.findings ?? []).every(
-				(f) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed"].includes(f.status),
+				(f) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed", "executing"].includes(f.status),
 			),
 		`实际 ${list.status} 条数=${list.json?.findings?.length}`,
 	);

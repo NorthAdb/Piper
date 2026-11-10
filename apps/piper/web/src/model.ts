@@ -118,6 +118,10 @@ export type Approval = {
 	expiresAt: string | null;
 	createdAt: string;
 	updatedAt: string;
+	// 批准记录（R1）：approvalId 为批准后落的记录 id（未批准时为 null）；intentHash 是
+	// 批准内容的哈希，批准时必须原样带回，内容变了服务端回 409 要求重新查看
+	approvalId: string | null;
+	intentHash: string;
 	// 来自审计（P1-6）：最近一次执行失败原因与已执行的评论链接
 	lastError: string | null;
 	commentUrl: string | null;

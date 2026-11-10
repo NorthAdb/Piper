@@ -17,11 +17,12 @@
 // 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.mjs）
 // GET /api/artifacts 产物列表
 // GET /api/artifacts/:id 产物正文
-// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved Finding 的审批视图）
-// POST /api/approvals/:id/approve 批准并经薄网关执行（P1-6）：回 { approval, execution }；
+// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved/executing Finding 的审批视图，含 approvalId 与 intentHash）
+// POST /api/approvals/:id/approve {intentHash} 批准并经薄网关执行批准快照（P1-6 + R1）：回 { approval, execution }；
+//   intentHash 与当前内容不一致回 409「内容已变，请重新查看」；正在 executing 回 409；
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
 // POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
-// GET /api/audit 网关审计记录（可按 findingId 过滤）：denied / approved / executed / failed / rejected
+// GET /api/audit 网关审计记录（可按 findingId 过滤）：denied / approved / executing / executed / failed / rejected
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
@@ -344,7 +345,8 @@ if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200,
 const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject)$/);
 if (approvalMatch && req.method === "POST") {
 if (approvalMatch[2] === "approve") {
-const out = await approveApproval(approvalMatch[1]);
+const body = await readBody(req);
+const out = await approveApproval(approvalMatch[1], { intentHash: typeof body.intentHash === "string"? body.intentHash: undefined});
 return out? sendJson(res, 200, { approval: out.approval, execution: out.execution}): sendJson(res, 404, { error: "待批项不存在"});
 }
 const approval = rejectApproval(approvalMatch[1]);

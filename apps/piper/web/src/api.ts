@@ -89,8 +89,8 @@ export async function listApprovals(): Promise<Approval[]> {
 	return (await api<{ approvals: Approval[] }>("/api/approvals")).approvals;
 }
 
-export async function approveApproval(id: string): Promise<{ approval: Approval; execution: ApprovalExecution }> {
-	return api(`/api/approvals/${id}/approve`, { method: "POST", body: "{}" });
+export async function approveApproval(id: string, intentHash: string): Promise<{ approval: Approval; execution: ApprovalExecution }> {
+	return api(`/api/approvals/${id}/approve`, { method: "POST", body: JSON.stringify({ intentHash }) });
 }
 
 export async function rejectApproval(id: string): Promise<Approval> {

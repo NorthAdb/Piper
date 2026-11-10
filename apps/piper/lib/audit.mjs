@@ -9,7 +9,8 @@ import { join } from "node:path";
 import { DATA_DIR, ensureData } from "./store.mjs";
 import { githubToken } from "./settings.mjs";
 
-export const AUDIT_RESULTS = ["denied", "approved", "executed", "failed", "rejected"];
+// executing（R1）：网关领取执行、真正发出评论之前先落一条，进程崩溃后能看到「发到一半」。
+export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected"];
 
 function auditFile() {
 	return process.env.PIPER_AUDIT_FILE || join(DATA_DIR, "audit.jsonl");

@@ -8,7 +8,17 @@ import { join } from "node:path";
 import { DATA_DIR, ensureData } from "./store.mjs";
 
 export const FINDING_TYPES = ["ci_failed", "pr_needs_review"];
-export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed"];
+export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed", "executing"];
+// 显式状态迁移表（R1）：updateFinding 强制执行，表外迁移一律抛错。
+// executing 是批准执行在途态（网关领取后、落终态前）；executing→approved 是执行失败退回。
+export const FINDING_TRANSITIONS = {
+	open: ["approved", "rejected", "expired"],
+	approved: ["executing", "rejected", "expired"],
+	executing: ["executed", "approved"],
+	rejected: [],
+	expired: [],
+	executed: [],
+};
 // 本批只允许一种写意图（P1-6 网关放行）：给指定 PR 发表一条评论。
 export const FINDING_WRITE_INTENT_KINDS = ["pr_comment"];
 
@@ -145,14 +155,23 @@ export function findOpenFinding(repo, type, subject) {
 	return readAll().find((f) => f.repo === repo && f.type === type && f.subject === String(subject) && f.status === "open") ?? null;
 }
 
-// 可改字段：status / title / summary / suggestedAction / writeIntent / expiresAt。
-// 其余字段（repo/type/subject/evidenceUrl/botId）是取证事实，立住后不许改。
-const PATCHABLE = ["status", "title", "summary", "suggestedAction", "writeIntent", "expiresAt"];
+// 可改字段：status / title / summary / suggestedAction / expiresAt。
+// 其余字段（repo/type/subject/evidenceUrl/botId）是取证事实，立住后不许改；writeIntent 自
+// R1 起同样不可改——批准的是用户看到的那份内容，批准后以批准记录的意图快照为准执行。
+const PATCHABLE = ["status", "title", "summary", "suggestedAction", "expiresAt"];
 
 export function updateFinding(id, patch) {
 	const all = readAll();
 	const idx = all.findIndex((f) => f.id === id);
 	if (idx < 0) return null;
+	// 状态迁移强制（R1）：status 真正变化且目标是合法枚举时必须落在迁移表内，否则抛 409；
+	// 枚举外的 status 仍由 buildFinding 按非法值拒绝（报错口径不变）。
+	if (patch && patch.status !== undefined && patch.status !== all[idx].status && FINDING_STATUSES.includes(patch.status)) {
+		const allowed = FINDING_TRANSITIONS[all[idx].status] ?? [];
+		if (!allowed.includes(patch.status)) {
+			throw Object.assign(new Error(`Finding 状态迁移非法：${all[idx].status} → ${patch.status}`), { status: 409 });
+		}
+	}
 	const merged = { ...all[idx] };
 	for (const key of PATCHABLE) {
 		if (patch && patch[key] !== undefined) merged[key] = patch[key];
@@ -165,6 +184,8 @@ export function updateFinding(id, patch) {
 	return next;
 }
 
+// 注意（R1 核查）：deleteFinding 没有生产路径调用——server / scan / approvals / gateway
+// 均不删 Finding（关闭走状态迁移），仅存储层单测使用。不要在生产路径里接它。
 export function deleteFinding(id) {
 	const all = readAll();
 	const next = all.filter((f) => f.id !== id);

@@ -146,11 +146,15 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
   `approval.pending`（新待批写操作）、`approval.executed` / `approval.failed`（网关执行结果）真正写入
 - `audit.jsonl`：网关审计一行一条（P1-6，见 `lib/audit.mjs`），只追加：时间、bot、意图摘要
   （kind / repo / prNumber / 正文长度与脱敏预览，不含任何秘密）、结果
-  （denied / approved / executed / failed / rejected）、原因、关联 Finding、评论链接；
+  （denied / approved / executing / executed / failed / rejected）、原因、关联 Finding、评论链接；
   `GET /api/audit?findingId=` 可追溯。文件路径可用 `PIPER_AUDIT_FILE` 覆盖（仅供测试隔离）
+- `approvals.jsonl`：批准记录一行一条（R1，见 `lib/approvals.mjs`），只追加：approvalId、
+  关联 Finding、批准时刻的意图快照（kind / repo / prNumber / 正文）与 SHA-256 哈希、批准
+  时间。网关只执行这份快照。文件路径可用 `PIPER_APPROVALS_FILE` 覆盖（仅供测试隔离）
 - `findings.jsonl`：分诊 Finding 一行一条（P1-1，见 `lib/findings.mjs`）：需要人拍板的事项的结构化对象
   （repo / type / subject 去重键 / evidenceUrl 必填 / suggestedAction / writeIntent / expiresAt /
-  status（open|approved|rejected|expired|executed）/ botId），每次读写现读落盘、重启不丢；
+  status（open|approved|rejected|expired|executed|executing）/ botId），每次读写现读落盘、重启不丢；
+  状态迁移由显式迁移表强制（R1），writeIntent 落盘后不可改；
   校验在写入边界：无 evidenceUrl、非法 type/status/writeIntent 一律拒绝。只读 API：
   `GET /api/findings`（可按 status/repo/botId 过滤）、`GET /api/findings/:id`。
   文件路径可用环境变量 `PIPER_FINDINGS_FILE` 覆盖（仅供单元测试 / 评测隔离，缺省即此文件）
@@ -172,10 +176,11 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 见 `server.mjs` 文件头注释（逐条列明）。要点：SSE 事件类型固定为
 `session / delta / tool / system / draft / error / done`；草案卡结构
 `{name, systemPrompt, tools, repos, memoryScope, source}`，经 `POST /api/bots/draft-confirm` 确认才落库；
-`GET /api/approvals` 自 P1-5 起读真实存储：待批项即带 `writeIntent` 的 open/approved
-Finding 的审批视图（不另存一份）；`POST /api/approvals/:id/approve` 自 P1-6 起批准后
-经薄网关（`lib/gateway.mjs`，默认拒绝、只放行 `pr_comment` 一种写）真正执行，
-`reject` 只改状态不产生写操作。
+`GET /api/approvals` 自 P1-5 起读真实存储：待批项即带 `writeIntent` 的 open/approved/executing
+Finding 的审批视图（不另存一份），每条带批准记录 id 与 intentHash；`POST /api/approvals/:id/approve`
+自 P1-6 起批准后经薄网关（`lib/gateway.mjs`，默认拒绝、只放行 `pr_comment` 一种写）真正执行，
+R1 起必须带回 intentHash（不一致回 409）且网关只执行批准时刻的意图快照、靠评论里的
+幂等标记防重复发送，`reject` 只改状态不产生写操作。
 定时调度（P1-4）：`server.mjs` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
 （缺省 08:00，时区读基础资料），与手动触发走同一执行函数、同一通知语义；
 只读状态端点 `GET /api/schedule/status` 给出时区、下次运行、上次运行与结果。
@@ -640,3 +645,43 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 明确不做核对：未做打标签 / 合并 PR / 改代码 / 自动合并；未接第二种写意图；网关
   未打进 `packages/`；未改 SSE 事件名。截图（待批详情）本环境做不了，以替身测试的
   参数断言 + 审计样例替代，留待 P1-7 真实试用时一并目检。
+
+### R1 审批执行返工实测（2026-11-10，分支 fix/r1-approval-execution）
+
+审计 B1 + M1 的收口：批准的是「看到的那段内容」，双击、双标签、网络重试、进程在发完
+评论后崩溃，对同一待批项都只产生一条评论。先红后修（用例先行，红输出留档）：
+
+- 先红（未改实现时）：`test-findings` **17/27**（合法迁移链走不通、writeIntent 可被
+  updateFinding 改掉、7 条非法迁移全部未被拒、executing 未进枚举）；
+  `test-gateway` **12/18**（正向正文无幂等标记、无 executing 审计、快照不符照样把
+  改后正文发出去、文件篡改后带旧哈希照样批准、并发批准替身 POST **2 次**、崩溃
+  重放再 POST 一次共 2 次）。与审计探针 P1/P2/P3 的结论一致。
+- 状态机（`lib/findings.mjs`）：新增 `executing` 状态与显式迁移表，`updateFinding`
+  强制：open→approved|rejected|expired；approved→executing|rejected|expired；
+  executing→executed|approved（失败退回）；其余抛 409。`writeIntent` 移出可改字段
+  （批准后内容以批准记录快照为准）。`deleteFinding` 核查无生产路径调用（仅单测用）。
+- 批准记录（`lib/approvals.mjs`）：批准落 append-only 记录到 `data/approvals.jsonl`
+  （`PIPER_APPROVALS_FILE` 可覆盖）：{approvalId, findingId, intentSnapshot{kind, repo,
+  prNumber, body}, intentHash（SHA-256）, approvedAt}。`GET /api/approvals` 下发
+  approvalId + intentHash；`POST …/approve` 必须带回 intentHash，不一致（或缺失，
+  针对 open 项）回 409「内容已变，请重新查看」。重试沿用原记录（快照与 approvalId
+  不变）。前端 Inbox 带回哈希并显示「执行中」状态。口径变化：审计里的 approvalId
+  自本返工起是批准记录 id，不再与 findingId 同值；旧的 denied/intent_mismatch 改为
+  denied/intent_changed。
+- 网关（`lib/gateway.mjs`）：只执行快照——执行前拿快照与当前 writeIntent 逐字比对，
+  不一致 denied/intent_changed（原「请求动作与存储自比对」已删除）。领取执行 =
+  approved→executing 在同步段内完成（无 await 间隔），第二个并发批准在 approvals
+  层回 409「正在执行」。领取后先写审计 `executing` 再出站；发评论前先 GET 评论列表
+  查幂等标记 `<!-- piper:approval=<approvalId> -->`，已有则复用其链接记 executed、
+  不再 POST；POST 正文 = 快照正文 + 标记。网络步失败统一 executing→approved 退回。
+- 改绿（本分支）：`test-gateway` **18/18**（原 15 条场景按新契约保留并新增并发互斥
+  ——替身 50ms 延迟下恰好 1 次写 + 1 条 executed 审计 + 另一个 409；崩溃重放——
+  替身 POST 成功后抛错，再次批准靠标记查重、总写次数仍 1；篡改两路——带旧哈希
+  批准 409、网关快照不符 denied/intent_changed）；`test-findings` **27/27**（迁移表
+  全拒 + 合法链 + writeIntent 不可改）；同批复跑 test-scan 5/5、test-schedule 12/12、
+  eval:scan 5/5、回归 **58/58**（条目数不变，approvals/findings 结构断言按新契约
+  对齐：状态枚举含 executing、approvals 每条带 intentHash）、`npm run check` 无错误、
+  `npm run build:web` 成功。
+- 明确不做核对：未接第二种写意图；未做通用权限语言；未改 `packages/`；未改 SSE
+  事件名；未做多用户审批。R2–R11 不在本 PR（时区校验、Origin、测试隔离、去重
+  冷却与对账等均未动）。全部测试走替身，未对真实仓库发评论。

@@ -48,7 +48,7 @@ export function Inbox({
 		setNotice("");
 		try {
 			if (action === "approve") {
-				const { execution } = await approveApproval(a.id);
+				const { execution } = await approveApproval(a.id, a.intentHash);
 				if (execution.ok) {
 					setNotice(`已执行「${a.title}」，评论已发到 ${a.repo} 的 PR #${a.writeIntent.prNumber}${execution.commentUrl ? `：${execution.commentUrl}` : ""}`);
 				} else {
@@ -103,7 +103,7 @@ export function Inbox({
 									<CardTitle className="min-w-0 flex-1 truncate text-sm">{a.title}</CardTitle>
 									<Badge variant="outline">{TYPE_LABEL[a.type] ?? a.type}</Badge>
 									<Badge variant={a.status === "approved" ? "default" : "secondary"}>
-										{a.status === "approved" ? "已批准 · 待执行" : "待批准"}
+										{a.status === "approved" ? "已批准 · 待执行" : a.status === "executing" ? "执行中" : "待批准"}
 									</Badge>
 								</CardHeader>
 								<CardContent className="flex flex-col gap-3 px-4 pb-4">
@@ -135,11 +135,11 @@ export function Inbox({
 										</p>
 									) : null}
 									<div className="flex gap-2">
-										<Button type="button" size="sm" disabled={busyId === a.id} onClick={() => void act(a, "approve")}>
+										<Button type="button" size="sm" disabled={busyId === a.id || a.status === "executing"} onClick={() => void act(a, "approve")}>
 											{a.status === "approved" ? <RotateCcwIcon /> : <CheckIcon />}
 											{a.status === "approved" ? "再次执行" : "批准并执行"}
 										</Button>
-										<Button type="button" size="sm" variant="outline" disabled={busyId === a.id} onClick={() => void act(a, "reject")}>
+										<Button type="button" size="sm" variant="outline" disabled={busyId === a.id || a.status === "executing"} onClick={() => void act(a, "reject")}>
 											<XIcon />
 											驳回
 										</Button>
