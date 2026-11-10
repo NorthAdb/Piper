@@ -1,0 +1,3 @@
+# 运行时数据（文件优先存储）：bots/sessions/artifacts/workspaces 均为本地运行产物，不入库
+data/*
+!data/.gitkeep

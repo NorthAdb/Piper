@@ -1,0 +1,1 @@
+{"dependencies":{"@earendil-works/pi-agent-core":"1.5.1","@earendil-works/pi-ai":"1.5.1"},"description":"Piper — Grok Bot 式多 bot Personal Agent 雏形（垂直：开发者运维），基于 Pi 源码基座","name":"piper-app","private":true,"scripts":{"start":"node server.mjs"},"type":"module","version":"0.1.0"}
