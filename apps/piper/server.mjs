@@ -16,6 +16,9 @@
 // GET /api/artifacts/:id 产物正文
 // GET /api/approvals 待批收件箱（雏形占位，恒为空数组）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
+// GET /api/settings/model 模型设置读回（configured/baseUrl/modelId/apiKeyHint，绝无 Key 全文）
+// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除），保存即热生效
+// POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
 //
 // POST /api/chat 的 SSE 事件（event 名 + JSON data）：
 // session {botId, sessionId} 本轮开始
@@ -47,7 +50,8 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.mjs";
-import { modelConfig, streamChat, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
+import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
+import { saveModelSettingsFile} from "./lib/settings.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
@@ -82,6 +86,17 @@ const chunks = [];
 for await (const c of req) chunks.push(c);
 const raw = Buffer.concat(chunks).toString("utf8");
 return raw? JSON.parse(raw): {};
+}
+
+// 模型设置对外视图：只暴露是否已配置、端点、模型名与 Key 末四位掩码，绝不含 Key 全文。
+function modelSettingsView() {
+const cfg = modelConfig();
+return {
+configured: cfg.configured,
+baseUrl: cfg.baseUrl,
+modelId: cfg.modelId,
+apiKeyHint: cfg.apiKey? `••••${cfg.apiKey.slice(-4)}`: "",
+};
 }
 
 function sse(res) {
@@ -147,6 +162,24 @@ return res.end(JSON.stringify({ ok: true}));
 if (path.startsWith("/api/")) {
 if (!isAuthed(req)) return sendJson(res, 401, { error: "未登录"});
 if (path === "/api/session") return sendJson(res, 200, { authenticated: true, modelConfigured: modelConfig().configured});
+if (path === "/api/settings/model" && req.method === "GET") return sendJson(res, 200, modelSettingsView());
+if (path === "/api/settings/model" && req.method === "PUT") {
+const body = await readBody(req);
+const patch = {};
+if (typeof body.baseUrl === "string") patch.baseUrl = body.baseUrl;
+if (typeof body.modelId === "string") patch.modelId = body.modelId;
+if (typeof body.apiKey === "string") patch.apiKey = body.apiKey;
+saveModelSettingsFile(patch);
+return sendJson(res, 200, modelSettingsView());
+}
+if (path === "/api/settings/model/test" && req.method === "POST") {
+const body = await readBody(req);
+const overrides = {};
+if (typeof body.baseUrl === "string" && body.baseUrl) overrides.baseUrl = body.baseUrl;
+if (typeof body.modelId === "string" && body.modelId) overrides.modelId = body.modelId;
+if (typeof body.apiKey === "string" && body.apiKey) overrides.apiKey = body.apiKey;
+return sendJson(res, 200, await testModelConfig(overrides));
+}
 if (path === "/api/bots" && req.method === "GET") return sendJson(res, 200, { bots: listBots()});
 if (path === "/api/bots" && req.method === "POST") return sendJson(res, 201, { bot: createBot(await readBody(req))});
 if (path === "/api/bots/draft-confirm" && req.method === "POST") {

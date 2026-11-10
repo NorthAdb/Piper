@@ -11,25 +11,30 @@
 //     （packages/agent/src/types.ts 注释原文：`Models.streamSimple` satisfies this shape）
 //
 // 模型配置（规格四：只接一个 OpenAI 兼容端点）：
-//   PIPER_MODEL_API_KEY（或 OPENAI_API_KEY）、PIPER_MODEL_BASE_URL（默认 https://api.openai.com/v1）、
-//   PIPER_MODEL_ID（默认 gpt-4o-mini）。无 Key 时 configured=false，调用方发「未配置模型」事件，不崩溃。
+//   第一来源是设置文件 data/settings-model.json（L0-2，设置页保存、热生效）；
+//   文件缺失的字段回退环境变量 PIPER_MODEL_API_KEY（或 OPENAI_API_KEY）、
+//   PIPER_MODEL_BASE_URL（默认 https://api.openai.com/v1）、PIPER_MODEL_ID（默认 gpt-4o-mini）。
+//   环境变量里的秘密不会被自动写进设置文件。无 Key 时 configured=false，
+//   调用方发「未配置模型」事件，不崩溃。modelConfig() 每次现读文件，保存后下一次 prompt 即生效。
 //
 // 说明：这里用动态 import 懒加载基座 dist——基座未构建时 app 的其余 API（bot CRUD/例程/产物）
 // 仍须可用，所以不能在模块顶层静态 import 一个可能不存在的 dist；失败原因会原样上报。
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
+import { readModelSettingsFile } from "./settings.mjs";
 import { APP_DIR } from "./store.mjs";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
 
 export function modelConfig() {
-	const apiKey = process.env.PIPER_MODEL_API_KEY || process.env.OPENAI_API_KEY || "";
+	const saved = readModelSettingsFile();
+	const apiKey = saved.apiKey || process.env.PIPER_MODEL_API_KEY || process.env.OPENAI_API_KEY || "";
 	return {
 		configured: Boolean(apiKey),
 		apiKey,
-		baseUrl: process.env.PIPER_MODEL_BASE_URL || "https://api.openai.com/v1",
-		modelId: process.env.PIPER_MODEL_ID || "gpt-4o-mini",
+		baseUrl: saved.baseUrl || process.env.PIPER_MODEL_BASE_URL || "https://api.openai.com/v1",
+		modelId: saved.modelId || process.env.PIPER_MODEL_ID || "gpt-4o-mini",
 	};
 }
 
@@ -72,7 +77,12 @@ async function buildModelsAndModel(cfg) {
 		contextWindow: 128000,
 		maxTokens: 8192,
 	};
-	const keyAuth = ai.envApiKeyAuth("Piper model", ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY"]);
+	// 自定义 ApiKeyAuth：直接解析 modelConfig() 已合并好的 Key（设置文件优先、环境变量兜底），
+	// 不再走 envApiKeyAuth——否则设置页保存的 Key 喂不进 provider。
+	const keyAuth = {
+		name: "Piper model",
+		resolve: async () => (cfg.apiKey ? { auth: { apiKey: cfg.apiKey }, source: "piper model config" } : undefined),
+	};
 	const provider = ai.createProvider({
 		id: "piper",
 		name: "Piper (OpenAI-compatible)",
@@ -127,7 +137,7 @@ function textOf(message) {
 export async function streamChat({ systemPrompt, history = [], message, onEvent }) {
 	const cfg = modelConfig();
 	if (!cfg.configured) {
-		throw Object.assign(new Error("未配置模型：请设置 PIPER_MODEL_API_KEY（或 OPENAI_API_KEY）后重试。"), {
+		throw Object.assign(new Error("未配置模型：请在设置中配置模型（端点与 API Key），或设置 PIPER_MODEL_API_KEY 后重试。"), {
 			code: "MODEL_NOT_CONFIGURED",
 		});
 	}
@@ -168,6 +178,33 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent 
 		throw Object.assign(new Error(`模型调用失败：${agent.state.errorMessage}`), { code: "MODEL_ERROR" });
 	}
 	return { text: finalText };
+}
+
+// 设置页「测试连接」：用候选配置（overrides 覆盖已生效配置的对应字段）打一次最小请求。
+// 只回 {ok} 或 {ok:false, error}，不抛错、不把 Key 写进返回值。15 秒超时，坏端点不会挂死进程。
+export async function testModelConfig(overrides = {}) {
+	const base = modelConfig();
+	const cfg = {
+		apiKey: overrides.apiKey || base.apiKey,
+		baseUrl: overrides.baseUrl || base.baseUrl,
+		modelId: overrides.modelId || base.modelId,
+	};
+	cfg.configured = Boolean(cfg.apiKey);
+	if (!cfg.configured) return { ok: false, error: "未配置 API Key" };
+	try {
+		const { models, model } = await buildModelsAndModel(cfg);
+		const res = await models.completeSimple(
+			model,
+			{ messages: [{ role: "user", content: [{ type: "text", text: "ping" }], timestamp: Date.now() }] },
+			{ maxTokens: 8, signal: AbortSignal.timeout(15000) },
+		);
+		if (res?.stopReason === "error") {
+			return { ok: false, error: String(res.errorMessage || "模型返回错误").slice(0, 300) };
+		}
+		return { ok: true };
+	} catch (err) {
+		return { ok: false, error: String(err?.message || err).slice(0, 300) };
+	}
 }
 
 // 用模型从用户消息抽取 Bot 草案字段；失败返回 null，调用方走规则兜底。

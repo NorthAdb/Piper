@@ -46,6 +46,20 @@ export type ArtifactMeta = {
 
 export type Artifact = ArtifactMeta & { body: string };
 
+// 模型设置（GET/PUT /api/settings/model 的线格式）：apiKeyHint 只有末四位掩码，绝无全文
+export type ModelSettings = {
+	configured: boolean;
+	baseUrl: string;
+	modelId: string;
+	apiKeyHint: string;
+};
+
+export type ModelSettingsInput = {
+	baseUrl?: string;
+	modelId?: string;
+	apiKey?: string;
+};
+
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
 export type HistoryEntry = {
 	ts?: string;

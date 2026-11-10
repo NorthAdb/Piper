@@ -122,7 +122,17 @@ export function App() {
 	const currentBot = bots.find((b) => b.id === currentBotId) ?? null;
 
 	if (view === "settings") {
-		return <Settings onBack={() => setView("main")} />;
+		return (
+			<Settings
+				onBack={() => setView("main")}
+				onModelSaved={() => {
+					void getSession()
+						.then((s) => setModelConfigured(s.modelConfigured))
+						.catch(() => {});
+				}}
+				onUnauthorized={onUnauthorized}
+			/>
+		);
 	}
 
 	return (

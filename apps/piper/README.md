@@ -96,6 +96,10 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
 | `PIPER_MODEL_ID` | 模型 id | `gpt-4o-mini` |
 | `GITHUB_TOKEN` | 可选，提高晨间扫描的 GitHub API 限额 | 无（公开限额） |
 
+注（L0-2）：模型三项（端点、模型名、Key）可在设置页保存到 `data/settings-model.json`，
+**设置文件优先于环境变量**，保存即热生效、不必重启；环境变量只作文件缺失时的初值，
+不会被自动写进文件。设置读回只给是否已配置与 Key 末四位掩码（`GET /api/settings/model`）。
+
 ## Pi 接入
 
 结论：**源码级真接入**，不是 SDK 嵌入、不是子进程调 CLI。`apps/piper` 作为 monorepo 内新增 app，
@@ -107,7 +111,9 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
   `agent.prompt(text)` 驱动一轮。bot 的 systemPrompt 与历史会话（JSONL 读出后转换）都走这条路。
 - `@earendil-works/pi-ai`（`packages/ai`）：模型层用 `createModels()` + `createProvider()` 自建一个
   OpenAI 兼容 provider（`id: "piper"`，`api: openAICompletionsApi()`——该工厂不在 pi-ai 主入口导出，
-  实测位于 `dist/api/openai-completions.lazy.js`，即 package exports 的 `./api/*` 子路径；auth 用 `envApiKeyAuth(...)` 读上面两个环境变量，
+  实测位于 `dist/api/openai-completions.lazy.js`，即 package exports 的 `./api/*` 子路径；auth 用自定义
+  `ApiKeyAuth.resolve` 直接解析 `modelConfig()` 合并后的 Key（L0-2 起：设置文件优先、环境变量兜底，
+  不再走 `envApiKeyAuth`，否则设置页保存的 Key 喂不进 provider），
   model 对象按 `packages/ai/src/types.ts` 的 `Model` 形状手工构造，`api: "openai-completions"`）。
   `Models.streamSimple(model, context, options)` 即 `Agent` 需要的 `StreamFn`
   （`packages/agent/src/types.ts` 注释原文即称其满足该形状），与 coding-agent 在
@@ -129,6 +135,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 运行时数据在 `apps/piper/data/`（`.gitignore` 排除，仅保留 `.gitkeep`）：
 
 - `bots.json`：bot 元数据（雏形用 JSON 文件代替规格中的 SQLite，接口不变，后续可平滑替换）
+- `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
 - `about-me.md`：账号级「关于我」，全 bot 可读；写入仅主 bot（雏形未开写入接口）
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
 - `sessions/<botId>.jsonl`：每 bot 独立会话流水
@@ -170,8 +177,11 @@ npm run regression       # 或 node scripts/regression.mjs
 
 脚本以「无模型 Key」的默认环境在测试端口（4398，可用 `REGRESSION_PORT` 覆盖）启动一份
 `server.mjs`，逐项断言后退出：原 26 项覆盖未登录 401、登录、bot CRUD、chat 无 Key 的
-`MODEL_NOT_CONFIGURED`、草案规则兜底全链路、晨间扫描与产物、收件箱、记忆与首页托管。
-晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），其余不依赖外网。
+`MODEL_NOT_CONFIGURED`、草案规则兜底全链路、晨间扫描与产物、收件箱、记忆与首页托管；
+L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显全文、测试连接坏端点不崩溃、
+清除恢复未配置），当前共 **30 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
+其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
+整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
 
 ## 实测
 
@@ -252,3 +262,31 @@ npm run regression       # 或 node scripts/regression.mjs
 - 验证：`npm run check`（tsc）无错误；`npm run build:web` 成功，bundle 内含「设置」入口与
   四组文案；`node scripts/regression.mjs` 26/26 通过（无 Key 默认环境）。
 - 未做浏览器截图：本环境无浏览器工具，设置页观感以构建产物 + 契约证据替代，留待用户本地目检。
+
+### L0-2 模型与真 Key 实测（2026-11-10，分支 feat/l0-2-model-key）
+
+- 设置存储：`lib/settings.mjs` 读写 `data/settings-model.json`（`git check-ignore` 实测命中
+  `data/*` 规则，不可追踪）。`modelConfig()` 改为设置文件优先、环境变量兜底，每次现读，
+  保存后下一次 prompt 即用新配置；环境变量里的秘密不被自动写入文件。
+- 接口：`GET /api/settings/model`（`{configured, baseUrl, modelId, apiKeyHint}`，hint 只有
+  `••••` + 末四位）、`PUT /api/settings/model`（部分字段单独更新；`apiKey:""` 清除）、
+  `POST /api/settings/model/test`（候选配置打一次最小请求，15 秒超时，回 `{ok}` 或
+  `{ok:false, error}`，不抛 5xx）。设置页「模型」组为真表单（端点、模型名、Key 密码框、
+  测试连接、保存、清除 Key）；保存成功后顶栏「未配置模型」徽标随 `modelConfigured` 刷新。
+- 无 Key 行为不变：`MODEL_NOT_CONFIGURED` 的 code 保留，文案改为「请在设置中配置模型…」。
+- 回归：脚本扩展至 30 项，`node scripts/regression.mjs` **30/30 通过**（无 Key 默认环境）；
+  `npm run check` 无错误；`npm run build:web` 成功。
+- 真链路（本地 OpenAI 兼容 stub，端口 4399，流式与非流式都支持）：PUT 保存 stub 配置后，
+  同一进程内 `modelConfigured` 即变 true（未重启）；测试连接回 `ok:true`；与仓库管家对话
+  收到两个 `delta` 并正确拼合为「你好，这是 stub 的流式回复。」，助手消息落盘
+  `sessions/repo-keeper.jsonl`，且 JSONL 全文不含 stub Key；对主 bot 说「创建一个代码审查
+  bot，负责审查 PR 的代码质量」，草案走**模型抽取**（`draft.source="model"`、name=代码审查）；
+  清除 Key 后立即回到未配置。验证后设置文件已删除、恢复无文件状态。
+- 人工真 Key 验收步骤（有真实厂商 Key 时照此复验一遍，并把结果补记到本节）：
+  1. `npm start` 后登录，左栏底部进「设置 → 模型」，填端点、模型名、真 Key，点「测试连接」应显示连接可用；
+  2. 保存后回主界面，顶栏徽标应变「模型已配置」；
+  3. 任选一个 bot 发一句话，应收到流式回复（多个 delta），且该 bot 的 `data/sessions/<botId>.jsonl` 出现助手消息；
+  4. 对主 bot 说「创建一个代码审查 bot，负责审查 PR 的代码质量」，草案卡来源应标注模型抽取；确认后落库；
+  5. 回设置页点「清除 Key」，顶栏徽标应回「未配置模型」，再发消息应回 `MODEL_NOT_CONFIGURED`。
+- 截图类验收（设置页已配置状态、Key 掩码）本环境做不了（无浏览器工具），以以上构建 +
+  接口 + stub 链路证据替代，留待用户本地目检。

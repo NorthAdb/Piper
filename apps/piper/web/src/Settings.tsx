@@ -1,10 +1,11 @@
-// 设置视图（L0-1 骨架）：独立整页，四组信息架构先立住——模型 / 基础资料 / 连接器 / 通知。
-// 本切片只立分组与空状态，不保存任何配置；各组的真接入在后续切片（模型见 L0-2）。
+// 设置视图（L0-1 骨架 + L0-2 模型组真接入）：独立整页，四组——模型 / 基础资料 / 连接器 / 通知。
+// 模型组已是真表单（SettingsModel.tsx，保存热生效）；其余三组仍为占位空状态，后续切片接入。
 import { ArrowLeftIcon, BellIcon, BlocksIcon, SlidersHorizontalIcon, UserRoundIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { ModelSettingsForm } from "./SettingsModel";
 
 function PendingGroup({ title, description, note }: { title: string; description: string; note: string }) {
 	return (
@@ -23,7 +24,15 @@ function PendingGroup({ title, description, note }: { title: string; description
 	);
 }
 
-export function Settings({ onBack }: { onBack: () => void }) {
+export function Settings({
+	onBack,
+	onModelSaved,
+	onUnauthorized,
+}: {
+	onBack: () => void;
+	onModelSaved: () => void;
+	onUnauthorized: () => void;
+}) {
 	return (
 		<div className="flex h-dvh flex-col bg-background">
 			<header className="flex h-13 shrink-0 items-center gap-3 border-b px-5">
@@ -57,11 +66,7 @@ export function Settings({ onBack }: { onBack: () => void }) {
 					</TabsList>
 
 					<TabsContent value="model">
-						<PendingGroup
-							title="模型"
-							description="OpenAI 兼容端点、模型名与 API Key。目前配置仍来自环境变量（PIPER_MODEL_API_KEY 等）。"
-							note="设置页配置即将在后续切片接入，保存后立即生效、不回显 Key 全文。"
-						/>
+						<ModelSettingsForm onSaved={onModelSaved} onUnauthorized={onUnauthorized} />
 					</TabsContent>
 					<TabsContent value="profile">
 						<PendingGroup

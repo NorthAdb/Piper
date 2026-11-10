@@ -211,8 +211,62 @@ async function main() {
 	}
 }
 
-// 切片扩展断言的挂载点：后续切片在此追加（默认无操作）。
-async function runExtraChecks() {}
+// 切片扩展断言的挂载点：后续切片在此追加。
+// L0-2（27-30）：模型设置存储——无 Key 默认值、保存不回显全文、测试连接失败不崩溃、清除恢复未配置。
+// 保护：若 data/settings-model.json 在运行前就存在（用户真实配置），整组跳过，绝不覆盖或清除。
+async function runExtraChecks({ req, chatEvents, check }) {
+	const { existsSync, rmSync } = await import("node:fs");
+	const settingsFile = join(APP_DIR, "data", "settings-model.json");
+	if (existsSync(settingsFile)) {
+		console.log("SKIP 27-30 已存在 data/settings-model.json（视为用户真实配置），跳过设置组断言以免覆盖");
+		return;
+	}
+	const FAKE_KEY = "sk-regression-1234567890abcd";
+	try {
+		const before = await req("/api/settings/model");
+		check(
+			"GET /api/settings/model 无 Key 时 configured=false 且 apiKeyHint 为空",
+			before.status === 200 && before.json?.configured === false && before.json?.apiKeyHint === "",
+			`实际 ${before.status} ${JSON.stringify(before.json)}`,
+		);
+
+		await req("/api/settings/model", {
+			method: "PUT",
+			body: JSON.stringify({ baseUrl: "https://api.openai.com/v1", modelId: "gpt-4o-mini", apiKey: FAKE_KEY }),
+		});
+		const after = await req("/api/settings/model");
+		check(
+			"PUT 保存后 GET 只回末四位掩码且响应不含 Key 全文",
+			after.status === 200 &&
+				after.json?.configured === true &&
+				String(after.json?.apiKeyHint ?? "").endsWith("abcd") &&
+				!JSON.stringify(after.json).includes(FAKE_KEY),
+			`实际 ${JSON.stringify(after.json)}`,
+		);
+
+		const test = await req("/api/settings/model/test", {
+			method: "POST",
+			body: JSON.stringify({ baseUrl: "http://127.0.0.1:9/v1", apiKey: "sk-bad" }),
+		});
+		const alive = await req("/api/session");
+		check(
+			"POST /api/settings/model/test 坏端点返回 ok:false 且进程存活",
+			test.status === 200 && test.json?.ok === false && typeof test.json?.error === "string" && alive.status === 200,
+			`实际 ${test.status} ${JSON.stringify(test.json)}`,
+		);
+
+		const clear = await req("/api/settings/model", { method: "PUT", body: JSON.stringify({ apiKey: "" }) });
+		const ev = await chatEvents("piper-main", "你好");
+		const errEv = ev.find((e) => e.event === "error");
+		check(
+			"清除 Key 后回到未配置且对话再回 MODEL_NOT_CONFIGURED",
+			clear.json?.configured === false && errEv?.data?.code === "MODEL_NOT_CONFIGURED",
+			`clear=${JSON.stringify(clear.json)} err=${JSON.stringify(errEv?.data ?? null)}`,
+		);
+	} finally {
+		if (existsSync(settingsFile)) rmSync(settingsFile);
+	}
+}
 
 main().catch((err) => {
 	console.error(`回归脚本异常：${err.message}`);
