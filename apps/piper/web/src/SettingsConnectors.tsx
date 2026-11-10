@@ -1,9 +1,10 @@
 // 设置页「连接器」组：统一槽位卡片列表。
-// GitHub 是唯一可配置项（PAT 粘贴保存，读回只有末四位掩码，保存后扫描立即使用）；
-// 网页查询尚未启用；日历 / 邮件是占位卡，点开能看到「尚未接入」与既定口径，不冒充已接好。
+// GitHub 可配置令牌（PAT 粘贴保存，读回只有末四位掩码，保存后扫描立即使用）；
+// 网页查询可启用只读抓取并配置搜索端点（密钥读回只有掩码）；
+// 日历 / 邮件是占位卡，点开能看到「尚未接入」与既定口径，不冒充已接好。
 import { ChevronDownIcon, Loader2Icon, SaveIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getConnectors, saveGithubToken, UnauthorizedError } from "./api";
+import { getConnectors, saveGithubToken, saveWebSettings, UnauthorizedError } from "./api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -73,6 +74,87 @@ function GithubTokenForm({ connector, onChanged, onUnauthorized }: { connector: 
 	);
 }
 
+function WebSettingsForm({ connector, onChanged, onUnauthorized }: { connector: Connector; onChanged: () => void; onUnauthorized: () => void }) {
+	const [endpoint, setEndpoint] = useState(connector.searchEndpoint ?? "");
+	const [searchKey, setSearchKey] = useState("");
+	const [busy, setBusy] = useState(false);
+	const [notice, setNotice] = useState("");
+
+	useEffect(() => {
+		setEndpoint(connector.searchEndpoint ?? "");
+	}, [connector.searchEndpoint]);
+
+	const run = async (patch: { fetchEnabled?: boolean; searchEndpoint?: string; searchApiKey?: string }, okText: string) => {
+		setBusy(true);
+		setNotice("");
+		try {
+			await saveWebSettings(patch);
+			setSearchKey("");
+			setNotice(okText);
+			onChanged();
+		} catch (err) {
+			if (err instanceof UnauthorizedError) onUnauthorized();
+			else setNotice(`保存失败：${err instanceof Error ? err.message : String(err)}`);
+		} finally {
+			setBusy(false);
+		}
+	};
+
+	return (
+		<div className="flex flex-col gap-3 border-t pt-3">
+			<div className="flex flex-wrap items-center gap-2">
+				<span className="text-sm">网页抓取：{connector.fetchEnabled ? "已启用" : "未启用"}</span>
+				<Button
+					type="button"
+					size="sm"
+					variant={connector.fetchEnabled ? "ghost" : "default"}
+					disabled={busy}
+					onClick={() => run({ fetchEnabled: !connector.fetchEnabled }, connector.fetchEnabled ? "已关闭网页抓取。" : "已启用网页抓取，可用范围内的 bot 现在可以只读打开公开网页。")}
+				>
+					{busy ? <Loader2Icon className="animate-spin" /> : null}
+					{connector.fetchEnabled ? "关闭" : "启用"}
+				</Button>
+			</div>
+			<div className="flex flex-col gap-2">
+				<Label htmlFor="web-search-endpoint">搜索端点（可选，填了还需密钥才启用搜索）</Label>
+				<Input
+					id="web-search-endpoint"
+					type="url"
+					autoComplete="off"
+					className="max-w-md"
+					placeholder="https://search.example.com/query"
+					value={endpoint}
+					onChange={(e) => setEndpoint(e.target.value)}
+				/>
+				<Label htmlFor="web-search-key">搜索密钥</Label>
+				<div className="flex flex-wrap items-center gap-2">
+					<Input
+						id="web-search-key"
+						type="password"
+						autoComplete="off"
+						className="max-w-sm"
+						placeholder={connector.searchConfigured ? `已配置（${connector.searchKeyHint ?? ""}），粘贴新密钥可替换` : "粘贴搜索服务密钥"}
+						value={searchKey}
+						onChange={(e) => setSearchKey(e.target.value)}
+					/>
+					<Button type="button" size="sm" disabled={busy || (!endpoint && !searchKey)} onClick={() => run({ searchEndpoint: endpoint, ...(searchKey ? { searchApiKey: searchKey } : {}) }, "搜索设置已保存。")}>
+						{busy ? <Loader2Icon className="animate-spin" /> : <SaveIcon />}
+						保存搜索设置
+					</Button>
+					{connector.searchConfigured ? (
+						<Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => run({ searchApiKey: "" }, "已清除搜索密钥，搜索停用。")}>
+							<Trash2Icon />
+							清除密钥
+						</Button>
+					) : null}
+				</div>
+				<p className="text-sm text-muted-foreground">搜索状态：{connector.searchConfigured ? "已配置，可按关键词搜索" : "未配置，暂不能搜索（不会用其他方式冒充搜索）"}</p>
+			</div>
+			{notice ? <p className="text-sm text-muted-foreground">{notice}</p> : null}
+		</div>
+	);
+}
+
 function ConnectorCard({ connector, onChanged, onUnauthorized }: { connector: Connector; onChanged: () => void; onUnauthorized: () => void }) {
 	const [open, setOpen] = useState(false);
 	return (
@@ -103,6 +185,9 @@ function ConnectorCard({ connector, onChanged, onUnauthorized }: { connector: Co
 				) : null}
 				{connector.configurable && connector.id === "github" ? (
 					<GithubTokenForm connector={connector} onChanged={onChanged} onUnauthorized={onUnauthorized} />
+				) : null}
+				{connector.configurable && connector.id === "web" ? (
+					<WebSettingsForm connector={connector} onChanged={onChanged} onUnauthorized={onUnauthorized} />
 				) : null}
 			</CardContent>
 		</Card>

@@ -22,7 +22,8 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { readModelSettingsFile } from "./settings.mjs";
+import { readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.mjs";
+import { webFetch, webSearch } from "./webfetch.mjs";
 import { redact } from "./redact.mjs";
 import { APP_DIR } from "./store.mjs";
 
@@ -143,9 +144,71 @@ export function modelErrorMessage(raw) {
 	return status ? `模型调用失败（HTTP ${status}）：${clean}` : `模型调用失败：${clean}`;
 }
 
+// ---------- 网页查询工具（L0-6）：注册与否由连接器状态 + bot 可用范围决定 ----------
+// 工具只在「网页查询已启用且 bot 在可用范围内」时才被注册进 Agent——不在范围
+// 的 bot 的模型根本看不到这个工具，直接调用无从发生。web.search 还要求搜索
+// 端点与密钥已配置，未配置时不注册，对话里问起就如实说没有搜索服务。
+function toolTextResult(text, details) {
+	return { content: [{ type: "text", text }], details };
+}
+function toolErrorResult(text) {
+	return { content: [{ type: "text", text }], details: { isError: true }, isError: true };
+}
+
+export function webToolsForBot(bot) {
+	if (!bot || !webFetchEnabled()) return [];
+	if (!webToolBots().includes(bot.id)) return [];
+	const tools = [
+		{
+			name: "web.fetch",
+			label: "打开网页（只读）",
+			description:
+				"只读打开一个公开网页并返回其可见文本（已截断）。只能访问公开地址；本机、私网与云元数据地址会被拒绝。用户给出链接、让你看某篇文档或网页内容时使用。",
+			parameters: {
+				type: "object",
+				properties: { url: { type: "string", description: "要打开的网页 URL（http/https）" } },
+				required: ["url"],
+			},
+			execute: async (_toolCallId, params) => {
+				try {
+					const out = await webFetch(String(params?.url ?? ""));
+					const head = `已打开 ${out.url}（HTTP ${out.status}）${out.truncated ? "；内容较长，已截断" : ""}`;
+					return toolTextResult(`${head}\n\n${out.text}`, { url: out.url, status: out.status, truncated: out.truncated });
+				} catch (err) {
+					// 被拒口径是通用句（不含内网细节）；其余失败给状态级原因，统一脱敏
+					return toolErrorResult(redact(String(err?.message ?? err)).slice(0, 300));
+				}
+			},
+		},
+	];
+	const search = webSearchConfig();
+	if (search) {
+		tools.push({
+			name: "web.search",
+			label: "搜索网页",
+			description: "按关键词搜索网页，返回前几条结果的标题、链接与摘要。需要引用具体页面时再用 web.fetch 打开。",
+			parameters: {
+				type: "object",
+				properties: { query: { type: "string", description: "搜索关键词" } },
+				required: ["query"],
+			},
+			execute: async (_toolCallId, params) => {
+				try {
+					const items = await webSearch(String(params?.query ?? ""), search);
+					const text = items.map((it, i) => `${i + 1}. ${it.title}\n${it.url}\n${it.snippet}`).join("\n\n");
+					return toolTextResult(text, { count: items.length });
+				} catch (err) {
+					return toolErrorResult(redact(String(err?.message ?? err)).slice(0, 300));
+				}
+			},
+		});
+	}
+	return tools;
+}
+
 // 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"tool",phase,name,detail}。
 // 返回最终助手文本。失败抛错（err.code 区分 BASE_NOT_BUILT / MODEL_ERROR 等），由路由层转 SSE error 事件。
-export async function streamChat({ systemPrompt, history = [], message, onEvent }) {
+export async function streamChat({ systemPrompt, history = [], message, onEvent, tools = [] }) {
 	const cfg = modelConfig();
 	if (!cfg.configured) {
 		throw Object.assign(new Error("未配置模型：请在设置中配置模型（端点与 API Key），或设置 PIPER_MODEL_API_KEY 后重试。"), {
@@ -154,12 +217,15 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent 
 	}
 	const { agentCore } = await loadRuntime();
 	const { models, model } = await buildModelsAndModel(cfg);
+	const toolNote = tools.length
+		? `\n\n你可以使用这些只读工具：${tools.map((t) => t.name).join("、")}。工具被拒绝或失败时，把原因如实告诉用户，不要编造网页内容。`
+		: "";
 	const agent = new agentCore.Agent({
 		initialState: {
-			systemPrompt,
+			systemPrompt: systemPrompt + toolNote,
 			model,
 			messages: toPiMessages(history, cfg),
-			tools: [],
+			tools,
 			thinkingLevel: "off",
 		},
 		streamFn: (m, context, options) => models.streamSimple(m, context, options),

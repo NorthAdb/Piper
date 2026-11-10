@@ -39,6 +39,8 @@
 // PUT /api/about-me 写入账号级「关于我」（需登录；与 GET 同源一份 about-me.md；超 20000 字符回 413，原文件不动）
 // GET /api/settings/connectors 连接器列表（统一形状；GitHub 带 tokenHint 末四位掩码，绝无令牌全文）
 // PUT /api/settings/connectors/github 保存 GitHub 令牌（token 传空串清除），保存即被 scan 使用
+// PUT /api/settings/connectors/web 保存网页查询设置（fetchEnabled 开关、searchEndpoint、searchApiKey；
+//   端点只许 http/https，密钥传空串清除；读回只在连接器卡上给 searchConfigured/searchEndpoint/末四位掩码）
 // GET /api/notifications 应用内通知列表（新在前）+ 未读数；扫描成功写 routine.completed、整轮失败写 routine.failed
 // POST /api/notifications/read 标记已读：{ids:[...]} 只标记这些，无 ids 则全部标记
 //
@@ -74,9 +76,9 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.mjs";
-import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.mjs";
+import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.mjs";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, secretHint} from "./lib/settings.mjs";
+import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
 import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
@@ -230,6 +232,7 @@ const { text} = await streamChat({
 systemPrompt: `${bot.systemPrompt}\n\n\n${readAboutMe()}`,
 history,
 message,
+tools: webToolsForBot(bot),
 onEvent: (e) => {
 if (e.type === "delta") emit("delta", { text: e.text});
 else if (e.type === "tool") emit("tool", { phase: e.phase, name: e.name, detail: e.detail});
@@ -388,6 +391,19 @@ const body = await readBody(req);
 if (typeof body.token!== "string") return sendJson(res, 400, { error: "token 必填且须为字符串（空串表示清除）"});
 saveGithubSettingsFile({ token: body.token});
 return sendJson(res, 200, { connector: listConnectors().find((c) => c.id === "github")});
+}
+if (path === "/api/settings/connectors/web" && req.method === "PUT") {
+const body = await readBody(req);
+// 搜索端点只许 http/https（与 R7 模型端点同一口径）：非法直接 400，不落盘。
+if (body.searchEndpoint!== undefined && typeof body.searchEndpoint!== "string") return sendJson(res, 400, { error: "searchEndpoint 须为字符串"});
+if (typeof body.searchEndpoint === "string" && body.searchEndpoint.trim()) {
+let parsed;
+try { parsed = new URL(body.searchEndpoint.trim()); } catch { return sendJson(res, 400, { error: "searchEndpoint 不是合法 URL"}); }
+if (parsed.protocol!== "http:" && parsed.protocol!== "https:") return sendJson(res, 400, { error: "searchEndpoint 只支持 http/https"});
+}
+if (body.searchApiKey!== undefined && typeof body.searchApiKey!== "string") return sendJson(res, 400, { error: "searchApiKey 须为字符串（空串表示清除）"});
+saveWebSettingsFile({ fetchEnabled: body.fetchEnabled, searchEndpoint: body.searchEndpoint, searchApiKey: body.searchApiKey});
+return sendJson(res, 200, { connector: listConnectors().find((c) => c.id === "web")});
 }
 if (path === "/api/bots" && req.method === "GET") return sendJson(res, 200, { bots: listBots()});
 if (path === "/api/bots" && req.method === "POST") return sendJson(res, 201, { bot: createBot(await readBody(req))});

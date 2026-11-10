@@ -563,6 +563,50 @@ async function runConnectorChecks({ req, check }) {
 			cleared.status === 200 && ghClear?.status === "unconfigured" && githubToken() === "",
 			`实际 status=${ghClear?.status} token空=${githubToken() === ""}`,
 		);
+
+		// L0-6：网页查询卡默认未启用但可配置；未登录 PUT 401；启用后 connected；
+		// 搜索密钥保存后读回只有掩码、响应不含全文；非法端点 400。
+		const FAKE_SEARCH_KEY = "sk-websearch-regression-0000beef";
+		const webBefore = byId.web;
+		const anonPut = await fetch(`${BASE}/api/settings/connectors/web`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ fetchEnabled: true }),
+		});
+		check(
+			"网页查询卡默认 unconfigured 且 configurable、范围含主 bot；未登录 PUT /api/settings/connectors/web 回 401",
+			webBefore?.status === "unconfigured" &&
+				webBefore?.configurable === true &&
+				webBefore?.fetchEnabled === false &&
+				(webBefore?.bots ?? []).includes("piper-main") &&
+				anonPut.status === 401,
+			`card=${JSON.stringify(webBefore)} anon=${anonPut.status}`,
+		);
+		const putWeb = await req("/api/settings/connectors/web", {
+			method: "PUT",
+			body: JSON.stringify({ fetchEnabled: true, searchEndpoint: "https://search.example.com/query", searchApiKey: FAKE_SEARCH_KEY }),
+		});
+		const listWeb = await req("/api/settings/connectors");
+		const webAfter = (listWeb.json?.connectors ?? []).find((c) => c.id === "web");
+		check(
+			"启用网页查询并保存搜索配置后卡 connected、searchConfigured=true、读回只有末四位掩码且响应不含密钥全文",
+			putWeb.status === 200 &&
+				webAfter?.status === "connected" &&
+				webAfter?.fetchEnabled === true &&
+				webAfter?.searchConfigured === true &&
+				String(webAfter?.searchKeyHint ?? "").endsWith("beef") &&
+				!JSON.stringify(listWeb.json).includes(FAKE_SEARCH_KEY),
+			`put=${putWeb.status} card=${JSON.stringify(webAfter)}`,
+		);
+		const badEndpoint = await req("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ searchEndpoint: "ftp://example.com/x" }) });
+		const putWebOff = await req("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ fetchEnabled: false, searchApiKey: "" }) });
+		const listWebOff = await req("/api/settings/connectors");
+		const webOff = (listWebOff.json?.connectors ?? []).find((c) => c.id === "web");
+		check(
+			"搜索端点非 http/https 回 400；关闭抓取并清除密钥后卡回到 unconfigured 且 searchConfigured=false",
+			badEndpoint.status === 400 && putWebOff.status === 200 && webOff?.status === "unconfigured" && webOff?.searchConfigured === false,
+			`bad=${badEndpoint.status} off=${JSON.stringify(webOff)}`,
+		);
 	} finally {
 		if (existsSync(githubFile)) rmSync(githubFile);
 		if (savedEnvToken !== undefined) process.env.GITHUB_TOKEN = savedEnvToken;

@@ -19,6 +19,8 @@ const PORT = Number(process.env.SHOTS_PORT || 4399);
 const BASE = `http://127.0.0.1:${PORT}`;
 const CDP_PORT = Number(process.env.SHOTS_CDP_PORT || 9339);
 const FAKE_KEY = "sk-r9-fake-key-00000000wxyz";
+const FAKE_SEARCH_KEY = "sk-shots-fake-search-0000wxyz";
+const FIXTURE_FEATURE = "夹具特征句：紫水晶海豹在屋顶上读报纸。";
 
 function findChrome() {
 	// headless shell 优先于全量 chrome（后者在无显示环境要额外 --headless=new 才起得来）。
@@ -60,13 +62,76 @@ function runSeed(code) {
 	});
 }
 
+// ---- L0-6 截图用：夹具网页 + 本地模型 stub（让工具卡截图走真实工具链路） ----
+const fixtureServer = createServer((reqHttp, resHttp) => {
+	if ((reqHttp.url ?? "").startsWith("/page")) {
+		resHttp.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+		resHttp.end(`<html><body><h1>示例文档</h1><p>${FIXTURE_FEATURE}</p></body></html>`);
+	} else {
+		resHttp.statusCode = 404;
+		resHttp.end("not found");
+	}
+});
+await new Promise((r) => fixtureServer.listen(0, "127.0.0.1", r));
+const FIXTURE_PORT = fixtureServer.address().port;
+
+const shotsModelStub = createServer((reqHttp, resHttp) => {
+	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
+		resHttp.statusCode = 404;
+		resHttp.end(JSON.stringify({ error: { message: "not found" } }));
+		return;
+	}
+	let raw = "";
+	reqHttp.on("data", (c) => (raw += c));
+	reqHttp.on("end", () => {
+		let body = {};
+		try {
+			body = JSON.parse(raw || "{}");
+		} catch {
+			/* 忽略 */
+		}
+		const model = body.model || "stub-model";
+		if (!body.stream) {
+			resHttp.writeHead(200, { "Content-Type": "application/json" });
+			resHttp.end(JSON.stringify({ id: "x", object: "chat.completion", created: 1762732800, model, choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+			return;
+		}
+		const toolNames = (body.tools ?? []).map((t) => t.function?.name ?? t.name);
+		const messages = body.messages ?? [];
+		const last = messages[messages.length - 1] ?? {};
+		const lastUser = [...messages].reverse().find((m) => m.role === "user");
+		const userText = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
+		resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+		const chunk = (delta, finishReason = null) =>
+			`data: ${JSON.stringify({ id: "chatcmpl-shots", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+		resHttp.write(chunk({ role: "assistant" }));
+		if (last.role === "tool") {
+			const toolText = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+			resHttp.write(chunk({ content: `页面要点：${toolText.slice(0, 220)}` }));
+			resHttp.write(chunk({}, "stop"));
+		} else if (toolNames.includes("web.fetch") && /https?:\/\//.test(userText)) {
+			const url = /https?:\/\/[^\s"']+/.exec(userText)[0];
+			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots", type: "function", function: { name: "web.fetch", arguments: "" } }] }));
+			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
+			resHttp.write(chunk({}, "tool_calls"));
+		} else {
+			resHttp.write(chunk({ content: "好的。" }));
+			resHttp.write(chunk({}, "stop"));
+		}
+		resHttp.end("data: [DONE]\n\n");
+	});
+});
+await new Promise((r) => shotsModelStub.listen(0, "127.0.0.1", r));
+const SHOTS_MODEL_BASE = `http://127.0.0.1:${shotsModelStub.address().port}/v1`;
+
 const libUrl = (name) => `file://${join(APP_DIR, "lib", name)}`;
 runSeed(`
 import { ensureData, saveArtifact, updateRoutine } from "${libUrl("store.mjs")}";
-import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+import { saveModelSettingsFile, saveWebSettingsFile } from "${libUrl("settings.mjs")}";
 import { addNotification } from "${libUrl("notify.mjs")}";
 ensureData();
-saveModelSettingsFile({ baseUrl: "http://127.0.0.1:9/v1", modelId: "gpt-4o-mini", apiKey: "${FAKE_KEY}" });
+saveModelSettingsFile({ baseUrl: "${SHOTS_MODEL_BASE}", modelId: "gpt-4o-mini", apiKey: "${FAKE_KEY}" });
+saveWebSettingsFile({ fetchEnabled: true, searchEndpoint: "https://search.example.com/query", searchApiKey: "${FAKE_SEARCH_KEY}" });
 const artifact = saveArtifact({
 	botId: "repo-keeper",
 	kind: "morning-report",
@@ -103,7 +168,7 @@ await new Promise((r) => ghStub.listen(0, "127.0.0.1", r));
 const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
 
 // ---- 起被截实例 ----
-const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
+const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE, PIPER_WEB_FETCH_TEST_ALLOW: `127.0.0.1:${FIXTURE_PORT}` };
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
 const serverProc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -267,6 +332,10 @@ try {
 	await clickText("连接器");
 	await waitFor(bodyHas("GitHub"), "设置-连接器组出现");
 	await shot("06-settings-connectors.png");
+	// L0-6：网页查询已启用态——把网页查询卡滚到视口中央再截（卡上应有已启用与搜索掩码）
+	await evaluate(`(() => { const el = [...document.querySelectorAll('*')].find((e) => e.children.length === 0 && (e.textContent || '').trim() === '网页查询'); el?.scrollIntoView({ block: 'center' }); return Boolean(el); })()`);
+	await waitFor(bodyHas("网页抓取：已启用"), "网页查询卡已启用态出现");
+	await shot("10-settings-connectors-web-enabled.png");
 	await clickText("通知");
 	await waitFor(bodyHas("晨间仓库扫描已完成"), "设置-通知组出现完成条");
 	await shot("07-settings-notifications.png");
@@ -301,6 +370,18 @@ console.log("种子（待批 Finding）已写入");
 	await waitFor(bodyHas("批准后将执行的写操作"), "待批详情出现写操作参数");
 	await shot("09-inbox-detail.png");
 
+	// L0-6：一次 web.fetch 工具卡——刷新回主界面（默认选中主 bot）、让它打开夹具页
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "刷新后主界面出现");
+	await waitFor(`document.querySelector('textarea') !== null`, "主 bot 对话输入框出现");
+	await evaluate(`document.querySelector('textarea').focus()`);
+	await cdp("Input.insertText", { text: `打开 http://127.0.0.1:${FIXTURE_PORT}/page 看看里面写了什么` }, sessionId);
+	await clickText("发送");
+	await waitFor(bodyHas("web.fetch"), "对话里出现 web.fetch 工具卡", 30000);
+	await waitFor(bodyHas("紫水晶海豹"), "助手回答引用到夹具特征句", 30000);
+	await new Promise((r) => setTimeout(r, 800));
+	await shot("11-chat-web-fetch-tool.png");
+
 	console.log(`\n截图完成：${shots.length} 张，目录 ${SCREENS_DIR}`);
 	console.log("注意：脚本不做内容断言，请逐张目检 Key 区为掩码、无真实秘密。");
 } finally {
@@ -312,5 +393,7 @@ console.log("种子（待批 Finding）已写入");
 	chromeProc.kill("SIGTERM");
 	serverProc.kill("SIGTERM");
 	ghStub.close();
+	fixtureServer.close();
+	shotsModelStub.close();
 	rmSync(TMP_ROOT, { recursive: true, force: true });
 }

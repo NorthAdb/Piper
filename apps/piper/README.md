@@ -143,6 +143,8 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
 - `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
 - `settings-github.json`：设置页保存的 GitHub 令牌（明文只存此文件，L0-4；经 `githubToken()` 读取）
+- `settings-web.json`：网页查询设置（抓取开关、搜索端点、搜索密钥明文只存此文件，0600，
+  读回只有掩码，L0-6；见 `lib/settings.mjs` 的 `readWebSettingsFile` 与 `lib/webfetch.mjs`）
 - `notifications.jsonl`：应用内通知一行一条（L0-5），扫描完成 / 整轮失败时写入；P1-6 起
   `approval.pending`（新待批写操作）、`approval.executed` / `approval.failed`（网关执行结果）真正写入
 - `audit.jsonl`：网关审计一行一条（P1-6，见 `lib/audit.mjs`），只追加：时间、bot、意图摘要
@@ -1150,3 +1152,59 @@ MINOR 批量七项，专项测试 `scripts/test-r10.mjs`（`npm run test:r10`，
   regression 69/69（数字以本节合入时实跑为准，见 PR 描述）。
 - 明确不做核对：未碰 R11（网页查询实现）；未改 `packages/`；未改 SSE 事件
   名；未增加第二种写意图；未做日历/邮件/多模型。
+
+### R11 / L0-6 网页查询实测（2026-11-11，分支 feat/l0-6-web-fetch，堆叠在 R10 上）
+
+第零层关闭必做项：连接器「网页查询」从占位改可启用，主 bot 获只读工具
+`web.fetch`（配置搜索端点与密钥后再加 `web.search`）。专项测试
+`scripts/test-webfetch.mjs`（`npm run test:webfetch`，已纳入 `npm run test`
+聚合）**28/28**，回归扩 3 项到 **72/72**。
+
+- 实现：`lib/webfetch.mjs` 是唯一抓取实现。上限写死并被测试钉住——总超时
+  10 秒、下载最多 1MB（超限断流、用部分正文并标明）、注入上下文的可见文本
+  最多 8000 字（超限截断并标明）。HTML 剥脚本/样式/标签只留可见文本。
+- SSRF 口径：只许 http/https；每一跳（含重定向，最多 5 跳）在出站之前先
+  校验——解析主机名得到全部地址，任一地址落入回环/私网（10/8、172.16/12、
+  192.168/16）/链路本地/云元数据（169.254.169.254、::1、fe80::/10）/
+  CGNAT/唯一本地/组播等保留段即整条拒绝。连接用已校验地址钉住 socket 的
+  lookup，校验后再解析变私网（DNS rebinding）也连不到钉住的地址；TLS 的
+  SNI/证书校验仍按原主机名。被拒时对模型与用户只说「不允许访问该地址」，
+  不摊命中的网段或解析到的私网 IP。取舍如实记：本实现校验「全部解析地址」
+  而非「首个地址」，域名只要有一个私网解析就整条拒绝，比逐个尝试更严，
+  代价是极少数双栈/多解析站点的可用性——只读引用场景下选严不选通。
+- 先红后修：SSRF 校验临时改成放行（`isBlockedAddress` 检查短路）后跑同一套
+  测试，**19/28**——解析到 10.0.0.1 / 169.254.169.254 / localhost /
+  192.168.1.1 / [::1] 的用例全部出站成功（替身计数 1）、302 到私网与无缝
+  回环用例同样红；恢复校验后 **28/28** 全绿。红输出留档在本机
+  `piper-r11-red.log`（不入库），PR 描述有摘录。
+- 验收逐条：① 夹具特征句页经 stub 模型对话取回并被助手引用（test-webfetch
+  第 20–21 项，SSE `tool` 事件名不变、中栏工具卡见截图 11）；② 拦截清单
+  （127.0.0.1、localhost、10.0.0.1、192.168.1.1、169.254.169.254、[::1]、
+  302 到私网）替身出站计数为 0（第 02–06、09、13、15 项）；③ 超大响应在
+  下载与注入两层截断并标明（第 11、14 项）；④ 未启用时主 bot 也无工具、
+  仓库管家（不在可用范围）请求里根本没有 web.fetch（第 18、22 项）；⑤ 设
+  置读回只有末四位掩码、会话 JSONL 无密钥全文（第 25、27 项）；⑥ check 通
+  过、回归只增不减全绿，截图两张：`docs/screens/10-settings-connectors-web-enabled.png`
+  （连接器已启用态）、`docs/screens/11-chat-web-fetch-tool.png`（一次
+  web.fetch 工具卡与引用了特征句的回答）。
+- 可用范围：默认只有主 bot；其他 bot 在自己的 tools 里声明 `web.fetch` /
+  `web.search` 才进范围（连接器卡「可用范围」与内核注册共用
+  `webToolBots()` 一份口径）。工具只在启用且在范围内时注册，范围外 bot 的
+  模型看不到工具、不存在「直接调用」路径。
+- web.search 契约：`GET <搜索端点>?q=<关键词>`，请求头
+  `Authorization: Bearer <密钥>`；期望 JSON 的 `results`/`data`/`items`
+  数组，每项取 title/name、url/link、snippet/description/content。未配置
+  端点或密钥时工具不注册、对话问起如实说没有，不做爬虫冒充。搜索密钥存
+  `settings-web.json`（0600），已纳入统一 `redact()` 的已知秘密收集。
+- 测试缝说明：本地夹具服务在回环地址上，与 SSRF 规则天然冲突；测试进程
+  经环境变量 `PIPER_WEB_FETCH_TEST_ALLOW`（逗号分隔 host:port）放行夹具
+  地址，生产环境不设此变量即无任何放行（第 15 项断言关掉缝后同一回环地址
+  照样被拦、出站计数 0）。
+- 全套：`npm run test` 聚合全绿——build:web、check、test:findings、
+  test:scan、test:schedule、test:gateway、test:listen、test:badtz、
+  test:secrets、test:model-stub、test:r10、test:webfetch 28/28、
+  eval:scan 18/18、regression 72/72（数字以本节合入时实跑为准，见 PR 描述）。
+- 明确不做核对：未做登录态浏览、未操作任何需授权后台、无头浏览器仅用于
+  截图（CDP 驱动已构建前端，不执行被抓页面的脚本——抓取走原始 HTTP + 文本
+  抽取）、未配置搜索端点时不用爬虫冒充搜索、未把网页查询做成评测主线；
+  未改 `packages/`、未改 SSE 事件名、未增加写意图。

@@ -143,11 +143,61 @@ export function githubToken() {
 	return readGithubSettingsFile().token || process.env.GITHUB_TOKEN || "";
 }
 
+// ---------- 网页查询（L0-6）：抓取开关 + 搜索端点/密钥，与其他设置文件同一套规则 ----------
+
+const WEB_SETTINGS_FILE = join(DATA_DIR, "settings-web.json");
+
+export function readWebSettingsFile() {
+	if (!existsSync(WEB_SETTINGS_FILE)) return {};
+	try {
+		const parsed = JSON.parse(readFileSync(WEB_SETTINGS_FILE, "utf8"));
+		return parsed && typeof parsed === "object" ? parsed : {};
+	} catch {
+		return {};
+	}
+}
+
+// 部分更新：字段出现才改；searchApiKey 传空字符串表示清除已保存的密钥。
+export function saveWebSettingsFile(patch) {
+	const next = { ...readWebSettingsFile() };
+	if (patch.fetchEnabled !== undefined) next.fetchEnabled = Boolean(patch.fetchEnabled);
+	if (patch.searchEndpoint !== undefined) next.searchEndpoint = String(patch.searchEndpoint).trim();
+	if (patch.searchApiKey !== undefined) {
+		if (patch.searchApiKey) next.searchApiKey = String(patch.searchApiKey);
+		else delete next.searchApiKey;
+	}
+	writeSettingsFile(WEB_SETTINGS_FILE, next);
+	return next;
+}
+
+export function webFetchEnabled() {
+	return readWebSettingsFile().fetchEnabled === true;
+}
+
+// 搜索配置：端点与密钥都齐才算可用，缺一即未配置（工具不注册、对话里如实说没有）。
+export function webSearchConfig() {
+	const saved = readWebSettingsFile();
+	const endpoint = typeof saved.searchEndpoint === "string" ? saved.searchEndpoint.trim() : "";
+	const apiKey = typeof saved.searchApiKey === "string" ? saved.searchApiKey : "";
+	if (!endpoint || !apiKey) return null;
+	return { endpoint, apiKey };
+}
+
+// 网页查询的可用范围：默认只有主 bot；其他 bot 须在自己的 tools 里声明
+// web.fetch / web.search 才进范围。连接器卡的 bots 与内核注册工具都用这一份。
+export function webToolBots() {
+	const declared = listBots()
+		.filter((b) => (b.tools ?? []).some((t) => t === "web.fetch" || t === "web.search" || t.startsWith("web.")))
+		.map((b) => b.id);
+	return [...new Set(["piper-main", ...declared])];
+}
+
 // 连接器统一形状：id / name / purpose / status(placeholder|unconfigured|connected) /
 // statusNote（点开看的口径）/ bots（可用范围）/ access（读写级别）/ configurable。
 // tokenHint 只出现在 GitHub 卡上，且只有末四位掩码。
 export function listConnectors() {
 	const token = githubToken();
+	const web = { fetchEnabled: webFetchEnabled(), search: webSearchConfig() };
 	const githubBots = listBots()
 		.filter((b) => (b.tools ?? []).some((t) => t.startsWith("github")))
 		.map((b) => b.id);
@@ -168,12 +218,20 @@ export function listConnectors() {
 		{
 			id: "web",
 			name: "网页查询",
-			purpose: "主 bot 只读打开公开网页并在对话里引用内容。",
-			status: "unconfigured",
-			statusNote: "尚未启用：启用后可只读抓取公开网页，带超时与体积上限，并拒绝本机 / 私网 / 元数据地址。搜索需另行配置搜索端点后才可用。",
-			bots: ["piper-main"],
+			purpose: "只读打开公开网页并在对话里引用内容；配置搜索端点后，还能按关键词搜索网页。",
+			status: web.fetchEnabled ? "connected" : "unconfigured",
+			statusNote: web.fetchEnabled
+				? `已启用：可用范围内的 bot 可只读抓取公开网页（超时 10 秒、单页最多 1 MB、引用文本最多 8000 字），本机 / 私网 / 元数据地址一律拒绝。${
+						web.search ? "搜索已配置，可按关键词搜索。" : "搜索尚未配置：在下方填入搜索端点与密钥后可用。"
+					}`
+				: "尚未启用：启用后可用范围内的 bot 可只读抓取公开网页（带超时与体积上限，本机 / 私网 / 元数据地址一律拒绝）。搜索需另行配置搜索端点与密钥后才可用。",
+			bots: webToolBots(),
 			access: "read",
-			configurable: false,
+			configurable: true,
+			fetchEnabled: web.fetchEnabled,
+			searchConfigured: Boolean(web.search),
+			searchEndpoint: web.search?.endpoint ?? "",
+			searchKeyHint: web.search ? secretHint(web.search.apiKey) : "",
 		},
 		{
 			id: "calendar",

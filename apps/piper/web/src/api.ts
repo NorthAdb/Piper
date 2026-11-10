@@ -138,6 +138,10 @@ export async function saveGithubToken(token: string): Promise<Connector> {
 	return (await api<{ connector: Connector }>("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token }) })).connector;
 }
 
+export async function saveWebSettings(patch: { fetchEnabled?: boolean; searchEndpoint?: string; searchApiKey?: string }): Promise<Connector> {
+	return (await api<{ connector: Connector }>("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify(patch) })).connector;
+}
+
 export function getNotifications(): Promise<{ notifications: NotificationEntry[]; unread: number }> {
 	return api("/api/notifications");
 }

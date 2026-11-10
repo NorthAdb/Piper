@@ -93,6 +93,11 @@ export type Connector = {
 	access: string;
 	configurable: boolean;
 	tokenHint?: string;
+	// 网页查询卡专属（L0-6）：抓取开关、搜索是否已配置、端点与密钥末四位掩码
+	fetchEnabled?: boolean;
+	searchConfigured?: boolean;
+	searchEndpoint?: string;
+	searchKeyHint?: string;
 };
 
 // 待批项（GET /api/approvals 的线格式，P1-5）：带 writeIntent 的 Finding 的审批视图，

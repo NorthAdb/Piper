@@ -42,6 +42,8 @@ function collectSecrets() {
 	if (typeof model.apiKey === "string" && model.apiKey.length >= MIN_EXACT_LENGTH) knownSecrets.add(model.apiKey);
 	const github = readSettingsJson("settings-github.json");
 	if (typeof github.token === "string" && github.token.length >= MIN_EXACT_LENGTH) knownSecrets.add(github.token);
+	const web = readSettingsJson("settings-web.json");
+	if (typeof web.searchApiKey === "string" && web.searchApiKey.length >= MIN_EXACT_LENGTH) knownSecrets.add(web.searchApiKey);
 	for (const v of [process.env.GITHUB_TOKEN, process.env.PIPER_MODEL_API_KEY, process.env.OPENAI_API_KEY]) {
 		if (typeof v === "string" && v.length >= MIN_EXACT_LENGTH) knownSecrets.add(v);
 	}
