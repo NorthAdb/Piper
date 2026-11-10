@@ -39,7 +39,12 @@ function installStub(scenario) {
 		if (rest === "") payload = infoFor(m[1]);
 		else if (rest.startsWith("/commits")) payload = entry.commits ?? [];
 		else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
-		else if (rest.startsWith("/pulls")) payload = entry.pulls ?? [];
+		else if (rest.match(/^\/pulls\/\d+$/)) {
+			const num = rest.match(/^\/pulls\/(\d+)$/)[1];
+			const one = (entry.pulls ?? []).find((p) => String(p.number) === num) ?? entry.pullDetails?.[num];
+			if (!one) return { ok: false, status: 404, json: async () => ({}) };
+			payload = one;
+		} else if (rest.startsWith("/pulls")) payload = entry.pulls ?? [];
 		else if (rest.startsWith("/issues")) payload = entry.issues ?? [];
 		else if (rest.startsWith("/actions/runs")) payload = { workflow_runs: entry.runs ?? [] };
 		else return { ok: false, status: 599, json: async () => ({}) };
@@ -119,6 +124,43 @@ try {
 		"场景B：单仓 API 失败计 failures=1 并写进日报，其他仓继续；安静仓（成功 CI + 已批准 PR）不开 Finding",
 		runB.failures === 1 && runB.total === 2 && runB.findings.length === 0 && runB.report.includes("扫描失败") && runB.report.includes("Acme/Quiet") && runB.report.includes("本轮没有需要拍板的事项。"),
 		`failures=${runB.failures} findings=${runB.findings.length}`,
+	);
+
+	// ---- 场景 C（R5，审计探针 P5 的镜像）：驳回后冷却——头部未变连扫不再重开，
+	//      头部变化才重开。旧实现每轮新开 1 条（累计多条、待批列表堆积）。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "c.jsonl");
+	const scenarioC = (headSha) => ({
+		"Acme/Probe": {
+			runs: [{ id: 6001, name: "CI", status: "completed", conclusion: "success", head_branch: "main", head_sha: headSha, html_url: "https://github.com/Acme/Probe/actions/runs/6001", created_at: "2026-11-10T01:00:00Z" }],
+			pulls: [
+				{ number: 42, title: "Probe PR", draft: false, head: { sha: headSha }, html_url: "https://github.com/Acme/Probe/pull/42", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" },
+			],
+			reviews: { "42": [] },
+			commits: [],
+			issues: [],
+		},
+	});
+	installStub(scenarioC("aaa111"));
+	const runC1 = await runMorningScan({ repos: ["Acme/Probe"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const firstC = runC1.findings.find((f) => f.type === "pr_needs_review");
+	if (firstC) findingsMod.updateFinding(firstC.id, { status: "rejected" });
+	let reopened = 0;
+	for (let i = 0; i < 3; i += 1) {
+		const r = await runMorningScan({ repos: ["Acme/Probe"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+		reopened += r.findings.length;
+	}
+	const allC = findingsMod.listFindings({ repo: "Acme/Probe" });
+	check(
+		"场景C：驳回后头部未变，连扫三轮每轮新开 0 条（P5 旧现象为每轮 +1），该 subject 总共只有 1 条且为 rejected",
+		Boolean(firstC) && reopened === 0 && allC.length === 1 && allC[0].status === "rejected",
+		`首轮=${runC1.findings.length} 后三轮累计新开=${reopened} 总条数=${allC.length}`,
+	);
+	installStub(scenarioC("bbb222"));
+	const runC5 = await runMorningScan({ repos: ["Acme/Probe"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景C：头部提交变化后可重开一条新的 open Finding（冷却按 head 解除）",
+		runC5.findings.length === 1 && runC5.findings[0].status === "open" && findingsMod.listFindings({ repo: "Acme/Probe", status: "open" }).length === 1,
+		`新开=${runC5.findings.length}`,
 	);
 } finally {
 	globalThis.fetch = realFetch;

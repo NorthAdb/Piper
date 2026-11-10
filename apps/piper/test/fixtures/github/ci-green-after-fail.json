@@ -1,0 +1,84 @@
+{
+ "description": "CI 转绿对账（R5）：第一轮 CI 最新已结束 run 为 failure，开 ci_failed；第二轮该工作流最新已结束 run 转为 success——扫描前对账应把旧 ci_failed 自动退役为 expired（审计 reconciled:ci_green），且不新开。",
+ "expect": {
+  "created": 1,
+  "createdPerScan": [
+   1,
+   0
+  ],
+  "expired": [
+   {
+    "repo": "NorthAdb/LinkForge",
+    "subject": "555001",
+    "type": "ci_failed"
+   }
+  ],
+  "failures": 0,
+  "findings": []
+ },
+ "name": "ci-green-after-fail",
+ "phases": [
+  {
+   "NorthAdb/LinkForge": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 2,
+     "pushed_at": "2026-11-10T02:00:00Z",
+     "stargazers_count": 12
+    },
+    "issues": [],
+    "pulls": [],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "failure",
+      "created_at": "2026-11-10T01:00:00Z",
+      "head_branch": "main",
+      "head_sha": "aaa111",
+      "html_url": "https://github.com/NorthAdb/LinkForge/actions/runs/555001",
+      "id": 555001,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   }
+  },
+  {
+   "NorthAdb/LinkForge": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 2,
+     "pushed_at": "2026-11-10T06:00:00Z",
+     "stargazers_count": 12
+    },
+    "issues": [],
+    "pulls": [],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T05:00:00Z",
+      "head_branch": "main",
+      "head_sha": "bbb222",
+      "html_url": "https://github.com/NorthAdb/LinkForge/actions/runs/555002",
+      "id": 555002,
+      "name": "CI",
+      "status": "completed"
+     },
+     {
+      "conclusion": "failure",
+      "created_at": "2026-11-10T01:00:00Z",
+      "head_branch": "main",
+      "head_sha": "aaa111",
+      "html_url": "https://github.com/NorthAdb/LinkForge/actions/runs/555001",
+      "id": 555001,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   }
+  }
+ ]
+}

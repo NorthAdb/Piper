@@ -18,6 +18,9 @@
 // 领取与执行（领取 = approved→executing 的同步段，单进程内即互斥）：
 //   - 领取后先写一条审计 executing，再做网络调用——进程崩溃后能看到「发到一半」；
 //   - 执行前现查目标 PR 仍为 open，否则 failed/pr_not_open，退回 approved 可重试；
+//   - 再复检触发规则前提（R5）：PR 非 draft、且按与扫描同一套「已批准」判定
+//     （lib/pr-review.mjs）仍待审——批准后 PR 已被批准的，不再发过时催办评论，
+//     failed/precondition_changed 退回 approved；复检取证失败同样退回，不误发；
 //   - 发评论前先查该 PR 已有评论里是否带本批准的幂等标记
 //     <!-- piper:approval=<approvalId> -->，有则复用该评论记 executed，不再 POST；
 //   - POST 的正文 = 快照正文 + 幂等标记；成功写审计 executed（带评论 URL）、Finding 转 executed；
@@ -27,6 +30,7 @@ import { githubToken } from "./settings.mjs";
 import { getBot } from "./store.mjs";
 import { getFinding, updateFinding } from "./findings.mjs";
 import { appendAudit } from "./audit.mjs";
+import { evaluateReviews } from "./pr-review.mjs";
 
 // GitHub API 基址：缺省官方；可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归/测试指向本地桩）。
 function ghBase() {
@@ -111,6 +115,22 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 	if (pr.state !== "open") {
 		rollback();
 		return failed("pr_not_open");
+	}
+	// 规则前提复检（R5）：与扫描共用 lib/pr-review.mjs 的「已批准」判定。
+	if (pr.draft) {
+		rollback();
+		return failed("precondition_changed");
+	}
+	let reviews;
+	try {
+		reviews = await ghJson(`/repos/${finding.repo}/pulls/${snapshot.prNumber}/reviews?per_page=100`, { token });
+	} catch (err) {
+		rollback();
+		return failed(`precondition_check_failed: ${err.message}`);
+	}
+	if (evaluateReviews(reviews, pr.head?.sha).approved) {
+		rollback();
+		return failed("precondition_changed");
 	}
 
 	// 幂等查重：同一批准若已留过评论（例如上次 POST 成功后进程崩溃），直接复用，不再发第二条。

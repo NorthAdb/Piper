@@ -1,0 +1,77 @@
+{
+ "description": "已批准待执行不重开（R5）：PR 42 已有一条 approved 的 Finding（等人执行网关写），PR 仍待审。连扫两轮不得另开新条，待批列表里始终只有那一条 approved。",
+ "expect": {
+  "created": 0,
+  "createdPerScan": [
+   0,
+   0
+  ],
+  "failures": 0,
+  "findings": [],
+  "statusFindings": [
+   {
+    "repo": "NorthAdb/ApprovedPending",
+    "status": "approved",
+    "subject": "42",
+    "type": "pr_needs_review"
+   }
+  ]
+ },
+ "name": "approved-pending-rescan",
+ "repos": {
+  "NorthAdb/ApprovedPending": {
+   "commits": [],
+   "info": {
+    "default_branch": "main",
+    "forks_count": 0,
+    "pushed_at": "2026-11-10T02:00:00Z",
+    "stargazers_count": 1
+   },
+   "issues": [],
+   "pulls": [
+    {
+     "created_at": "2026-11-09T10:00:00Z",
+     "draft": false,
+     "head": {
+      "sha": "aaa111"
+     },
+     "html_url": "https://github.com/NorthAdb/ApprovedPending/pull/42",
+     "number": 42,
+     "title": "Add thing",
+     "user": {
+      "login": "contributor"
+     }
+    }
+   ],
+   "reviews": {},
+   "runs": [
+    {
+     "conclusion": "success",
+     "created_at": "2026-11-10T01:00:00Z",
+     "head_branch": "main",
+     "head_sha": "aaa111",
+     "html_url": "https://github.com/NorthAdb/ApprovedPending/actions/runs/880301",
+     "id": 880301,
+     "name": "CI",
+     "status": "completed"
+    }
+   ]
+  }
+ },
+ "scans": 2,
+ "seedFindings": [
+  {
+   "headSha": "aaa111",
+   "repo": "NorthAdb/ApprovedPending",
+   "status": "approved",
+   "subject": "42",
+   "type": "pr_needs_review",
+   "updatedAtDaysAgo": 0,
+   "writeIntent": {
+    "body": "晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。",
+    "kind": "pr_comment",
+    "prNumber": 42
+   }
+  }
+ ]
+}

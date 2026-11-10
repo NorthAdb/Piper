@@ -1,0 +1,212 @@
+{
+ "description": "驳回冷却（R5）：RejectCool 的 PR 42 有一条 1 天前被驳回的 Finding，头部提交未变（aaa111）时第一轮不重开；第二轮头部变为 bbb222 后可重开。RejectStale 的 PR 43 被驳回已 15 天，头部未变（ccc333）也可在第一轮重开，第二轮因已有 open 不重复开。",
+ "expect": {
+  "created": 2,
+  "createdPerScan": [
+   1,
+   1
+  ],
+  "failures": 0,
+  "findings": [
+   {
+    "evidenceUrl": "https://github.com/NorthAdb/RejectCool/pull/42",
+    "repo": "NorthAdb/RejectCool",
+    "subject": "42",
+    "type": "pr_needs_review"
+   },
+   {
+    "evidenceUrl": "https://github.com/NorthAdb/RejectStale/pull/43",
+    "repo": "NorthAdb/RejectStale",
+    "subject": "43",
+    "type": "pr_needs_review"
+   }
+  ]
+ },
+ "name": "reopen-after-reject",
+ "phases": [
+  {
+   "NorthAdb/RejectCool": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 0,
+     "pushed_at": "2026-11-10T02:00:00Z",
+     "stargazers_count": 1
+    },
+    "issues": [],
+    "pulls": [
+     {
+      "created_at": "2026-11-09T10:00:00Z",
+      "draft": false,
+      "head": {
+       "sha": "aaa111"
+      },
+      "html_url": "https://github.com/NorthAdb/RejectCool/pull/42",
+      "number": 42,
+      "title": "Add thing",
+      "user": {
+       "login": "contributor"
+      }
+     }
+    ],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T01:00:00Z",
+      "head_branch": "main",
+      "head_sha": "aaa111",
+      "html_url": "https://github.com/NorthAdb/RejectCool/actions/runs/880001",
+      "id": 880001,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   },
+   "NorthAdb/RejectStale": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 0,
+     "pushed_at": "2026-11-10T02:00:00Z",
+     "stargazers_count": 1
+    },
+    "issues": [],
+    "pulls": [
+     {
+      "created_at": "2026-11-09T10:00:00Z",
+      "draft": false,
+      "head": {
+       "sha": "ccc333"
+      },
+      "html_url": "https://github.com/NorthAdb/RejectStale/pull/43",
+      "number": 43,
+      "title": "Fix other",
+      "user": {
+       "login": "contributor"
+      }
+     }
+    ],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T01:00:00Z",
+      "head_branch": "main",
+      "head_sha": "ccc333",
+      "html_url": "https://github.com/NorthAdb/RejectStale/actions/runs/880101",
+      "id": 880101,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   }
+  },
+  {
+   "NorthAdb/RejectCool": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 0,
+     "pushed_at": "2026-11-10T06:00:00Z",
+     "stargazers_count": 1
+    },
+    "issues": [],
+    "pulls": [
+     {
+      "created_at": "2026-11-09T10:00:00Z",
+      "draft": false,
+      "head": {
+       "sha": "bbb222"
+      },
+      "html_url": "https://github.com/NorthAdb/RejectCool/pull/42",
+      "number": 42,
+      "title": "Add thing",
+      "user": {
+       "login": "contributor"
+      }
+     }
+    ],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T05:00:00Z",
+      "head_branch": "main",
+      "head_sha": "bbb222",
+      "html_url": "https://github.com/NorthAdb/RejectCool/actions/runs/880002",
+      "id": 880002,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   },
+   "NorthAdb/RejectStale": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 0,
+     "pushed_at": "2026-11-10T02:00:00Z",
+     "stargazers_count": 1
+    },
+    "issues": [],
+    "pulls": [
+     {
+      "created_at": "2026-11-09T10:00:00Z",
+      "draft": false,
+      "head": {
+       "sha": "ccc333"
+      },
+      "html_url": "https://github.com/NorthAdb/RejectStale/pull/43",
+      "number": 43,
+      "title": "Fix other",
+      "user": {
+       "login": "contributor"
+      }
+     }
+    ],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T01:00:00Z",
+      "head_branch": "main",
+      "head_sha": "ccc333",
+      "html_url": "https://github.com/NorthAdb/RejectStale/actions/runs/880101",
+      "id": 880101,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   }
+  }
+ ],
+ "seedFindings": [
+  {
+   "headSha": "aaa111",
+   "repo": "NorthAdb/RejectCool",
+   "status": "rejected",
+   "subject": "42",
+   "type": "pr_needs_review",
+   "updatedAtDaysAgo": 1,
+   "writeIntent": {
+    "body": "晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。",
+    "kind": "pr_comment",
+    "prNumber": 42
+   }
+  },
+  {
+   "headSha": "ccc333",
+   "repo": "NorthAdb/RejectStale",
+   "status": "rejected",
+   "subject": "43",
+   "type": "pr_needs_review",
+   "updatedAtDaysAgo": 15,
+   "writeIntent": {
+    "body": "晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。",
+    "kind": "pr_comment",
+    "prNumber": 43
+   }
+  }
+ ]
+}

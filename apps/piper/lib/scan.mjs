@@ -2,8 +2,15 @@
 // 统计信息只进日报的「其余观察」，不再冒充主结果。
 // 进入拍板清单的规则是程序化的（本批就这两条，不要临时扩种类）：
 //   ci_failed：默认分支上最近一次已结束（status=completed）的 workflow run 结论为 failure；
-//   pr_needs_review：open、非 draft、且没有任何 APPROVED 审查的 PR。
-// 以 subject（run id / PR 号）去重：已有 open Finding 的不重复开。建议先用规则模板，不上模型润色，
+//   pr_needs_review：open、非 draft、且按「已批准」锁定语义（lib/pr-review.mjs：每位审查人
+//   最新一条为准、陈旧批准不算数）仍待审的 PR。
+// 去重（R5，口径已锁定）：键 repo+type+subject，按状态冷却——open/approved/executing
+// 不得另开；rejected 头部未变且未满 14 天不重开；executed 仅头部变化可重开；expired 可重开
+//（实现在 findings.findBlockingFinding）。头部取 PR 的 head.sha / run 的 head_sha，开单时
+// 存进 Finding.headSha 作下轮比较基准。
+// 扫描前对账（R5）：每仓先复核既有 open/approved Finding——PR 已合并/关闭/draft/已批准、
+// 或同工作流 CI 已转绿/已被新失败 run 取代的，自动转 expired 并写审计 reconciled:<原因>，
+// 退出待批。建议先用规则模板，不上模型润色，
 // 模型不得发明 GitHub 上不存在的 PR 或 CI（后续步骤若引入模型写建议，同样受此约束）。
 // 令牌经 lib/settings.mjs 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
 // 本文件不直读令牌环境变量；无令牌走公开限额。API 基址缺省 https://api.github.com，
@@ -13,7 +20,9 @@
 // 本文件全程只读，绝不调用任何 GitHub 写接口：pr_needs_review 附带的 writeIntent 只是
 // 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
 import { githubToken } from "./settings.mjs";
-import { createFinding, findOpenFinding } from "./findings.mjs";
+import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.mjs";
+import { evaluateReviews, prNeedsReview } from "./pr-review.mjs";
+import { appendAudit } from "./audit.mjs";
 
 function ghBase() {
 	return (process.env.PIPER_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
@@ -59,14 +68,73 @@ async function fetchRepoData(repo) {
 	};
 }
 
-async function hasApprovedReview(repo, prNumber) {
-	const reviews = await gh(`/repos/${repo}/pulls/${prNumber}/reviews?per_page=100`);
-	return (reviews ?? []).some((r) => r.state === "APPROVED");
+async function fetchReviews(repo, prNumber) {
+	return (await gh(`/repos/${repo}/pulls/${prNumber}/reviews?per_page=100`)) ?? [];
+}
+
+// ---- 扫描前对账（R5）：把已失效的 open/approved Finding 自动退役为 expired ----
+// PR 类：已 merged/closed、变 draft、或按锁定语义已算当前已批准 → 退役；
+// CI 类：同工作流最新已结束 run 已转绿（ci_green）或已被一条更新的失败 run 取代
+//（ci_superseded，新 run 由本轮规则另开）→ 退役。取证不足（PR 单查失败、工作流
+// 无法确认）时不退役，宁可多留一轮等人处理。退役一律写审计 reason=reconciled:<原因>。
+function ciRetireCause(f, data) {
+	const mine = data.runs.find((r) => String(r.id) === f.subject);
+	const workflow = f.workflow ?? mine?.name ?? null;
+	if (!workflow) return null;
+	const latestCompleted = data.runs.filter((r) => r.name === workflow && r.head_branch === data.branch && r.status === "completed")[0];
+	if (!latestCompleted || String(latestCompleted.id) === f.subject) return null;
+	if (latestCompleted.conclusion === "success") return "ci_green";
+	if (latestCompleted.conclusion === "failure") return "ci_superseded";
+	return null;
+}
+
+async function prRetireCause(repo, f, data, fetchReviewsCached) {
+	const num = Number(f.subject);
+	let pr = data.pulls.find((p) => p.number === num) ?? null;
+	if (!pr) {
+		try {
+			pr = await gh(`/repos/${repo}/pulls/${num}`);
+		} catch {
+			return null;
+		}
+		if (pr.state === "closed") return pr.merged_at ? "pr_merged" : "pr_closed";
+	}
+	if (pr.draft) return "pr_draft";
+	const reviews = await fetchReviewsCached(num);
+	if (evaluateReviews(reviews, pr.head?.sha).approved) return "pr_approved";
+	return null;
+}
+
+async function reconcileRepo(repo, data, fetchReviewsCached) {
+	const reconciled = [];
+	const candidates = listFindings({ repo }).filter((f) => f.status === "open" || f.status === "approved");
+	for (const f of candidates) {
+		const cause = f.type === "pr_needs_review" ? await prRetireCause(repo, f, data, fetchReviewsCached) : ciRetireCause(f, data);
+		if (!cause) continue;
+		updateFinding(f.id, { status: "expired" });
+		appendAudit({
+			botId: f.botId,
+			intent: f.writeIntent ? { ...f.writeIntent, repo: f.repo } : null,
+			result: "expired",
+			reason: `reconciled:${cause}`,
+			findingId: f.id,
+		});
+		reconciled.push({ id: f.id, repo: f.repo, type: f.type, subject: f.subject, cause });
+	}
+	return reconciled;
 }
 
 // 对一个仓库取证并按规则开 Finding（落盘）。取证失败抛错，由上层记入日报并计 failures。
 async function scanRepo(repo, botId, now) {
 	const data = await fetchRepoData(repo);
+	// 审查结果在对账与规则之间共用一轮取证，避免同一 PR 重复拉 reviews。
+	const reviewsCache = new Map();
+	const fetchReviewsCached = async (prNumber) => {
+		if (!reviewsCache.has(prNumber)) reviewsCache.set(prNumber, await fetchReviews(repo, prNumber));
+		return reviewsCache.get(prNumber);
+	};
+	// 先对账再开新：失效的旧项退役后不占去重名额，本轮报告也只讲还活着的事。
+	const reconciled = await reconcileRepo(repo, data, fetchReviewsCached);
 	const created = [];
 
 	// 规则一：ci_failed。runs 已按创建时间倒序；除 API 的 branch 参数外，客户端再按
@@ -74,7 +142,7 @@ async function scanRepo(repo, botId, now) {
 	const latestCompleted = data.runs.filter((r) => r.head_branch === data.branch && r.status === "completed")[0];
 	if (latestCompleted && latestCompleted.conclusion === "failure") {
 		const subject = String(latestCompleted.id);
-		if (!findOpenFinding(repo, "ci_failed", subject)) {
+		if (!findBlockingFinding(repo, "ci_failed", subject, { headSha: latestCompleted.head_sha ?? null, now })) {
 			created.push(
 				createFinding({
 					repo,
@@ -86,6 +154,8 @@ async function scanRepo(repo, botId, now) {
 					evidenceUrl: latestCompleted.html_url,
 					suggestedAction: "请查看该 run 的失败日志，决定是直接修复，还是在相关 PR 下留言跟进。",
 					expiresAt: expiresAtFrom(now),
+					headSha: latestCompleted.head_sha ?? null,
+					workflow: latestCompleted.name ?? null,
 				}),
 			);
 		}
@@ -96,9 +166,11 @@ async function scanRepo(repo, botId, now) {
 	// 扫描本身不发送；人在收件箱批准后由网关（P1-6）执行，批不批由人决定。
 	for (const p of data.pulls) {
 		if (p.draft) continue;
-		if (await hasApprovedReview(repo, p.number)) continue;
+		const headSha = p.head?.sha ?? null;
+		const reviews = await fetchReviewsCached(p.number);
+		if (!prNeedsReview(reviews, headSha)) continue;
 		const subject = String(p.number);
-		if (findOpenFinding(repo, "pr_needs_review", subject)) continue;
+		if (findBlockingFinding(repo, "pr_needs_review", subject, { headSha, now })) continue;
 		created.push(
 			createFinding({
 				repo,
@@ -106,7 +178,7 @@ async function scanRepo(repo, botId, now) {
 				subject,
 				botId,
 				title: `PR 待审查：#${p.number} ${p.title}（${repo}）`,
-				summary: `PR #${p.number} 由 ${p.user?.login ?? "?"} 于 ${fmtDate(p.created_at)} 打开，尚未获得任何批准（APPROVED）审查。`,
+				summary: `PR #${p.number} 由 ${p.user?.login ?? "?"} 于 ${fmtDate(p.created_at)} 打开，按每位审查人最新一条审查判定仍未获得批准。`,
 				evidenceUrl: p.html_url,
 				suggestedAction: "请审查该 PR 并给出结论，或批准收件箱里的模板评论由网关发到 PR 下跟进。",
 				writeIntent: {
@@ -115,11 +187,12 @@ async function scanRepo(repo, botId, now) {
 					body: `晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。\n\n（由 Piper 仓库管家在晨间扫描中生成，经人工批准后由网关发送。）`,
 				},
 				expiresAt: expiresAtFrom(now),
+				headSha,
 			}),
 		);
 	}
 
-	return { data, created };
+	return { data, created, reconciled };
 }
 
 // 「其余观察」：统计与列表只进这里，不进拍板清单。
@@ -157,18 +230,21 @@ function observationLines(repo, data) {
 	return lines.join("\n");
 }
 
-// 返回 { artifact, report, failures, total, findings }：
-// findings 为本轮新开的 Finding（已落盘）；failures 是取证失败的仓库数，total 为仓库总数。
+// 返回 { artifact, report, failures, total, findings, reconciled }：
+// findings 为本轮新开的 Finding（已落盘）；reconciled 为本轮对账退役的失效项
+//（{ id, repo, type, subject, cause }）；failures 是取证失败的仓库数，total 为仓库总数。
 export async function runMorningScan({ repos, botId, saveArtifact }) {
 	const now = new Date();
 	const dateStr = now.toISOString().slice(0, 10);
 	const createdAll = [];
+	const reconciledAll = [];
 	const observations = [];
 	let failures = 0;
 	for (const repo of repos) {
 		try {
-			const { data, created } = await scanRepo(repo, botId, now);
+			const { data, created, reconciled } = await scanRepo(repo, botId, now);
 			createdAll.push(...created);
+			reconciledAll.push(...reconciled);
 			observations.push(observationLines(repo, data));
 		} catch (err) {
 			failures += 1;
@@ -194,9 +270,12 @@ export async function runMorningScan({ repos, botId, saveArtifact }) {
 	} else {
 		parts.push("本轮没有需要拍板的事项。");
 	}
+	if (reconciledAll.length) {
+		parts.push("", `对账：本轮 ${reconciledAll.length} 条已失效事项自动退役（转 expired，原因见审计 reconciled:*）。`);
+	}
 	parts.push("", "## 其余观察", "", observations.join("\n"));
 
 	const body = parts.join("\n");
 	const artifact = saveArtifact({ botId, kind: "morning-scan", title: `晨间仓库日报 ${dateStr}`, body });
-	return { artifact, report: body, failures, total: repos.length, findings: createdAll };
+	return { artifact, report: body, failures, total: repos.length, findings: createdAll, reconciled: reconciledAll };
 }

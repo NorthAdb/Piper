@@ -294,8 +294,13 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 运行器 `scripts/eval-scan.mjs` 给每用例独立的临时 findings 文件，fetch 全域换成夹具
   替身：未映射的 URL 会被记录、回 599 并在结尾断言为空——评测永不访问真实 api.github.com，
   也不产生真实写入。每用例除期望 Finding 集合外，还断言累计新开条数与期望一致（去重被打穿
-  会立刻变红）。当前五用例：`ci-failed-latest`、`pr-needs-review`、`quiet-no-findings`、
-  `dedup-rescan`、`repo-api-error`。
+  会立刻变红）。当前十二用例：`ci-failed-latest`、`pr-needs-review`、`quiet-no-findings`、
+  `dedup-rescan`、`repo-api-error`，以及 R5 新增的 `reopen-after-reject`、
+  `reopen-after-executed`、`approved-pending-rescan`、`pr-approved-then-changes-requested`、
+  `pr-approved-then-new-commits`、`pr-approved-current`、`ci-green-after-fail`。
+  R5 起运行器还支持 `seedFindings`（预置历史 Finding）、`phases`（逐轮换 GitHub 状态）
+  与 `expect.createdPerScan` / `expired` / `statusFindings`，字段说明见
+  `scripts/eval-scan.mjs` 头部注释。
 - 新增用例：往 `test/fixtures/github/` 放一个符合上面格式的 JSON 即可，不用改脚本；
   文件名即用例来源，`name` 字段写用例名。新增夹具应来自真实响应脱敏或手造的最小形状，
   不要把真实令牌写进夹具。
@@ -817,3 +822,63 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   产品行为变更只有 `PIPER_DATA_DIR` 与 `PIPER_GITHUB_API_BASE` 两个新环境
   变量入口（缺省值与原行为一致）；未碰 R5 及以后；未改 `packages/`；未改
   SSE 事件名；未增加第二种写意图。
+
+### R5 去重语义与「已批准」判定实测（2026-11-10，分支 fix/r5-dedup-semantics，堆叠在 R4 上）
+
+审计 B5 + M2 的收口：去重从「只认 open」改成按状态冷却，「已批准」从「曾经出现过
+APPROVED」改成锁定语义，并补上扫描前对账与网关规则前提复检。口径以返工稿 R5 与
+修订切片第 1 节决策表为准，已锁定、不再改。先红后修：
+
+- 先红（新夹具/用例先行、实现未改）：`eval:scan` **6/12**——
+  `approved-pending-rescan`（已批准待执行被另开一条，逐轮新开 [1,0]）、
+  `reopen-after-reject`（逐轮 [2,0]，驳回冷却不存在）、`reopen-after-executed`
+  （逐轮 [1,0]）、`pr-approved-then-changes-requested` 与
+  `pr-approved-then-new-commits`（旧「有过 APPROVED 就算批准」判定漏报）、
+  `ci-green-after-fail`（无对账，转绿后旧 ci_failed 仍挂 open）；
+  `test-scan` **5/7**——场景 C 两条全红（驳回后连扫累计新开 1 条、总条数 2，
+  即审计探针 P5 的「每轮新开」现象；头部变化后又被那条 open 挡住开不出）；
+  `test-gateway` **18/19**——批准后 PR 已被批准，网关照样把评论发了出去。
+- 「已批准」判定（新 `lib/pr-review.mjs`，扫描与网关共用同一实现）：按每位审查人
+  取最新一条审查——任一人最新为 CHANGES_REQUESTED 则仍待审；至少一人最新为
+  APPROVED 且无人最新为 CHANGES_REQUESTED 才算已批准；COMMENTED 不改变判定；
+  最新一条 APPROVED 所针对的 commit（`commit_id`）与当前 head SHA 不一致视为
+  陈旧批准、仍待审。head/commit_id 缺失时不判陈旧（取证不足不误报）。
+- 去重冷却（`findings.findBlockingFinding`，键 repo+type+subject）：
+  open/approved/executing 不得另开；rejected 头部未变且未满 14 天不重开（头部
+  变化或满 14 天可重开，14 天从该 Finding 的 `updatedAt` 起算，近似驳回时刻）；
+  executed 仅头部变化可重开（不以满 14 天自动再催）；expired 可重开。
+  头部取法：`pr_needs_review` 用 PR 的 `head.sha`，`ci_failed` 用 run 的
+  `head_sha`，开单时存入 Finding 的 `headSha`（连同 ci 的 `workflow` 名）作
+  后续比较基准；任一侧缺失按「未变」处理（保守：不重开、不再催）。
+- 扫描前对账（`scan.reconcileRepo`，每仓取证后、开新前）：对 open/approved
+  Finding 复核现状——PR 已 merged（`reconciled:pr_merged`）/closed
+  （`pr_closed`）/draft（`pr_draft`）/按上条语义已批准（`pr_approved`），或同
+  工作流最新已结束 run 已转绿（`ci_green`）/已被更新的失败 run 取代
+  （`ci_superseded`）→ 自动转 expired 并写审计（result `expired`，reason
+  `reconciled:<原因>`），退出待批；取证不足（PR 单查失败、工作流无法确认）
+  不退役。日报在有退役时加一行计数，`runMorningScan` 返回值新增 `reconciled`。
+- `ci_failed` 退役的边界：按 Finding 存的工作流名分组判断，只影响同工作流的
+  旧项；「按工作流分别开单」是 R6 的完整改造，本 PR 未做（开单仍取全仓最近
+  一次已结束 run），分页与半成品不落盘同样留 R6，未提前做。
+- 网关规则前提复检（`gateway.mjs`）：PR 仍 open 的既有复检之外，再查非 draft
+  且按同一判定仍待审；已被批准或转 draft → `failed/precondition_changed`，
+  不发评论、退回 approved 可重试；复检取证失败走 `precondition_check_failed:*`
+  同样退回、不误发。
+- 夹具扩展（只增不减）：运行器新增 `seedFindings`（预置历史 Finding，时间按
+  「几天前」换算）、`phases`（逐轮换 GitHub 状态）、单 PR 查询端点、
+  `expect.created` / `createdPerScan` / `expired` / `statusFindings` 四个期望
+  字段；新增 7 份夹具（见上「先红」清单加 `pr-approved-current` 守绿），
+  `dedup-rescan` 补 `comment` 写明它只覆盖「同批 open 去重」，冷却另有专属用例。
+- 变异验证（返工稿要求）：把扫描两处去重临时改回只认 open（`findOpenFinding`）
+  后，`eval:scan` 降到 **9/12**（三份冷却夹具红）、`test-scan` 降到 **5/7**
+  （场景 C 两条红）；还原后复跑全绿（下方数字），变异代码未留存。
+- 改绿（本分支）：`eval:scan` **12/12**（5 基线 + 7 新增）、`test-scan` **7/7**
+  （5 基线 + 场景 C 两条）、`test-gateway` **19/19**（18 基线 + 前提复检一条：
+  扫描后替身把 PR 变成已有 APPROVED，再批准 → 写替身 0 次、审计
+  `failed/precondition_changed`、状态保持 approved）；回归 **66/66**、
+  test-findings 27/27、test-schedule 14/14、test-listen 6/6、test-badtz 4/4，
+  `npm run check` 无错误、`npm run build:web` 成功。
+- 明确不做核对：未做 R6 的分页与半成品不落盘、未把 ci_failed 开单改成按工作
+  流分别取（仅退役/对账按工作流）；未扩扫描种类（issue/Dependabot/讨论区）；
+  未接事件触发；未做模型润色建议；未改 `packages/`；未改 SSE 事件名；未增加
+  第二种写意图。

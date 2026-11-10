@@ -47,6 +47,7 @@ const realFetch = globalThis.fetch;
 const postCalls = [];
 const commentsByKey = new Map();
 let pullState = "open";
+let pullReviews = [];
 let postShouldFail = false;
 let pullShouldFail = false;
 let fetchDelayMs = 0;
@@ -70,9 +71,12 @@ globalThis.fetch = async (url, init = {}) => {
 		if (postShouldFail) return { ok: false, status: 500, json: async () => ({}) };
 		return { ok: true, status: 201, json: async () => comment };
 	}
+	if (method === "GET" && /\/pulls\/\d+\/reviews$/.test(u.pathname)) {
+		return { ok: true, status: 200, json: async () => pullReviews };
+	}
 	if (method === "GET" && /\/pulls\/\d+$/.test(u.pathname)) {
 		if (pullShouldFail) return { ok: false, status: 500, json: async () => ({}) };
-		return { ok: true, status: 200, json: async () => ({ state: pullState }) };
+		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: false, head: { sha: "head-sha-1" } }) };
 	}
 	return { ok: false, status: 599, json: async () => ({}) };
 };
@@ -428,7 +432,28 @@ try {
 		);
 	}
 
-	// 16. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
+	// 16. 规则前提复检（R5）：扫描时 PR 待审、批准后 PR 已被批准（审查人最新为 APPROVED 且
+	//     所针对 commit 与当前 head 一致）→ 网关 failed/precondition_changed，不发评论，
+	//     Finding 保持 approved、审计有 failed/precondition_changed
+	{
+		const f = makeFinding({ subject: "117" });
+		pullReviews = [{ state: "APPROVED", user: { login: "rev" }, commit_id: "head-sha-1" }];
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullReviews = [];
+		check(
+			"前提已变被拦：批准后 PR 已获批准 → failed/precondition_changed，写 API 0 次，保持 approved，审计有该原因",
+			out.execution.ok === false &&
+				out.execution.result === "failed" &&
+				out.execution.reason === "precondition_changed" &&
+				getFinding(f.id).status === "approved" &&
+				postCalls.length === before &&
+				auditFor(f.id).some((x) => x.result === "failed" && x.reason === "precondition_changed"),
+			JSON.stringify(out.execution),
+		);
+	}
+
+	// 17. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
 	//     扫描与对话层文件不得同时出现 api.github.com 与 POST 写调用。
 	{
 		const libFiles = readdirSync(join(APP_DIR, "lib")).filter((f) => f.endsWith(".mjs"));

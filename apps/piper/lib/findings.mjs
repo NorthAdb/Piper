@@ -118,6 +118,11 @@ function buildFinding(input) {
 		expiresAt: validateExpiresAt(input.expiresAt),
 		status,
 		botId: requireNonEmptyString(input.botId, "botId"),
+		// 头部提交（R5，去重冷却的比较基准，开单时刻的取证事实、不可改）：
+		// pr_needs_review 取 PR 的 head.sha，ci_failed 取 run 的 head_sha；缺失为 null。
+		headSha: typeof input.headSha === "string" && input.headSha ? input.headSha : null,
+		// ci_failed 所属工作流名（R5 对账按工作流退役用）；其他类型为 null。
+		workflow: typeof input.workflow === "string" && input.workflow ? input.workflow : null,
 	};
 }
 
@@ -155,8 +160,30 @@ export function findOpenFinding(repo, type, subject) {
 	return readAll().find((f) => f.repo === repo && f.type === type && f.subject === String(subject) && f.status === "open") ?? null;
 }
 
+// 去重冷却（R5，口径已锁定）：去重键 repo+type+subject。返回「挡住新开」的既有 Finding，
+// 没有则 null。规则：
+//   open / approved / executing：未关闭，不得另开一条；
+//   rejected：头部提交未变且距上次状态变更（updatedAt，近似驳回时刻）未满 14 天 → 挡住；
+//     头部变化或满 14 天 → 不挡（可重开）；
+//   executed：头部提交未变 → 挡住（已留过言，不以满 14 天自动再催）；头部变化 → 不挡；
+//   expired：从不挡住。
+// 头部比较：任一侧 headSha 缺失时按「未变」处理（取证不足不重开、不再催，保守口径）。
+export const REJECTED_COOLDOWN_MS = 14 * 24 * 3600 * 1000;
+
+export function findBlockingFinding(repo, type, subject, { headSha = null, now = new Date() } = {}) {
+	const same = readAll().filter((f) => f.repo === repo && f.type === type && f.subject === String(subject));
+	const active = same.find((f) => f.status === "open" || f.status === "approved" || f.status === "executing");
+	if (active) return active;
+	const headSame = (f) => !headSha || !f.headSha || f.headSha === headSha;
+	for (const f of same) {
+		if (f.status === "executed" && headSame(f)) return f;
+		if (f.status === "rejected" && headSame(f) && now.getTime() - Date.parse(f.updatedAt) < REJECTED_COOLDOWN_MS) return f;
+	}
+	return null;
+}
+
 // 可改字段：status / title / summary / suggestedAction / expiresAt。
-// 其余字段（repo/type/subject/evidenceUrl/botId）是取证事实，立住后不许改；writeIntent 自
+// 其余字段（repo/type/subject/evidenceUrl/botId/headSha/workflow）是取证事实，立住后不许改；writeIntent 自
 // R1 起同样不可改——批准的是用户看到的那份内容，批准后以批准记录的意图快照为准执行。
 const PATCHABLE = ["status", "title", "summary", "suggestedAction", "expiresAt"];
 

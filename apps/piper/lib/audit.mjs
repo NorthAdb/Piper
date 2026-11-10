@@ -10,7 +10,9 @@ import { DATA_DIR, ensureData } from "./store.mjs";
 import { githubToken } from "./settings.mjs";
 
 // executing（R1）：网关领取执行、真正发出评论之前先落一条，进程崩溃后能看到「发到一半」。
-export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected"];
+// expired（R5）：扫描前对账把失效的 open/approved Finding 自动退役时落一条，
+// reason 形如 reconciled:<原因>（pr_merged / pr_closed / pr_draft / pr_approved / ci_green / ci_superseded）。
+export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired"];
 
 function auditFile() {
 	return process.env.PIPER_AUDIT_FILE || join(DATA_DIR, "audit.jsonl");
