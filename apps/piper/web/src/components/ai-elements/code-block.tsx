@@ -5,6 +5,10 @@
 //  1. 导入路径 @repo/shadcn-ui/* 改为本项目的 @/ 别名（ui/button、ui/select、lib/utils）。
 //  2. Tailwind v4 的 important 修饰符语法：官方源码的 `dark:!bg-[...]`/`dark:!text-[...]`
 //     （v3 前缀写法）在 v4 不再生效，改为 v4 的后缀写法 `dark:bg-[...]!`/`dark:text-[...]!`。
+//  3. 高亮器改用 shiki/core + JavaScript 正则引擎，只注册 json 文法与 github-light/dark
+//     两套主题：官方写法从 "shiki" 全量包 createHighlighter，会让 Vite 把全部语言文法
+//     拆成约 310 个 chunk（产物约 11MB），而本项目实际只高亮 json（Tool 的参数/结果）。
+//     渲染逻辑与 token 处理与官方源码一致，仅收窄文法/主题注册范围。
 "use client";
 
 import { Button } from "@/components/ui/button";
@@ -14,7 +18,11 @@ import { CheckIcon, CopyIcon } from "lucide-react";
 import type { ComponentProps, CSSProperties, HTMLAttributes } from "react";
 import { createContext, memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import type { BundledLanguage, BundledTheme, HighlighterGeneric, ThemedToken } from "shiki";
-import { createHighlighter } from "shiki";
+import { createHighlighterCore } from "shiki/core";
+import { createJavaScriptRegexEngine } from "shiki/engine/javascript";
+import jsonLang from "shiki/langs/json.mjs";
+import githubDark from "shiki/themes/github-dark.mjs";
+import githubLight from "shiki/themes/github-light.mjs";
 
 // Shiki uses bitflags for font styles: 1=italic, 2=bold, 4=underline
 const isItalic = (fontStyle: number | undefined) => fontStyle && fontStyle & 1;
@@ -133,10 +141,14 @@ const getHighlighter = (language: BundledLanguage): Promise<HighlighterGeneric<B
 		return cached;
 	}
 
-	const highlighterPromise = createHighlighter({
-		langs: [language],
-		themes: ["github-light", "github-dark"],
-	});
+	// 适配（见文件头第 3 点）：core 高亮器只注册 json 文法；language 参数保留官方签名，
+	// 非 json 时下游 codeToTokens 的 availableLangs 检查会回退到 "text"（与官方行为一致）。
+	void language;
+	const highlighterPromise = createHighlighterCore({
+		langs: [jsonLang],
+		themes: [githubLight, githubDark],
+		engine: createJavaScriptRegexEngine(),
+	}) as Promise<HighlighterGeneric<BundledLanguage, BundledTheme>>;
 
 	highlighterCache.set(language, highlighterPromise);
 

@@ -1,4 +1,6 @@
 // Piper 前端入口：单口令登录门 + 三栏布局（左 bot 列表 / 中 Chat / 右 bot 桌面）。
+// 视觉走设计系统：深色主题、sidebar 侧栏面、中栏顶部会话标题栏（bot 名 + 模型状态徽标）。
+import { BotIcon, Loader2Icon, LogInIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { getSession, listBots, login } from "./api";
@@ -6,6 +8,12 @@ import { BotForm } from "./BotForm";
 import { BotList } from "./BotList";
 import { ChatPane } from "./ChatPane";
 import { Desktop } from "./Desktop";
+import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { cn } from "@/lib/utils";
 import type { Bot } from "./model";
 
 type FormState = { open: boolean; bot: Bot | null };
@@ -65,28 +73,55 @@ export function App() {
 	};
 
 	if (authed === null) {
-		return <div className="boot-loading">加载中…</div>;
+		return (
+			<div className="flex h-dvh items-center justify-center gap-2 text-sm text-muted-foreground">
+				<Loader2Icon className="size-4 animate-spin" />
+				加载中…
+			</div>
+		);
 	}
 
 	if (!authed) {
 		return (
-			<form id="login" onSubmit={onLogin}>
-				<h2>Piper</h2>
-				<p className="muted">单用户口令登录（本地开发默认 piper-dev，可用环境变量 PIPER_TOKEN 修改）。</p>
-				<input type="password" placeholder="口令" value={token} onChange={(e) => setToken(e.target.value)} autoFocus />
-				<button type="submit" className="primary wide-btn">
-					登录
-				</button>
-				{loginErr ? <p className="form-err">{loginErr}</p> : null}
-			</form>
+			<div className="flex min-h-dvh items-center justify-center bg-background p-4">
+				<Card className="w-full max-w-sm gap-0 py-0">
+					<CardHeader className="flex flex-col items-center gap-2 px-6 pt-8 pb-2 text-center">
+						<span className="flex size-11 items-center justify-center rounded-xl bg-primary text-primary-foreground">
+							<BotIcon className="size-5.5" />
+						</span>
+						<CardTitle className="text-lg tracking-tight">Piper</CardTitle>
+						<CardDescription>单用户口令登录（本地开发默认 piper-dev，可用环境变量 PIPER_TOKEN 修改）。</CardDescription>
+					</CardHeader>
+					<CardContent className="px-6 pt-4 pb-8">
+						<form onSubmit={onLogin} className="flex flex-col gap-4">
+							<div className="flex flex-col gap-2">
+								<Label htmlFor="login-token">口令</Label>
+								<Input
+									id="login-token"
+									type="password"
+									placeholder="口令"
+									value={token}
+									onChange={(e) => setToken(e.target.value)}
+									autoFocus
+								/>
+							</div>
+							<Button type="submit" className="w-full">
+								<LogInIcon />
+								登录
+							</Button>
+							{loginErr ? <p className="text-center text-sm text-destructive">{loginErr}</p> : null}
+						</form>
+					</CardContent>
+				</Card>
+			</div>
 		);
 	}
 
 	const currentBot = bots.find((b) => b.id === currentBotId) ?? null;
 
 	return (
-		<div id="app">
-			<aside className="col bots-col">
+		<div className="grid h-dvh grid-cols-[264px_minmax(0,1fr)_360px]">
+			<aside className="min-h-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
 				<BotList
 					bots={bots}
 					currentBotId={currentBotId}
@@ -97,13 +132,26 @@ export function App() {
 				/>
 			</aside>
 
-			<main className="chat-col">
-				<div className="chat-header">
-					<b>{currentBot ? `与「${currentBot.name}」对话` : "选择一个 bot 开始对话"}</b>{" "}
-					<span className="muted">
-						{modelConfigured ? "（模型已配置）" : "（未配置模型：对话会明确提示，草案卡走规则兜底）"}
-					</span>
-				</div>
+			<main className="flex min-h-0 min-w-0 flex-col bg-background">
+				<header className="flex h-13 shrink-0 items-center gap-3 border-b px-5">
+					{currentBot ? (
+						<>
+							<span className="flex size-7 items-center justify-center rounded-full bg-secondary text-[11px] font-semibold text-secondary-foreground">
+								{(currentBot.name.trim()[0] ?? "?").toUpperCase()}
+							</span>
+							<span className="truncate text-sm font-semibold">{currentBot.name}</span>
+						</>
+					) : (
+						<span className="text-sm font-medium text-muted-foreground">选择一个 bot 开始对话</span>
+					)}
+					<Badge variant="outline" className="ml-auto gap-1.5">
+						<span className={cn("size-1.5 rounded-full", modelConfigured ? "bg-emerald-400" : "bg-amber-400")} />
+						{modelConfigured ? "模型已配置" : "未配置模型"}
+					</Badge>
+					{!modelConfigured ? (
+						<span className="hidden text-xs text-muted-foreground xl:block">对话会明确提示，草案卡走规则兜底</span>
+					) : null}
+				</header>
 				{currentBot ? (
 					<ChatPane
 						key={currentBot.id}
@@ -115,7 +163,7 @@ export function App() {
 				) : null}
 			</main>
 
-			<aside className="col desk-col">
+			<aside className="min-h-0 border-l border-sidebar-border bg-sidebar text-sidebar-foreground">
 				<Desktop bot={currentBot} onUnauthorized={onUnauthorized} />
 			</aside>
 

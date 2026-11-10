@@ -1,6 +1,8 @@
 // 中栏 Chat：assistant-ui 为组件底。后端 SSE 契约不变，前端用 useExternalStoreRuntime 自持消息，
-// convertMessage 把自有 part 模型映射为 ThreadMessageLike：tool 事件走 tool-call part（ToolCard 渲染），
+// convertMessage 把自有 part 模型映射为 ThreadMessageLike：tool 事件走 tool-call part（AI Elements Tool 渲染），
 // draft/system/error 走 data-* part（by_name 分发到对应卡片）。
+// 视觉按 assistant-ui 官方 registry thread 的实现方式：消息列居中定宽、用户气泡、
+// 助手整幅无气泡、Composer 为悬浮圆角卡片（输入区 + 底部工具行）。
 import {
 	AssistantRuntimeProvider,
 	ComposerPrimitive,
@@ -9,9 +11,12 @@ import {
 	useExternalStoreRuntime,
 } from "@assistant-ui/react";
 import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
+import { ArrowUpIcon, Loader2Icon, SparklesIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { confirmDraft, listMessages, streamChat, UnauthorizedError } from "./api";
+import { buttonVariants } from "@/components/ui/button";
+import { cn } from "@/lib/utils";
 import type { Bot, ChatMessage, ChatPart } from "./model";
 import { historyToMessages, nextId } from "./model";
 import type { DraftActions } from "./parts";
@@ -63,23 +68,27 @@ function TypingDots() {
 
 function UserMessage() {
 	return (
-		<MessagePrimitive.Root className="msg msg-user">
-			<MessagePrimitive.Parts components={{ Text: PlainText }} />
+		<MessagePrimitive.Root className="animate-in fade-in slide-in-from-bottom-1 mx-auto flex w-full max-w-3xl justify-end px-2 py-1.5 duration-150">
+			<div className="max-w-[85%] rounded-3xl bg-secondary px-4 py-2.5 break-words text-secondary-foreground">
+				<MessagePrimitive.Parts components={{ Text: PlainText }} />
+			</div>
 		</MessagePrimitive.Root>
 	);
 }
 
 function AssistantMessage() {
 	return (
-		<MessagePrimitive.Root className="msg msg-assistant">
-			<MessagePrimitive.Parts
-				components={{
-					Text: MarkdownText,
-					Empty: TypingDots,
-					tools: { Fallback: ToolCard },
-					data: { by_name: { draft: DraftCard, system: SystemCard, error: ErrorCard } },
-				}}
-			/>
+		<MessagePrimitive.Root className="animate-in fade-in mx-auto w-full max-w-3xl px-2 py-1.5 duration-150">
+			<div className="flex flex-col gap-3 leading-relaxed break-words">
+				<MessagePrimitive.Parts
+					components={{
+						Text: MarkdownText,
+						Empty: TypingDots,
+						tools: { Fallback: ToolCard },
+						data: { by_name: { draft: DraftCard, system: SystemCard, error: ErrorCard } },
+					}}
+				/>
+			</div>
 		</MessagePrimitive.Root>
 	);
 }
@@ -220,29 +229,49 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		isRunning: running,
 	});
 
-	if (loading) return <div className="chat-loading">加载会话…</div>;
+	if (loading) {
+		return (
+			<div className="flex flex-1 items-center justify-center gap-2 text-sm text-muted-foreground">
+				<Loader2Icon className="size-4 animate-spin" />
+				加载会话…
+			</div>
+		);
+	}
 
 	return (
 		<AssistantRuntimeProvider runtime={runtime}>
 			<DraftActionsContext.Provider value={draftActions}>
-				<ThreadPrimitive.Root className="thread">
-					<ThreadPrimitive.Viewport className="thread-viewport">
+				<ThreadPrimitive.Root className="flex h-full flex-col">
+					<ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth px-3 pt-6">
 						<ThreadPrimitive.Empty>
-							<p className="thread-empty">暂无消息，和「{bot.name}」打个招呼吧。</p>
+							<div className="mx-auto flex w-full max-w-3xl flex-col items-center gap-3 px-2 py-16 text-center">
+								<span className="flex size-11 items-center justify-center rounded-full border bg-card">
+									<SparklesIcon className="size-5 text-primary" />
+								</span>
+								<p className="text-sm text-muted-foreground">暂无消息，和「{bot.name}」打个招呼吧。</p>
+							</div>
 						</ThreadPrimitive.Empty>
 						<ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
 					</ThreadPrimitive.Viewport>
-					<ComposerPrimitive.Root
-						className="composer"
-						onSubmit={(e: FormEvent) => e.preventDefault()}
-					>
-						<ComposerPrimitive.Input
-							className="composer-input"
-							placeholder="输入消息；对主 bot 说「创建一个 XX bot，负责……」可生成草案卡"
-							submitOnEnter
-						/>
-						<ComposerPrimitive.Send className="primary send-btn">发送</ComposerPrimitive.Send>
-					</ComposerPrimitive.Root>
+					<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
+						<ComposerPrimitive.Root
+							className="flex w-full flex-col rounded-2xl border bg-card shadow-sm transition-shadow focus-within:ring-2 focus-within:ring-ring/40"
+							onSubmit={(e: FormEvent) => e.preventDefault()}
+						>
+							<ComposerPrimitive.Input
+								className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground"
+								placeholder="输入消息；对主 bot 说「创建一个 XX bot，负责……」可生成草案卡"
+								submitOnEnter
+							/>
+							<div className="flex items-center justify-between gap-2 px-3 pb-2.5">
+								<span className="hidden text-xs text-muted-foreground sm:block">Enter 发送 · Shift+Enter 换行</span>
+								<ComposerPrimitive.Send className={cn(buttonVariants({ size: "sm" }), "ml-auto rounded-full pr-3 pl-3.5")}>
+									发送
+									<ArrowUpIcon className="size-4" />
+								</ComposerPrimitive.Send>
+							</div>
+						</ComposerPrimitive.Root>
+					</div>
 				</ThreadPrimitive.Root>
 			</DraftActionsContext.Provider>
 		</AssistantRuntimeProvider>
