@@ -21,3 +21,12 @@ Piper 基于开源项目 **Pi** 的源码进行二次开发（不是 SDK 嵌入�
 - `.github/workflows/` 只保留 `ci.yml`（上游 CI 本体：push main / PR 时构建检查，在本仓一直通过且后续内核改造需要它）。
 - 删除其余 14 个上游 workflow：发布机器（preview-packages、publish-model-catalog、p2-cloud-bundle、build-binaries、env、env-daemons、nix——依赖上游 Earendil 的密钥与发布基础设施，在本仓必然失败或与本项目无关）、社区治理（issue-gate、pr-gate、approve-contributor、issue-triage-labels、issue-analysis、remove-inprogress-on-close——上游按贡献者名单把关的机制，单人项目不用）、定时审计（npm-audit，需要时本地跑即可）。
 - 删除内容都在 git 历史里，需要时可找回；后续如需 Piper 自己的 CI（如 apps/piper 的 check + 冻结夹具评测），按本项目需要新写，不恢复上游文件。
+
+## 事后追认说明（应 PA—design 审计要求补记，2026-11-11）
+
+上面「CI 精简」一节记录的删除（提交 `ba67176`，删 14 个上游 workflow、只留 `ci.yml`）**不在第零层与第一件的切片计划内**，是计划外改动，在此补记决策过程，请 PA—design 在 R8 复审时一并追认：
+
+- 起因：用户（萧北）在 2026-11-10 的对话中提出，上游 Pi 的 CI 每次推送都报错、且报错与本仓代码无关，询问是否要调整。
+- 评估：实施方（Muse）实查了仓库的 Actions 运行记录与全部 15 个 workflow 的触发条件，结论是只有 `ci.yml` 本体在每次推送时真正通过且对本仓有用；其余 14 个或依赖上游 Earendil 的发布基础设施与密钥（在本仓必然失败）、或是上游的社区治理与定时机器（对单人项目无用），据此建议只保留 `ci.yml`、删除其余 14 个。
+- 批准与执行：用户在对话中明确批准该建议后，实施方才执行删除，并把删除清单与理由写入上面「CI 精简」节。
+- 本说明只补记过程，不改动那次删除本身；如审计不予追认，恢复哪些 workflow 由审计意见决定，实施方按意见另行处理。
