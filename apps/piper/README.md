@@ -218,6 +218,28 @@ npm run test:scan    # 或 node scripts/test-scan.mjs
 覆盖两条规则的命中与证据链接、跳过进行中 run / 别分支 run / draft PR（且不查其审查）、
 日报清单在观察之前、连扫两次不重复开、单仓 API 失败不拖垮整轮、安静仓零 Finding。
 
+## 冻结夹具评测（P1-3）
+
+把两条规则钉在入库的 GitHub 响应夹具上回归，改规则先看评测变红：
+
+```bash
+cd apps/piper
+npm run eval:scan    # 或 node scripts/eval-scan.mjs
+```
+
+- 夹具在 `test/fixtures/github/*.json`，一文件一用例。字段：`name` / `description` /
+  `scans`（连扫几轮，缺省 1）/ `repos`（每仓的 `info`/`commits`/`issues`/`runs`/`pulls`/
+  `reviews` 响应，或 `{ "error": 500 }` 表示全端点失败）/ `expect`（`failures`、
+  `findings` 期望集合（repo/type/subject/evidenceUrl 精确比对）、可选 `reportIncludes`）。
+- 运行器 `scripts/eval-scan.mjs` 给每用例独立的临时 findings 文件，fetch 全域换成夹具
+  替身：未映射的 URL 会被记录、回 599 并在结尾断言为空——评测永不访问真实 api.github.com，
+  也不产生真实写入。每用例除期望 Finding 集合外，还断言累计新开条数与期望一致（去重被打穿
+  会立刻变红）。当前五用例：`ci-failed-latest`、`pr-needs-review`、`quiet-no-findings`、
+  `dedup-rescan`、`repo-api-error`。
+- 新增用例：往 `test/fixtures/github/` 放一个符合上面格式的 JSON 即可，不用改脚本；
+  文件名即用例来源，`name` 字段写用例名。新增夹具应来自真实响应脱敏或手造的最小形状，
+  不要把真实令牌写进夹具。
+
 ## 实测
 
 2026-11-10 在本机实测（Node v24.22.1；基座按上面步骤构建后 `npm start` 于 apps/piper，端口 4310）：
@@ -445,3 +467,26 @@ npm run test:scan    # 或 node scripts/test-scan.mjs
   状态当断言。本切片无界面改动，无截图项。
 - 明确不做核对：未扩扫描种类（不报 star 变化/新 issue）；未做定时（P1-4）、未做任何写操作
   （P1-6）；未改 `packages/`、未改 SSE 事件名；L0-5 的 approvals 回归断言口径未动（P1-5 才改）。
+
+### P1-3 冻结夹具评测实测（2026-11-10，分支 feat/p1-3-fixture-evals）
+
+- 落地：夹具五份入 `test/fixtures/github/`（ci-failed-latest、pr-needs-review、
+  quiet-no-findings、dedup-rescan（scans=2）、repo-api-error），运行器 `scripts/eval-scan.mjs`
+  （`npm run eval:scan`），每用例独立临时 findings 文件、fetch 全域替身、未映射 URL 记录并
+  在结尾断言为空（不打活网的证据是结构性的，不是口头承诺）。
+- 结果：`node scripts/eval-scan.mjs` **5/5 用例通过**；断言口径 = 每用例 failures 数、
+  open Finding 集合与 expect 精确一致（含 evidenceUrl）、累计新开条数与期望一致
+  （dedup-rescan 两轮后仍恰好两条）、日报片段（repo-api-error 的「扫描失败」与坏仓名）。
+- 守门证明（切片要求，如实记录）：先备份 `lib/scan.mjs`，把 ci_failed 判定从
+  `conclusion === "failure"` 故意改成 `"success"`，跑评测 → **0/5 全红**（反转规则既漏报
+  真失败——ci-failed-latest、dedup-rescan、repo-api-error，又误报成功 run——pr-needs-review、
+  quiet-no-findings），退出码 1；从备份还原后复跑 **5/5 全绿**，且 `git diff` 确认 scan.mjs
+  与改坏前逐字一致。评测确实守得住规则回归。
+- 全量核对：同一分支上 `test-findings` 18/18、`test-scan` 5/5、`npm run check` 无错误，
+  回归 **48/48 通过**。如实备注：回归首跑 44/48，失败的仍是 20/41/42/43 四项活 GitHub API
+  依赖项——本机出口 IP 在多个共享地址间轮换、各自的未授权限额被耗尽（403
+  `API rate limit exceeded`），等窗口恢复后复跑即全绿；本切片相对 P1-2 分支零产品代码
+  改动（只有夹具、评测脚本、README 与一条 npm script），P1-2 分支同日已实测 48/48。
+  本切片无产品界面与行为改动（只加测试资产），无截图项。
+- 明确不做核对：未用活仓做通过断言；未把评测 gate 到记忆或 RSI 验收（那些模块尚不存在）；
+  未改 `packages/`、未改 SSE 事件名、未动 L0-5 的 approvals 回归断言口径。
