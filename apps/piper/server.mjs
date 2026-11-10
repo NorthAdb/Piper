@@ -251,6 +251,13 @@ addNotification({ type: "routine.failed", title: `${routineName}失败`, body: `
 if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描失败（全部仓库取证失败），日报：${artifact.title}`});
 return { failed: true, artifact, report, findings};
 }
+if (failures > 0) {
+// 部分仓失败（R6）：整轮不算失败，但状态记 partial、通知写明几个仓失败，不许把「扫了一半」报成全绿的 ok。
+updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "partial"});
+addNotification({ type: "routine.completed", title: `${routineName}已完成（部分失败）`, body: `日报：${artifact.title}（${total} 个仓库中 ${failures} 个取证失败，原因见日报；本轮新开 ${findings.length} 条待拍板事项）`, routineId: "morning-scan", artifactId: artifact.id});
+if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描完成（${failures}/${total} 个仓库取证失败），日报：${artifact.title}`});
+return { failed: false, partial: true, artifact, report, findings};
+}
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "ok"});
 addNotification({ type: "routine.completed", title: `${routineName}已完成`, body: `日报：${artifact.title}（本轮新开 ${findings.length} 条待拍板事项，见日报开头的拍板清单）`, routineId: "morning-scan", artifactId: artifact.id});
 if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间仓库扫描完成，日报：${artifact.title}`});

@@ -16,6 +16,9 @@
 //   expect.createdPerScan: [n, n, ...]——逐轮新开条数（冷却类用例靠它区分「哪一轮开的」）。
 //   expect.expired: [{ repo, type, subject }]——结束时应恰好处于 expired 的 Finding 集合（对账退役）。
 //   expect.statusFindings: [{ repo, type, subject, status }]——结束时应存在对应状态的 Finding（子集断言）。
+// R6 起替身遵守 page/per_page（按请求参数切片，与真实 GitHub 一致），另支持两种局部报错：
+//   entry.runsError: 数字——/actions/runs 接口回该状态码（其余接口正常），验「CI 数据缺失」提示；
+//   reviews["<PR号>"]: { "error": 数字 }——该 PR 的 reviews 接口回该状态码，验「半成品不落盘」。
 // 每个用例用独立的临时 findings 文件跑（PIPER_FINDINGS_FILE），PIPER_DATA_DIR 一并
 // 指向临时目录（R4：ensureData 种子不落真实 data/），fetch 全域替换为夹具替身：
 // 夹具未映射的 URL 会被记录并以 599 失败，结尾断言为空——评测永不访问真实 api.github.com。
@@ -47,19 +50,30 @@ function installStub(repos) {
 		}
 		if (entry.error) return { ok: false, status: entry.error, json: async () => ({}) };
 		const rest = m[2] ?? "";
+		// 分页（R6）：按请求的 page/per_page 切片，与真实 GitHub 行为一致；
+		// 不带分页参数时按 GitHub 缺省 per_page=30、page=1。
+		const page = Number(u.searchParams.get("page") ?? 1);
+		const perPage = Number(u.searchParams.get("per_page") ?? 30);
+		const pageOf = (arr) => (arr ?? []).slice((page - 1) * perPage, page * perPage);
 		let payload;
 		if (rest === "") payload = entry.info;
-		else if (rest.startsWith("/commits")) payload = entry.commits ?? [];
-		else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
-		else if (rest.match(/^\/pulls\/\d+$/)) {
+		else if (rest.startsWith("/commits")) payload = pageOf(entry.commits);
+		else if (rest.match(/^\/pulls\/\d+\/reviews/)) {
+			const rv = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+			if (!Array.isArray(rv) && rv?.error) return { ok: false, status: rv.error, json: async () => ({}) };
+			payload = pageOf(rv);
+		} else if (rest.match(/^\/pulls\/\d+$/)) {
 			// 单个 PR 查询（对账用）：先查 open 列表，再查 pullDetails，都没有回 404。
 			const num = rest.match(/^\/pulls\/(\d+)$/)[1];
 			const one = (entry.pulls ?? []).find((p) => String(p.number) === num) ?? entry.pullDetails?.[num];
 			if (!one) return { ok: false, status: 404, json: async () => ({}) };
 			payload = one;
-		} else if (rest.startsWith("/pulls")) payload = entry.pulls ?? [];
-		else if (rest.startsWith("/issues")) payload = entry.issues ?? [];
-		else if (rest.startsWith("/actions/runs")) payload = { workflow_runs: entry.runs ?? [] };
+		} else if (rest.startsWith("/pulls")) payload = pageOf(entry.pulls);
+		else if (rest.startsWith("/issues")) payload = pageOf(entry.issues);
+		else if (rest.startsWith("/actions/runs")) {
+			if (entry.runsError) return { ok: false, status: entry.runsError, json: async () => ({}) };
+			payload = { workflow_runs: pageOf(entry.runs) };
+		}
 		else {
 			unmapped.push(u.pathname);
 			return { ok: false, status: 599, json: async () => ({}) };

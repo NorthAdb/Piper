@@ -882,3 +882,56 @@ APPROVED」改成锁定语义，并补上扫描前对账与网关规则前提复
   流分别取（仅退役/对账按工作流）；未扩扫描种类（issue/Dependabot/讨论区）；
   未接事件触发；未做模型润色建议；未改 `packages/`；未改 SSE 事件名；未增加
   第二种写意图。
+
+### R6 扫描取证完整性实测（2026-11-11，分支 fix/r6-scan-integrity，堆叠在 R5 上）
+
+审计 M3 的收口：分页、半成品不落盘、runs 失败可见、部分失败状态、ci_failed
+按工作流分别取最新。口径以返工稿 R6 与修订切片第 1 节锁定项为准。先红后修：
+
+- 替身先行改造：`eval-scan` 与 `test-scan` 的 fetch 替身改为遵守
+  `page/per_page` 切片（与真实 GitHub 一致），并支持两种局部报错形态——
+  夹具 `runsError`（runs 接口单独回状态码）与 `reviews["<PR号>"] = {"error": N}`。
+- 先红（新夹具先行、实现未改）：`eval:scan` **13/18**——
+  `ci-multi-workflow-lint`（lint 最新失败被 test 的更新成功遮蔽，0 条）、
+  `pr-pagination-many`（只看到第一页 10 条，期望 12 条）、
+  `pr-reviews-pagination`（只取第一页 100 条审查，漏掉第二页的 APPROVED 而误报）、
+  `repo-mid-scan-failure`（reviews 500 前 ci_failed 已经落盘，半截 Finding 留存）、
+  `ci-data-missing`（日报没有「CI 数据缺失：500」，runs 失败被静默吞掉）；
+  `ci-terminal-nonfailure`（cancelled/timed_out/startup_failure 不报、不回溯）
+  先行即绿，是口径守卫。其余 12 份基线夹具在替身分页改造后仍全绿。
+- 分页（`scan.ghPage`）：pulls（per_page 100、上限 200）、reviews（100、上限
+  300）、runs（100、上限 100）逐页取尽；触顶时日报该仓写明「仅检查前 N 条」
+  （reviews 触顶注明 PR 号）。test-scan 场景 F 用 205 条 PR 钉住上限与提示。
+- 半成品不落盘（`scanRepo` 三阶段）：阶段一取证（仓数据、对账候选 PR 单查、
+  全部相关审查先取齐，本阶段任何失败整仓抛错、不落盘）→ 阶段二纯计算
+  （对账退役清单 + 待开清单；退役原因与开单规则互斥，不需假设退役已落盘）→
+  阶段三落盘（先退役后开新）。R5 的对账逻辑并入此结构，语义不变。
+- runs 失败可见：runs 接口失败记状态码，日报该仓下写「CI 数据缺失：<状态码>」；
+  该仓不计 failures、PR 规则照常（Actions 未启用的仓不因此整仓失败）；
+  CI 类对账在数据缺失时不退役（取证不足不退役的既有口径）。
+- 部分失败状态：整轮中部分仓失败时 `lastStatus` 记 `partial`（全部失败仍
+  `failed`、全成功仍 `ok`），完成通知标题与正文写明「N/M 个仓库取证失败」。
+- ci_failed 按工作流开单：按工作流名分组，各取默认分支上最新一条已结束
+  run，只认 `conclusion === "failure"`；不同工作流的失败各开一条、subject
+  仍为 run id；对账退役沿用 R5 的按工作流判断（`ci_green` / `ci_superseded`），
+  两边口径一致。
+- 夹具（只增不减，12 → 18）：新增 `ci-multi-workflow-lint`（探针 D）、
+  `ci-terminal-nonfailure`（探针 C）、`pr-pagination-many`（探针 K，12 条全报）、
+  `pr-reviews-pagination`（第二页 APPROVED）、`repo-mid-scan-failure`
+  （探针 L）、`ci-data-missing`（探针 F）；探针 J/H/I 与 R5 已入的
+  `pr-approved-current` / `pr-approved-then-changes-requested` /
+  `pr-approved-then-new-commits` 为同一批用例，本轮复用并补 `comment` 写明
+  对应关系，不重复建。test-scan 新增场景 D（多工作流）、E（半成品不落盘）、
+  F（分页上限），7 → 10 条。
+- 变异验证（返工稿要求，均留档后还原、文件校验和一致）：
+  删分页循环 → `eval:scan` 17/18（`pr-reviews-pagination` 红）、
+  test-scan 9/10（场景 F 红，只取到 100 条且无截断提示）；
+  改回边算边落（CI 先落盘、reviews 边扫边取）→ `eval:scan` 17/18
+  （`repo-mid-scan-failure` 红，半截 ci_failed 留存）、test-scan 9/10（场景 E 红）；
+  改回只看全仓最新一条 run → `eval:scan` 17/18（`ci-multi-workflow-lint` 红）、
+  test-scan 9/10（场景 D 红）。
+- 改绿（本分支）：`eval:scan` **18/18**、test-scan **10/10**、回归 **66/66**、
+  test-findings 27/27、test-gateway 19/19、test-schedule 14/14、
+  test-listen 6/6、test-badtz 4/4，`npm run check` 无错误、`npm run build:web` 成功。
+- 明确不做核对：未加新规则类型（仍只有 ci_failed / pr_needs_review）；
+  未碰 R7 及以后；未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。

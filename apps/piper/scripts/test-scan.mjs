@@ -35,18 +35,28 @@ function installStub(scenario) {
 		if (!entry) return { ok: false, status: 599, json: async () => ({}) };
 		if (entry.error) return { ok: false, status: entry.error, json: async () => ({}) };
 		const rest = m[2] ?? "";
+		// 分页（R6）：按请求的 page/per_page 切片，与真实 GitHub 及 eval 替身一致。
+		const page = Number(u.searchParams.get("page") ?? 1);
+		const perPage = Number(u.searchParams.get("per_page") ?? 30);
+		const pageOf = (arr) => (arr ?? []).slice((page - 1) * perPage, page * perPage);
 		let payload;
 		if (rest === "") payload = infoFor(m[1]);
-		else if (rest.startsWith("/commits")) payload = entry.commits ?? [];
-		else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
-		else if (rest.match(/^\/pulls\/\d+$/)) {
+		else if (rest.startsWith("/commits")) payload = pageOf(entry.commits);
+		else if (rest.match(/^\/pulls\/\d+\/reviews/)) {
+			const rv = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+			if (!Array.isArray(rv) && rv?.error) return { ok: false, status: rv.error, json: async () => ({}) };
+			payload = pageOf(rv);
+		} else if (rest.match(/^\/pulls\/\d+$/)) {
 			const num = rest.match(/^\/pulls\/(\d+)$/)[1];
 			const one = (entry.pulls ?? []).find((p) => String(p.number) === num) ?? entry.pullDetails?.[num];
 			if (!one) return { ok: false, status: 404, json: async () => ({}) };
 			payload = one;
-		} else if (rest.startsWith("/pulls")) payload = entry.pulls ?? [];
-		else if (rest.startsWith("/issues")) payload = entry.issues ?? [];
-		else if (rest.startsWith("/actions/runs")) payload = { workflow_runs: entry.runs ?? [] };
+		} else if (rest.startsWith("/pulls")) payload = pageOf(entry.pulls);
+		else if (rest.startsWith("/issues")) payload = pageOf(entry.issues);
+		else if (rest.startsWith("/actions/runs")) {
+			if (entry.runsError) return { ok: false, status: entry.runsError, json: async () => ({}) };
+			payload = { workflow_runs: pageOf(entry.runs) };
+		}
 		else return { ok: false, status: 599, json: async () => ({}) };
 		return { ok: true, status: 200, json: async () => payload };
 	};
@@ -161,6 +171,76 @@ try {
 		"场景C：头部提交变化后可重开一条新的 open Finding（冷却按 head 解除）",
 		runC5.findings.length === 1 && runC5.findings[0].status === "open" && findingsMod.listFindings({ repo: "Acme/Probe", status: "open" }).length === 1,
 		`新开=${runC5.findings.length}`,
+	);
+
+	// ---- 场景 D（R6）：按工作流分别取最新——test 最新成功不遮蔽 lint 最新失败；
+	//      e2e 最新为 cancelled 不报、也不回溯它更早的 failure。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "d.jsonl");
+	const mkRun = (id, name, conclusion, ts) => ({
+		id, name, status: "completed", conclusion, head_branch: "main",
+		html_url: `https://github.com/Acme/Multi/actions/runs/${id}`, created_at: ts,
+	});
+	installStub({
+		"Acme/Multi": {
+			runs: [
+				mkRun(5005, "test", "success", "2026-11-10T03:00:00Z"),
+				mkRun(5004, "lint", "failure", "2026-11-10T02:00:00Z"),
+				mkRun(5003, "e2e", "cancelled", "2026-11-10T01:30:00Z"),
+				mkRun(5002, "e2e", "failure", "2026-11-10T01:00:00Z"),
+				mkRun(5001, "lint", "success", "2026-11-09T23:00:00Z"),
+			],
+			pulls: [],
+			reviews: {},
+			commits: [],
+			issues: [],
+		},
+	});
+	const runD = await runMorningScan({ repos: ["Acme/Multi"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景D：多工作流分别判定——只开 lint 的 ci_failed（test 成功不遮蔽、e2e 取消不报不回溯）",
+		runD.findings.length === 1 && runD.findings[0].type === "ci_failed" && runD.findings[0].subject === "5004" && runD.findings[0].workflow === "lint",
+		JSON.stringify(runD.findings.map((f) => `${f.type}:${f.subject}`)),
+	);
+
+	// ---- 场景 E（R6）：半成品不落盘——CI 已取到 failure，但 reviews 接口 500，
+	//      整仓失败且一条 Finding 都不得落盘（旧实现会先落 ci_failed）。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "e.jsonl");
+	installStub({
+		"Acme/Half": {
+			runs: [mkRun(6001, "CI", "failure", "2026-11-10T01:00:00Z")],
+			pulls: [{ number: 42, title: "Risky", draft: false, head: { sha: "abc123" }, html_url: "https://github.com/Acme/Half/pull/42", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" }],
+			reviews: { "42": { error: 500 } },
+			commits: [],
+			issues: [],
+		},
+	});
+	const runE = await runMorningScan({ repos: ["Acme/Half"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景E：取证中途失败整仓不落盘（failures=1，存储里 0 条 Finding）",
+		runE.failures === 1 && runE.findings.length === 0 && findingsMod.listFindings({ repo: "Acme/Half" }).length === 0,
+		`failures=${runE.failures} 落盘=${findingsMod.listFindings({ repo: "Acme/Half" }).length}`,
+	);
+
+	// ---- 场景 F（R6）：分页上限——205 条待审 PR 只检查前 200 条，日报写明截断。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "f.jsonl");
+	const manyPulls = Array.from({ length: 205 }, (_, i) => ({
+		number: i + 1, title: `PR ${i + 1}`, draft: false, head: { sha: `sha${i}` },
+		html_url: `https://github.com/Acme/Many/pull/${i + 1}`, user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z",
+	}));
+	installStub({
+		"Acme/Many": {
+			runs: [mkRun(7001, "CI", "success", "2026-11-10T01:00:00Z")],
+			pulls: manyPulls,
+			reviews: {},
+			commits: [],
+			issues: [],
+		},
+	});
+	const runF = await runMorningScan({ repos: ["Acme/Many"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景F：PR 超过检查上限时翻页取到 200 条并在日报写明「仅检查前 200 条」",
+		runF.findings.length === 200 && runF.report.includes("仅检查前 200 条"),
+		`新开=${runF.findings.length} 日报含提示=${runF.report.includes("仅检查前 200 条")}`,
 	);
 } finally {
 	globalThis.fetch = realFetch;
