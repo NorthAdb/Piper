@@ -2,15 +2,16 @@
 // 文件：apps/piper/data/settings-{model,profile,github}.json（data/ 已 gitignore，秘密不进 git）。
 // 语义：设置文件是配置的第一来源；模型文件不存在或字段缺失时，kernel 回退环境变量。
 // 本模块只负责读写文件——绝不把环境变量里的秘密自动写进文件。
-import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData, listBots } from "./store.mjs";
+import { DATA_DIR, ensureData, listBots, writeFileAtomicSync } from "./store.mjs";
 
-// 设置文件含秘密（模型 Key、GitHub 令牌）：写盘权限钉死 0600（R7）。writeFileSync 的
-// mode 只对新建文件生效，已存在的文件靠随后的 chmodSync 收紧，两条都走。
+// 设置文件含秘密（模型 Key、GitHub 令牌）：写盘权限钉死 0600（R7）。mode 作用于
+// 临时文件、rename 后即为目标文件权限；随后的 chmodSync 再兜一层。落盘走临时文件
+// + rename（R10），写一半崩溃不会把设置文件截成坏 JSON。
 function writeSettingsFile(file, data) {
 	ensureData();
-	writeFileSync(file, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+	writeFileAtomicSync(file, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
 	chmodSync(file, 0o600);
 }
 
@@ -154,22 +155,22 @@ export function listConnectors() {
 		{
 			id: "github",
 			name: "GitHub",
-			purpose: "绑定仓库的只读扫描（日报、PR / issue / CI 概况）；令牌就绪后供分诊闭环的有闸写入使用。",
+			purpose: "绑定仓库的扫描（日报、PR / issue / CI 概况）；经收件箱批准后，可向指定 PR 发表一条评论。",
 			status: token ? "connected" : "unconfigured",
 			statusNote: token
-				? "令牌已配置，扫描请求会带上它（限额更高）。写入仍未开放：评论等写操作要等分诊闭环的薄网关（P1-6）。"
+				? "令牌已配置，扫描请求会带上它（限额更高）。扫描全程只读；评论写入只发生在收件箱批准之后，由网关按批准的那份内容发出。"
 				: "未配置令牌：当前走公开 API 只读，限额较低。在下方粘贴 PAT 即可保存，之后扫描自动使用。",
 			bots: githubBots.length ? githubBots : ["repo-keeper"],
-			access: "read",
+			access: "read-approved-comment",
 			configurable: true,
 			tokenHint: token ? secretHint(token) : "",
 		},
 		{
 			id: "web",
 			name: "网页查询",
-			purpose: "主 bot 只读打开公开网页（web.fetch）并在对话里引用内容。",
+			purpose: "主 bot 只读打开公开网页并在对话里引用内容。",
 			status: "unconfigured",
-			statusNote: "即将接入（L0-6）：只读抓取，带超时与体积上限，并拒绝本机 / 私网 / 元数据地址（防 SSRF）。web.search 仅在配置搜索端点后可用。",
+			statusNote: "尚未启用：启用后可只读抓取公开网页，带超时与体积上限，并拒绝本机 / 私网 / 元数据地址。搜索需另行配置搜索端点后才可用。",
 			bots: ["piper-main"],
 			access: "read",
 			configurable: false,

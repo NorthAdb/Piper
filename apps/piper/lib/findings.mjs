@@ -3,9 +3,9 @@
 // 校验在写入边界完成：没有 evidenceUrl 的对象不准存成有效 Finding；type / status /
 // writeIntent 只接受本批已定的枚举，非法值抛带 status 的 Error（路由层转 4xx）。
 // 文件路径可用环境变量 PIPER_FINDINGS_FILE 覆盖（仅供单元测试 / 评测隔离数据，缺省走 data/）。
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData } from "./store.mjs";
+import { DATA_DIR, ensureData, writeFileAtomicSync } from "./store.mjs";
 
 export const FINDING_TYPES = ["ci_failed", "pr_needs_review"];
 export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed", "executing"];
@@ -46,9 +46,11 @@ function readAll() {
 		.filter(Boolean);
 }
 
+// 整表重写走临时文件 + rename（R10）：状态迁移写一半崩溃不会把 findings.jsonl
+// 截成半截文件，下次启动读到的要么是旧全表、要么是新全表。
 function rewriteAll(all) {
 	ensureData();
-	writeFileSync(findingsFile(), all.map((f) => JSON.stringify(f)).join("\n") + (all.length ? "\n" : ""), "utf8");
+	writeFileAtomicSync(findingsFile(), all.map((f) => JSON.stringify(f)).join("\n") + (all.length ? "\n" : ""), "utf8");
 }
 
 function requireNonEmptyString(value, field) {

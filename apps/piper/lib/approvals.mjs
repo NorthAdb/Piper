@@ -1,6 +1,7 @@
 // 待批收件箱（P1-5 读模型 + P1-6 批准执行 + R1 返工）：待批项不是另一份存储——它就是带
 // writeIntent 的 Finding 的审批视图。Finding 是唯一事实源（lib/findings.mjs），本模块
-// 负责读模型整形、过期清理、批准/驳回的状态迁移；批准后经 lib/gateway.mjs 执行写入
+// 负责读模型整形、批准/驳回的状态迁移；过期清理由显式步骤触发（见 sweepExpiredFindings）；
+// 批准后经 lib/gateway.mjs 执行写入
 //（本模块不直接调用任何 GitHub 写接口）。审计（lib/audit.mjs）记录 approved /
 // rejected / 以及网关的 denied / executing / executed / failed，收件箱据审计展示最近失败原因。
 // 执行失败时 Finding 保持 approved：错误经 lastError 展示，再次点批准即重试。
@@ -87,8 +88,10 @@ function badRequest(message) {
 	return Object.assign(new Error(message), { status: 400 });
 }
 
-// 过期清理：open 且 expiresAt 已过的 Finding 自动转 expired（惰性清理，读列表时顺带做，
-// 不另起定时器）。approved 的过期由网关执行前复检处理，不在这里悄悄改状态。
+// 过期清理：open 且 expiresAt 已过的 Finding 转 expired。R10 起 GET 读路径不再顺带
+// 做这件事（读接口无写副作用）——只由显式步骤调用：晨间扫描开始前、调度周期 tick
+// （server.mjs 每 30 秒）、以及批准/驳回的写路径（requireApprovable）。approved 的
+// 过期由网关执行前复检处理，不在这里悄悄改状态。
 export function sweepExpiredFindings(now = new Date()) {
 	let swept = 0;
 	for (const f of listFindings({ status: "open" })) {
@@ -128,15 +131,14 @@ export function toApproval(f) {
 }
 
 // 待批列表：带 writeIntent 且状态为 open / approved / executing 的 Finding，新在前。
+// 纯读：不做过期清理（R10）——清理的显式触发点见 sweepExpiredFindings 的注释。
 export function listApprovals() {
-	sweepExpiredFindings();
 	return listFindings()
 		.filter((f) => f.writeIntent && (f.status === "open" || f.status === "approved" || f.status === "executing"))
 		.map(toApproval);
 }
 
 export function getApproval(id) {
-	sweepExpiredFindings();
 	const f = getFinding(id);
 	return f && f.writeIntent ? toApproval(f) : null;
 }

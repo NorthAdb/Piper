@@ -607,10 +607,15 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   writeIntent 且状态为 open / approved 的 Finding 的审批视图（id 与 findingId 同值），
   字段含 bot、repo、type、title、summary、evidenceUrl、suggestedAction、writeIntent
   全文（仓库由 repo 给出、正文与 PR 号在 writeIntent 里）、expiresAt、status。
-  读列表时惰性清理：open 且已过 expiresAt 的 Finding 自动转 expired 并退出列表。
-  `POST /api/approvals/:id/approve` 把 open 转 approved（已 approved 重复批准幂等返回；
-  已关闭状态回 409；无 writeIntent 回 400；不存在回 404），`reject` 转 rejected；
-  本切片批准只改状态，不执行任何对外写操作（网关在 P1-6 接入同一入口）。
+  读列表时惰性清理：open 且已过 expiresAt 的 Finding 自动转 expired 并退出列表
+  （此口径 R10 已改：GET 读路径去掉写副作用，过期清理改由显式步骤执行——晨间
+  扫描开始前、调度周期 tick、批准/驳回写路径，见文末 R10 实测节）。
+  `POST /api/approvals/:id/approve` 在本切片只把 open 转 approved；P1-6 接入网关
+  后批准即执行，R1 后语义以批准快照为准（与 P1-6 现状一致）：批准时校验
+  intentHash 并落 append-only 批准记录，网关只执行快照内容；执行失败保持
+  approved，再次批准沿用同一批准记录重试——同一批准靠评论幂等标记查重，
+  不会重复发出第二条评论；已关闭状态回 409；无 writeIntent 回 400；不存在
+  回 404。`reject` 转 rejected，不产生任何对外写操作。
 - 界面：左栏「待批收件箱」改为打开独立整页视图（`web/src/Inbox.tsx`，与设置同模式、
   有返回路径），删除原底部展开面板与「雏形占位 / 后续迭代接入」等开发口吻文案。
   空状态为「现在没有需要你批准的写操作。」；有数据时每条卡片展示类型徽标、证据链接、
@@ -1091,3 +1096,57 @@ P1-7 前置清单第 8 条仍以那次真 Key 对话为准。
   `MODEL_NOT_CONFIGURED`。
 - 明确不做核对：未做视觉重写；未执行真 Key 对话（用户本人项）；未碰 R10/R11；
   未改 `packages/`；未改 SSE 事件名；未增加第二种写意图。
+
+### R10 MINOR 批量实测（2026-11-11，分支 fix/r10-minor-batch，堆叠在 R9 上）
+
+MINOR 批量七项，专项测试 `scripts/test-r10.mjs`（`npm run test:r10`，已纳入
+`npm run test` 聚合）**19/19**，逐项如下：
+
+- 文案：连接器卡与通知页去掉切片号与开发口吻——服务端 `listConnectors` 的
+  GitHub 卡 purpose/statusNote 重写为产品口径；GitHub 的 `access` 由 `read`
+  改为 `read-approved-comment`，前端标签同步为「读 + 经收件箱批准的评论」；
+  网页查询卡去掉「即将接入（L0-6）」说法；通知页去掉「不在本批范围」。
+  测试以 `listConnectors()` 实际输出 + 两页源码 grep 双口径断言无
+  `P1-\d / L0-\d / 本批 / 切片` 残留（test-r10 第 08–11 项）。
+- 桌面产物服务端过滤：`GET /api/artifacts` 支持 `?botId=`，`web/src/api.ts`
+  的 `listArtifacts(botId)` 带参请求，`Desktop.tsx` 切 bot 时按当前 bot 重新拉取、
+  不再前端全量过滤（例程仍前端过滤，不在本项范围）。子进程实测：带参只回该
+  bot 产物、不带参回全量（test-r10 第 13–14 项）。
+- `GET /api/approvals` 去写副作用：`listApprovals` / `getApproval` 不再顺带
+  `sweepExpiredFindings`。过期清理改由显式步骤执行：① 晨间扫描开始前
+  （`executeMorningScan`）；② 调度周期 tick（server 每 30 秒）；③ 批准/驳回
+  写路径（`requireApprovable`，保持「过期项不能被批准」的既有语义）。模块级
+  实测：已过期的 open Finding 读列表/详情后仍为 open，显式 sweep 后才转
+  expired（test-r10 第 05–07 项）。代价如实记：两次清理之间，刚过期的项仍会
+  出现在列表里（状态仍 open），下一次扫描/tick/批准动作即收口。
+- 原子写：`lib/store.mjs` 新增 `writeFileAtomicSync`（临时文件 + rename）；
+  设置文件（`writeSettingsFile`，0600 口径不变）与 `findings.jsonl` 整表重写
+  （`rewriteAll`）都经它落盘。实测以 inode 变化断言 rename 生效、且数据目录
+  无 `.tmp-*` 残留（test-r10 第 01–04 项）。
+- `package-lock.json` 对齐：**只核验、无改动**。返工稿称本机 `npm install`
+  会改约 95 行，本机（npm 10.9.4）实测复现不了：`apps/piper` 与仓库根两处
+  分别跑 `npm install --package-lock-only --ignore-scripts` 与完整
+  `npm install --ignore-scripts`，`git status` 均无任何漂移（lock 的
+  `apps/piper` 条目与 package.json 依赖逐项比对一致）。判断为审计机 npm 版本
+  差异所致的格式漂移；验收口径「git diff 无 package-lock.json 漂移」在本机
+  与 CI（`npm ci` 本就校验 lock 同步）均成立，故不做无意义的格式改动。
+- 双进程锁：`lib/store.mjs` 新增 `acquireDataLock`——`data/piper.lock` 只存
+  持有者 pid，启动时已有存活进程则抛错、server 拒绝启动并写明原因；持有者
+  退出（含 SIGINT/SIGTERM）释放；pid 不存活的陈旧锁自动接管。子进程实测：
+  第二个进程退出码非 0 且输出含占用原因；持有者退出后同目录可再启动；
+  手工预置死 pid 锁不挡启动（test-r10 第 15–19 项）。注意：锁按数据目录
+  生效——同一目录的第二个服务起不来是预期行为，测试脚本各自用独立临时
+  目录不受影响。
+- README P1-5 节表述：已按 P1-6/R1 后现状改写（批准=校验 intentHash + 落
+  批准记录 + 网关执行快照；失败保持 approved 沿同一批准记录重试、靠幂等
+  标记不重复发评论），并标注惰性清理口径已由本节 R10 项变更。
+- 附带发现（未在本 PR 修，记录备查）：`saveArtifact` 的产物 id 只到毫秒
+  （日期 + kind + 毫秒数），同 kind 两条产物在同一毫秒内写入会同 id 覆盖。
+  生产路径产物间隔通常以秒计、且 kind 不同，影响面小；本 PR 只在 test-r10
+  里用不同 kind 避开，未动存储口径。
+- 全套：`npm run test` 聚合全绿——build:web、check、test:findings、
+  test:scan、test:schedule、test:gateway、test:listen、test:badtz、
+  test:secrets、test:model-stub、test:r10 19/19、eval:scan 18/18、
+  regression 69/69（数字以本节合入时实跑为准，见 PR 描述）。
+- 明确不做核对：未碰 R11（网页查询实现）；未改 `packages/`；未改 SSE 事件
+  名；未增加第二种写意图；未做日历/邮件/多模型。

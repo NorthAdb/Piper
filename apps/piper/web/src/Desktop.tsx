@@ -1,6 +1,7 @@
 // 右栏业务组件：当前 bot 的「桌面」三页签——例程 / 产物 / 记忆，数据全部走现有 API。
-// 例程与产物按当前选中 bot 隔离（P1-5 修复）：接口返回全量，前端按 botId 过滤，
-// 选中主 bot 时不得出现仓库管家的例程或日报。页签用 shadcn Tabs；例程用 shadcn Card；
+// 例程与产物按当前选中 bot 隔离：例程在前端按 botId 过滤；产物走服务端过滤
+//（GET /api/artifacts?botId=，R10），切 bot 时重新拉取。选中主 bot 时不得出现
+// 仓库管家的例程或日报。页签用 shadcn Tabs；例程用 shadcn Card；
 // 产物详情用 AI Elements 的 Artifact 组件（components/ai-elements/artifact，真引入源码）。
 import { CalendarClockIcon, FileTextIcon, HistoryIcon, PlayIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
@@ -45,10 +46,10 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 	}, [guard]);
 
 	const loadArtifacts = useCallback(() => {
-		listArtifacts()
+		listArtifacts(bot?.id)
 			.then(setArtifacts)
 			.catch(guard);
-	}, [guard]);
+	}, [bot, guard]);
 
 	const loadMemory = useCallback(() => {
 		if (!bot) return;
@@ -83,7 +84,8 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 	};
 
 	const visibleRoutines = bot ? routines.filter((r) => r.botId === bot.id) : [];
-	const visibleArtifacts = bot ? artifacts.filter((a) => a.botId === bot.id) : [];
+	// 产物已按当前 bot 在服务端过滤，这里直接用拉回的列表（bot 为空时为空列表）。
+	const visibleArtifacts = bot ? artifacts : [];
 
 	const onOpenArtifact = async (meta: ArtifactMeta) => {
 		if (openArtifact?.id === meta.id) {

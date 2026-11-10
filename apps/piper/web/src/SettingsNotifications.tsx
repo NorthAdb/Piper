@@ -1,6 +1,6 @@
-// 设置页「通知」组（L0-5）：应用内通知列表（文件持久化，新在前），可逐条或全部标记已读。
+// 设置页「通知」组：应用内通知列表（文件持久化，新在前），可逐条或全部标记已读。
 // 来源：例程（routine.completed / routine.failed）与待批写操作（approval.pending /
-// approval.executed / approval.failed，P1-6 起真正写入）。
+// approval.executed / approval.failed）。
 import { BellRingIcon, CheckCheckIcon, CheckIcon, CircleAlertIcon, CircleCheckIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getNotifications, markNotificationsRead, UnauthorizedError } from "./api";
@@ -58,7 +58,7 @@ export function NotificationsSettings({ onUnauthorized }: { onUnauthorized: () =
 						</Button>
 					) : null}
 				</div>
-				<CardDescription>例程完成 / 失败、待批写操作的出现与执行结果会写到这里（文件持久化，重启不丢）。外部消息渠道不在本批范围，后续作为同一事件的第二个出口。</CardDescription>
+				<CardDescription>例程完成 / 失败、待批写操作的出现与执行结果会写到这里（文件持久化，重启不丢）。外部消息渠道尚未接入，接入后同一事件会同步推送出去。</CardDescription>
 			</CardHeader>
 			<CardContent>
 				{items === null ? (

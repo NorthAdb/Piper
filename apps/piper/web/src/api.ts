@@ -77,8 +77,9 @@ export async function runMorningScan(): Promise<void> {
 	await api("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
 }
 
-export async function listArtifacts(): Promise<ArtifactMeta[]> {
-	return (await api<{ artifacts: ArtifactMeta[] }>("/api/artifacts")).artifacts;
+export async function listArtifacts(botId?: string): Promise<ArtifactMeta[]> {
+	const query = botId ? `?botId=${encodeURIComponent(botId)}` : "";
+	return (await api<{ artifacts: ArtifactMeta[] }>(`/api/artifacts${query}`)).artifacts;
 }
 
 export async function getArtifact(id: string): Promise<Artifact> {

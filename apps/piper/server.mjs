@@ -19,9 +19,9 @@
 // GET /api/schedule/status 定时调度只读状态（时区、下次运行、上次运行/结果、是否运行中、补跑次数）
 // 定时（P1-4）：进程内调度，默认每天 08:00（routines.schedule 的 "HH:MM"），时区读基础资料；
 // 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.mjs）
-// GET /api/artifacts 产物列表
+// GET /api/artifacts 产物列表（支持 ?botId= 按 bot 过滤，桌面产物走服务端过滤，R10）
 // GET /api/artifacts/:id 产物正文
-// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved/executing Finding 的审批视图，含 approvalId 与 intentHash）
+// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved/executing Finding 的审批视图，含 approvalId 与 intentHash）；纯读无写副作用，过期清理由扫描开始与调度周期显式执行（R10）
 // POST /api/approvals/:id/approve {intentHash} 批准并经薄网关执行批准快照（P1-6 + R1）：回 { approval, execution }；
 //   intentHash 与当前内容不一致回 409「内容已变，请重新查看」；正在 executing 回 409；
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
@@ -56,6 +56,7 @@ import { existsSync, readFileSync} from "node:fs";
 import { join, extname} from "node:path";
 import {
 APP_DIR,
+acquireDataLock,
 ensureData,
 listBots,
 getBot,
@@ -80,7 +81,7 @@ import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
-import { approveApproval, listApprovals, rejectApproval} from "./lib/approvals.mjs";
+import { approveApproval, listApprovals, rejectApproval, sweepExpiredFindings} from "./lib/approvals.mjs";
 import { listAudit} from "./lib/audit.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
@@ -141,6 +142,23 @@ return null;
 }
 
 ensureData();
+
+// 双进程防护（R10）：同一数据目录只允许一个服务进程（锁在 lib/store.mjs）。
+// 已有存活进程时拒绝启动；持有者退出（含信号）时释放，陈旧锁自动接管。
+let releaseDataLock;
+try {
+releaseDataLock = acquireDataLock();
+} catch (err) {
+console.error(`拒绝启动：${err.message}`);
+process.exit(1);
+}
+process.on("exit", () => releaseDataLock());
+for (const sig of ["SIGINT", "SIGTERM"]) {
+process.on(sig, () => {
+releaseDataLock();
+process.exit(0);
+});
+}
 
 function sendJson(res, status, obj) {
 const body = JSON.stringify(obj);
@@ -238,6 +256,13 @@ let scanInFlight = false;
 async function executeMorningScan() {
 if (scanInFlight) return { skipped: true};
 scanInFlight = true;
+// 过期清理的显式触发点之一（R10）：扫描开始前把已过期的 open Finding 转 expired
+// （GET 读路径不再做这件事）。清理失败不挡扫描，记日志继续。
+try {
+sweepExpiredFindings();
+} catch (err) {
+console.error(`[piper] 扫描前过期清理失败（继续扫描）：${err?.message ?? err}`);
+}
 try {
 const routine = listRoutines().find((r) => r.id === "morning-scan");
 const bot = getBot(routine?.botId || "repo-keeper");
@@ -425,7 +450,11 @@ const body = await readBody(req);
 markNotificationsRead(Array.isArray(body.ids)? body.ids: undefined);
 return sendJson(res, 200, { notifications: listNotifications(), unread: countUnread()});
 }
-if (path === "/api/artifacts" && req.method === "GET") return sendJson(res, 200, { artifacts: listArtifacts()});
+if (path === "/api/artifacts" && req.method === "GET") {
+const botId = url.searchParams.get("botId");
+const all = listArtifacts();
+return sendJson(res, 200, { artifacts: botId? all.filter((a) => a.botId === botId): all});
+}
 const artMatch = path.match(/^\/api\/artifacts\/([\w.-]+)$/);
 if (artMatch && req.method === "GET") {
 const art = readArtifact(artMatch[1]);
@@ -479,8 +508,16 @@ return sendJson(res, err.status || 500, { error: redact(String(err?.message?? er
 
 server.listen(PORT, HOST, () => {
 console.log(`Piper prototype listening on http://${HOST}:${PORT} (token: ${process.env.PIPER_TOKEN? "from env": "default piper-dev"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
-// 定时调度启动：先 tick 一次（处理启动补跑与首次规划），之后每 30 秒推进状态机。
+// 定时调度启动：先 tick 一次（处理启动补跑与首次规划），之后每 30 秒推进状态机，
+// 并顺带做过期清理（R10 的显式触发点之二：GET 读路径不再写数据，靠周期点收口）。
 void scheduler.tick(new Date());
-const timer = setInterval(() => void scheduler.tick(new Date()), 30 * 1000);
+const timer = setInterval(() => {
+try {
+sweepExpiredFindings();
+} catch (err) {
+console.error(`[piper] 过期清理失败（下个周期重试）：${err?.message ?? err}`);
+}
+void scheduler.tick(new Date());
+}, 30 * 1000);
 timer.unref();
 });

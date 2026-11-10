@@ -1,6 +1,6 @@
-// 设置页「连接器」组（L0-4）：统一槽位卡片列表。
+// 设置页「连接器」组：统一槽位卡片列表。
 // GitHub 是唯一可配置项（PAT 粘贴保存，读回只有末四位掩码，保存后扫描立即使用）；
-// 网页查询待 L0-6；日历 / 邮件是占位卡，点开能看到「尚未接入」与既定口径，不冒充已接好。
+// 网页查询尚未启用；日历 / 邮件是占位卡，点开能看到「尚未接入」与既定口径，不冒充已接好。
 import { ChevronDownIcon, Loader2Icon, SaveIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getConnectors, saveGithubToken, UnauthorizedError } from "./api";
@@ -19,6 +19,7 @@ const STATUS_LABEL: Record<Connector["status"], string> = {
 
 const ACCESS_LABEL: Record<string, string> = {
 	read: "只读",
+	"read-approved-comment": "读 + 经收件箱批准的评论",
 	"read-write-gated": "读写（写经网关）",
 };
 

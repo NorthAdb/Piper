@@ -87,6 +87,63 @@ function writeJson(file, data) {
 	writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
 }
 
+// 整表重写走临时文件 + rename（R10）：写一半进程崩溃不会留下截断的文件，读者要么
+// 看到旧内容、要么看到新内容（rename 在同一文件系统内是原子替换）。tmp 名带 pid，
+// 避免并发写者踩同一个临时文件。设置文件与 findings.jsonl 的整表重写都经这里。
+export function writeFileAtomicSync(file, content, options) {
+	const tmp = `${file}.tmp-${process.pid}`;
+	writeFileSync(tmp, content, options);
+	renameSync(tmp, file);
+}
+
+// ---------- 数据目录进程锁（R10） ----------
+// 同一数据目录只允许一个 Piper 服务进程：两个进程同时整表重写 findings /
+// notifications 等文件会互相踩踏（后写者覆盖先写者的更新）。锁文件 data/piper.lock
+// 只存持有者 pid；启动时若已有存活进程持有则拒绝启动，pid 不存在则视为陈旧锁接管。
+const LOCK_FILE = join(DATA_DIR, "piper.lock");
+
+function pidAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err?.code === "EPERM";
+	}
+}
+
+// 抢锁成功返回释放函数（只删自己持有的锁）；已有存活进程时抛错，调用方拒绝启动。
+export function acquireDataLock() {
+	ensureDir(DATA_DIR);
+	const writeOwn = () => writeFileSync(LOCK_FILE, `${process.pid}\n`, { flag: "wx" });
+	try {
+		writeOwn();
+	} catch (err) {
+		if (err?.code !== "EEXIST") throw err;
+		let holder = NaN;
+		try {
+			holder = Number(readFileSync(LOCK_FILE, "utf8").trim());
+		} catch {
+			/* 锁文件读不出内容，按陈旧处理 */
+		}
+		if (Number.isInteger(holder) && holder > 0 && holder !== process.pid && pidAlive(holder)) {
+			throw new Error(`数据目录 ${DATA_DIR} 已被另一个 Piper 进程占用（pid ${holder}），拒绝启动；请先停掉已有进程，或换 PIPER_DATA_DIR。`);
+		}
+		// 陈旧锁：持有进程已退出或内容无效——删掉重抢（单机单用户，竞态窗口可接受）。
+		rmSync(LOCK_FILE, { force: true });
+		writeOwn();
+	}
+	let released = false;
+	return function releaseDataLock() {
+		if (released) return;
+		released = true;
+		try {
+			if (Number(readFileSync(LOCK_FILE, "utf8").trim()) === process.pid) rmSync(LOCK_FILE, { force: true });
+		} catch {
+			/* 锁已被接管或删除，无需处理 */
+		}
+	};
+}
+
 export function botWorkspace(botId) {
 	return join(DATA_DIR, "workspaces", botId);
 }
