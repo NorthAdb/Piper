@@ -1208,3 +1208,49 @@ MINOR 批量七项，专项测试 `scripts/test-r10.mjs`（`npm run test:r10`，
   截图（CDP 驱动已构建前端，不执行被抓页面的脚本——抓取走原始 HTTP + 文本
   抽取）、未配置搜索端点时不用爬虫冒充搜索、未把网页查询做成评测主线；
   未改 `packages/`、未改 SSE 事件名、未增加写意图。
+
+### 第二轮返工 F1–F3 实测（2026-11-11，分支 fix/round2-f1-f3，堆叠在 R11 上）
+
+PA—design 复审 tip `e42f3a0` 后的第二轮返工，本批做 F1、F2、F3（三项 MAJOR）。
+
+- **F1 executing 崩溃恢复**：网关领取执行后进程在落终态前死亡（kill -9 等），
+  Finding 永久卡 `executing`（批准 409、驳回 409，无出口）。新增
+  `lib/approvals.mjs` 的 `recoverInterruptedExecutions()`：把超时的 executing
+  退回 `approved` 并写审计 `failed`/`interrupted`，不自动重发；阈值常量
+  `EXECUTING_RECOVERY_MS = 5 分钟`（按 `updatedAt` 计）。server 启动时以
+  `olderThanMs=0` 全量恢复（数据锁保证没有第二个活进程，残留 executing 必是
+  上一进程的），30 秒周期 tick 用缺省阈值兜底运行中残留。之后再批准走既有
+  幂等标记检查：评论已发出的直接复用记 `executed`，不会双发。
+  验收：专项单测在 `test:gateway` 第 19–20 项（超时退回 + 审计、未超时不动、
+  启动语义全量恢复）；新增集成 `scripts/test-recovery.mjs`（`npm run
+  test:recovery`，已纳入聚合）**7/7**——替身 GitHub 在评论 POST 落库后延迟
+  30 秒响应，期间 `kill -9` server 再重启：重启后状态为 `approved`、审计有
+  `failed/interrupted`、再批准后评论 POST 总数仍 1 且转 `executed`。
+  先红：恢复函数不存在时单测 19–20 红、集成第 05–07 项红（重启后卡
+  `executing`、再批准 409）；变异（恢复函数改空转）后单测与集成同样红。
+- **F2 评论查重翻页**：幂等查重原来只取评论默认第一页（30 条），标记在靠后
+  页时重试会重复发评论。`lib/gateway.mjs` 查重改 `per_page=100` 翻页取尽、
+  上限 10 页（`fetchCommentsForCheck`）；到上限仍没取尽且没找到标记 → 不发，
+  `failed/comments_check_incomplete` 退回 `approved`。顺手：网关复检取
+  reviews 改用扫描的同一翻页函数（`lib/scan.mjs` 导出的 `ghPage`/`PAGE_CAPS`），
+  两处共用一套翻页口径。
+  验收（`test:gateway` 第 21–23 项，替身按 GitHub 口径分页、缺省每页 30）：
+  A 共 35 条、标记在第 35 条（默认页口径下在第 2 页）→ 重试 POST 0 次、复用
+  记 `executed`；B 共 120 条、标记在第 111 条（per_page=100 第 2 页）→ 同上；
+  C 共 1006 条、标记在第 1006 条（超出 10 页上限）→ POST 0 次、
+  `failed/comments_check_incomplete`、保持 `approved`、审计有该原因。
+  先红：未翻页时三项全红（三例都重发了一条评论）；变异（查重改回单次取）后
+  三项同样全红。
+- **F3 默认口令按值比较**：原来「使用默认口令」看 `PIPER_TOKEN` 有没有设，
+  显式 `PIPER_TOKEN=piper-dev` + `PIPER_HOST=0.0.0.0` 能绕过非回环拒启。
+  `server.mjs` 改为值比较 `TOKEN === "piper-dev"`（空串回落默认值同算），
+  拒启文案与启动日志的口令来源标注同步按此口径。
+  验收（`test:listen` 第 07–09 项）：显式默认口令 + `0.0.0.0` → 退出码非 0
+  且输出写明原因；显式默认口令 + 回环 → 正常启动。先红：改前第 07–08 项红
+  （进程照常监听 `0.0.0.0`）；变异（改回看变量有没有设）后同样红。
+- 全套：`npm run test` 聚合全绿——test:gateway **24/24**、test:recovery
+  **7/7**、test:listen **9/9**、eval:scan **18/18**、regression **72/72**
+  （基线只增不减），其余各套与 build:web、check 均通过（数字见 PR 描述）。
+- 明确不做核对：只做 F1/F2/F3，未碰 F4–F13；未改 `packages/`、未改 SSE
+  事件名、未加第二种写意图、未加新依赖；恢复不自动重发评论；查重取不尽时
+  宁可不发，不放宽幂等口径。

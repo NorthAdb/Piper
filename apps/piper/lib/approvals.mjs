@@ -88,6 +88,33 @@ function badRequest(message) {
 	return Object.assign(new Error(message), { status: 400 });
 }
 
+// executing 崩溃恢复（F1，第二轮返工）：网关领取执行后若进程在落终态前死亡
+// （kill -9、断电），Finding 会永久卡在 executing——批准 409、驳回 409，无出口。
+// 恢复把超时的 executing 退回 approved 并写审计 failed/interrupted，不自动重发；
+// 之后用户再点批准，网关会先查幂等标记：评论已发出的直接记 executed，不会双发。
+// 阈值 5 分钟：正常执行的网络调用在秒级完成，5 分钟足够覆盖慢网络，又不让真
+// 卡死的事项久等。server 启动时以 olderThanMs=0 调用（本进程刚起，数据锁保证没有
+// 第二个活进程，任何 executing 必然是上一进程的残留）；调度周期 tick 用缺省阈值。
+export const EXECUTING_RECOVERY_MS = 5 * 60 * 1000;
+
+export function recoverInterruptedExecutions({ now = new Date(), olderThanMs = EXECUTING_RECOVERY_MS } = {}) {
+	let recovered = 0;
+	for (const f of listFindings({ status: "executing" })) {
+		if (now.getTime() - Date.parse(f.updatedAt) < olderThanMs) continue;
+		updateFinding(f.id, { status: "approved" });
+		appendAudit({
+			botId: f.botId,
+			intent: f.writeIntent ? { ...f.writeIntent, repo: f.repo } : null,
+			result: "failed",
+			reason: "interrupted",
+			findingId: f.id,
+			approvalId: latestApprovalRecord(f.id)?.approvalId ?? null,
+		});
+		recovered += 1;
+	}
+	return recovered;
+}
+
 // 过期清理：open 且 expiresAt 已过的 Finding 转 expired。R10 起 GET 读路径不再顺带
 // 做这件事（读接口无写副作用）——只由显式步骤调用：晨间扫描开始前、调度周期 tick
 // （server.mjs 每 30 秒）、以及批准/驳回的写路径（requireApprovable）。approved 的

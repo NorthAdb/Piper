@@ -45,13 +45,15 @@ async function gh(path) {
 // 翻页取尽（R6）：按 per_page 逐页拉，直到某页不满 per_page 为止；累计到 maxItems
 // 且最后一页仍满页时记 truncated（调用方在日报写明「仅检查前 N 条」）。
 // extract 把响应体映射成数组（runs 接口是 { workflow_runs: [...] } 包装）。
-const PAGE_CAPS = {
+// 本函数与上限表同时供 lib/gateway.mjs 复检取 reviews 使用（F2，第二轮返工）：
+// 扫描与网关共用同一套翻页口径，不各写一份。
+export const PAGE_CAPS = {
 	pulls: { perPage: 100, maxItems: 200 },
 	reviews: { perPage: 100, maxItems: 300 },
 	runs: { perPage: 100, maxItems: 100 },
 };
 
-async function ghPage(path, { perPage, maxItems }, extract = (j) => j) {
+export async function ghPage(path, { perPage, maxItems }, extract = (j) => j) {
 	const sep = path.includes("?") ? "&" : "?";
 	const items = [];
 	let truncated = false;

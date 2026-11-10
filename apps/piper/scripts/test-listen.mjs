@@ -5,6 +5,9 @@
 //   B PIPER_HOST=0.0.0.0 且未设 PIPER_TOKEN（默认口令）：进程拒绝启动，退出码非 0
 //     且输出写明原因。
 //   C PIPER_HOST=0.0.0.0 且显式设置 PIPER_TOKEN：正常启动，监听 0.0.0.0。
+//   D（F1→F3，第二轮返工）PIPER_TOKEN 显式设为默认值 piper-dev + PIPER_HOST=0.0.0.0：
+//     「是否默认口令」按值比较而不是看变量有没有设——照样拒绝启动。
+//   E PIPER_TOKEN=piper-dev + 回环监听：正常启动（默认值本身只禁非回环）。
 // R4 起子进程一律带 PIPER_DATA_DIR 指向临时目录：调度启动 tick 的补跑产物只落
 // 隔离目录，不再写用户真实 data/；本脚本只断言监听面，不碰业务数据。
 import { execFileSync, spawn } from "node:child_process";
@@ -120,9 +123,42 @@ async function caseNonLoopbackWithToken() {
 	}
 }
 
+async function caseExplicitDefaultTokenNonLoopback() {
+	const port = 4414;
+	const { proc, output } = startServer({ ...baseEnv(port), PIPER_HOST: "0.0.0.0", PIPER_TOKEN: "piper-dev" });
+	try {
+		const code = await waitExit(proc);
+		check(
+			"显式 PIPER_TOKEN=piper-dev + 0.0.0.0 时进程拒绝启动（按值判定默认口令，退出码非 0）",
+			code !== null && code !== 0,
+			code === null ? "进程未退出（仍在运行）" : `exitCode=${code}`,
+		);
+		check(
+			"显式默认口令被拒时输出写明原因（提到 PIPER_TOKEN / 默认口令）",
+			/PIPER_TOKEN|默认口令/.test(output()),
+			`输出节选：${output().slice(0, 200)}`,
+		);
+	} finally {
+		proc.kill("SIGTERM");
+	}
+}
+
+async function caseExplicitDefaultTokenLoopback() {
+	const port = 4415;
+	const { proc } = startServer({ ...baseEnv(port), PIPER_TOKEN: "piper-dev" });
+	try {
+		const ready = await waitReady(proc, port);
+		check("显式 PIPER_TOKEN=piper-dev + 回环监听时正常启动", ready, `exitCode=${proc.exitCode}`);
+	} finally {
+		proc.kill("SIGTERM");
+	}
+}
+
 await caseDefaultLoopback();
 await caseRefuseNonLoopbackDefaultToken();
 await caseNonLoopbackWithToken();
+await caseExplicitDefaultTokenNonLoopback();
+await caseExplicitDefaultTokenLoopback();
 
 rmSync(join(TMP_DATA, ".."), { recursive: true, force: true });
 

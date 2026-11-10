@@ -59,7 +59,11 @@ globalThis.fetch = async (url, init = {}) => {
 	const commentsMatch = u.pathname.match(/^\/repos\/(.+)\/issues\/(\d+)\/comments$/);
 	if (commentsMatch && method === "GET") {
 		const key = `${commentsMatch[1]}#${commentsMatch[2]}`;
-		return { ok: true, status: 200, json: async () => commentsByKey.get(key) ?? [] };
+		// 按 GitHub 口径分页：缺省 per_page=30，page 从 1 起（F2 用例靠它摆位标记评论）。
+		const all = commentsByKey.get(key) ?? [];
+		const perPage = Number(u.searchParams.get("per_page") ?? 30);
+		const page = Number(u.searchParams.get("page") ?? 1);
+		return { ok: true, status: 200, json: async () => all.slice((page - 1) * perPage, page * perPage) };
 	}
 	if (commentsMatch && method === "POST") {
 		const body = JSON.parse(init.body ?? "{}");
@@ -72,7 +76,9 @@ globalThis.fetch = async (url, init = {}) => {
 		return { ok: true, status: 201, json: async () => comment };
 	}
 	if (method === "GET" && /\/pulls\/\d+\/reviews$/.test(u.pathname)) {
-		return { ok: true, status: 200, json: async () => pullReviews };
+		const perPage = Number(u.searchParams.get("per_page") ?? 30);
+		const page = Number(u.searchParams.get("page") ?? 1);
+		return { ok: true, status: 200, json: async () => pullReviews.slice((page - 1) * perPage, page * perPage) };
 	}
 	if (method === "GET" && /\/pulls\/\d+$/.test(u.pathname)) {
 		if (pullShouldFail) return { ok: false, status: 500, json: async () => ({}) };
@@ -91,7 +97,7 @@ try {
 	const { ensureData } = await import("../lib/store.mjs");
 	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
 	const { createFinding, getFinding, updateFinding } = await import("../lib/findings.mjs");
-	const { approveApproval, listApprovals, rejectApproval } = await import("../lib/approvals.mjs");
+	const { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.mjs");
 	const { gatewayExecuteWrite } = await import("../lib/gateway.mjs");
 	const { listAudit } = await import("../lib/audit.mjs");
 	const { listNotifications } = await import("../lib/notify.mjs");
@@ -453,7 +459,111 @@ try {
 		);
 	}
 
-	// 17. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
+	// 直接改 findings 文件里的 updatedAt（模拟执行在途已停留很久，updatedAt 不是可改字段）。
+	function ageFindingFile(id, iso) {
+		const lines = readFileSync(process.env.PIPER_FINDINGS_FILE, "utf8").split("\n").filter(Boolean);
+		const out = lines.map((line) => {
+			const f = JSON.parse(line);
+			if (f.id === id) f.updatedAt = iso;
+			return JSON.stringify(f);
+		});
+		writeFileSync(process.env.PIPER_FINDINGS_FILE, out.join("\n") + "\n", "utf8");
+	}
+
+	// 17. executing 崩溃恢复（F1，第二轮返工）：进程在网关领取执行后、落终态前死亡
+	//     （kill -9 等），Finding 会永久卡 executing——批准 409、驳回 409。恢复函数把
+	//     超时（缺省 5 分钟，按 updatedAt 计）的 executing 退回 approved 并写审计
+	//     failed/interrupted；刚领取的（未超时）不动。启动语义 olderThanMs=0 全量恢复。
+	{
+		const stale = makeFinding({ subject: "118" });
+		updateFinding(stale.id, { status: "approved" });
+		updateFinding(stale.id, { status: "executing" });
+		ageFindingFile(stale.id, new Date(Date.now() - 10 * 60 * 1000).toISOString());
+		const fresh = makeFinding({ subject: "119" });
+		updateFinding(fresh.id, { status: "approved" });
+		updateFinding(fresh.id, { status: "executing" });
+		let recovered = null;
+		let err = null;
+		try {
+			recovered = recoverInterruptedExecutions();
+		} catch (e) {
+			err = e;
+		}
+		check(
+			"executing 恢复：超时 executing 退回 approved 并写审计 failed/interrupted，未超时的不动",
+			err === null &&
+				recovered === 1 &&
+				getFinding(stale.id).status === "approved" &&
+				auditFor(stale.id).some((x) => x.result === "failed" && x.reason === "interrupted") &&
+				getFinding(fresh.id).status === "executing",
+			`err=${err?.message ?? ""} recovered=${recovered} stale=${getFinding(stale.id).status} fresh=${getFinding(fresh.id).status}`,
+		);
+		let recoveredAtBoot = null;
+		try {
+			recoveredAtBoot = recoverInterruptedExecutions({ olderThanMs: 0 });
+		} catch (e) {
+			err = e;
+		}
+		check(
+			"executing 恢复（启动语义）：olderThanMs=0 时未超时的 executing 也退回 approved",
+			err === null && recoveredAtBoot === 1 && getFinding(fresh.id).status === "approved",
+			`err=${err?.message ?? ""} recovered=${recoveredAtBoot} fresh=${getFinding(fresh.id).status}`,
+		);
+	}
+
+	// 18. 评论幂等查重翻页（F2，第二轮返工）：查重改 per_page=100 翻页取尽，上限 10 页；
+	//     到上限仍没取尽且没找到标记 → 不发，failed/comments_check_incomplete，退回 approved。
+	//     摆位都靠「首次执行 POST 成功后崩溃」种下带标记评论，再用填充评论把它推到目标位置：
+	//     A 共 35 条、标记在第 35 条（GitHub 默认每页 30 时位于第 2 页，旧实现只取第一页必漏检重发）；
+	//     B 共 120 条、标记在第 111 条（per_page=100 的第 2 页）；
+	//     C 共 1006 条、标记在第 1006 条（超出 10 页 × 100 的取尽上限）。
+	//     A/B：重试 POST 0 次、复用已有评论记 executed；C：POST 0 次、保持 approved、审计有该原因。
+	async function seedCrashedWithMarker(f, total, markerIndex) {
+		postCrashAfterSuccess = true;
+		const out1 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		postCrashAfterSuccess = false;
+		const key = `${f.repo}#${f.writeIntent.prNumber}`;
+		const arr = commentsByKey.get(key) ?? [];
+		const markerComment = arr[arr.length - 1];
+		const fillers = Array.from({ length: total - 1 }, (_, i) => ({ body: `filler ${i}`, html_url: `https://example.invalid/filler-${i}` }));
+		commentsByKey.set(key, [...fillers.slice(0, markerIndex), markerComment, ...fillers.slice(markerIndex)]);
+		return out1;
+	}
+	{
+		const fA = makeFinding({ subject: "201", writeIntent: { kind: "pr_comment", prNumber: 201, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/201" });
+		await seedCrashedWithMarker(fA, 35, 34);
+		const beforeA = postCalls.length;
+		const outA = await approveApproval(fA.id, { intentHash: viewOf(fA.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"查重翻页 A：35 条评论、标记在第 35 条 → 重试 POST 0 次，复用已有评论记 executed",
+			outA.execution.ok === true && outA.execution.reused === true && postCalls.length === beforeA && getFinding(fA.id).status === "executed",
+			`out=${JSON.stringify(outA.execution)} posts=${postCalls.length - beforeA}`,
+		);
+		const fB = makeFinding({ subject: "202", writeIntent: { kind: "pr_comment", prNumber: 202, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/202" });
+		await seedCrashedWithMarker(fB, 120, 110);
+		const beforeB = postCalls.length;
+		const outB = await approveApproval(fB.id, { intentHash: viewOf(fB.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"查重翻页 B：120 条评论、标记在第 111 条（per_page=100 第 2 页）→ 重试 POST 0 次，复用记 executed",
+			outB.execution.ok === true && outB.execution.reused === true && postCalls.length === beforeB && getFinding(fB.id).status === "executed",
+			`out=${JSON.stringify(outB.execution)} posts=${postCalls.length - beforeB}`,
+		);
+		const fC = makeFinding({ subject: "203", writeIntent: { kind: "pr_comment", prNumber: 203, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/203" });
+		await seedCrashedWithMarker(fC, 1006, 1005);
+		const beforeC = postCalls.length;
+		const outC = await approveApproval(fC.id, { intentHash: viewOf(fC.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"查重翻页 C：标记超出 10 页上限 → POST 0 次，failed/comments_check_incomplete，保持 approved，审计有该原因",
+			outC.execution.ok === false &&
+				outC.execution.reason === "comments_check_incomplete" &&
+				postCalls.length === beforeC &&
+				getFinding(fC.id).status === "approved" &&
+				auditFor(fC.id).some((x) => x.result === "failed" && x.reason === "comments_check_incomplete"),
+			`out=${JSON.stringify(outC.execution)} posts=${postCalls.length - beforeC} status=${getFinding(fC.id).status}`,
+		);
+	}
+
+	// 19. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
 	//     扫描与对话层文件不得同时出现 api.github.com 与 POST 写调用。
 	{
 		const libFiles = readdirSync(join(APP_DIR, "lib")).filter((f) => f.endsWith(".mjs"));

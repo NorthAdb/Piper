@@ -1,8 +1,8 @@
 // Piper 雏形服务端：Node 内置 http，零框架依赖。
 // API 契约（JSON；chat 为 SSE）：
 // POST /api/login {token} 单口令登录，种 cookie 会话（同来源连续 11 次错口令后锁定 60 秒，超限回 429）
-// 监听与写请求守卫（R2）：默认只监听 127.0.0.1，PIPER_HOST 显式放开；未设 PIPER_TOKEN
-// （默认口令）且监听非回环地址时进程拒绝启动。所有写方法（POST/PUT/PATCH/DELETE）
+// 监听与写请求守卫（R2）：默认只监听 127.0.0.1，PIPER_HOST 显式放开；使用默认口令
+// （PIPER_TOKEN 未设、为空或显式设为 piper-dev，按值比较，F3）且监听非回环地址时进程拒绝启动。所有写方法（POST/PUT/PATCH/DELETE）
 // 校验 Origin（有则必须与 Host 同源，不符 403）并要求 Content-Type: application/json
 // （不符 415）；会话 Cookie 为 SameSite=Strict。
 // GET /api/session {authenticated, modelConfigured}
@@ -83,13 +83,17 @@ import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
-import { approveApproval, listApprovals, rejectApproval, sweepExpiredFindings} from "./lib/approvals.mjs";
+import { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.mjs";
 import { listAudit} from "./lib/audit.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
 const HOST = process.env.PIPER_HOST || "127.0.0.1";
-const TOKEN = process.env.PIPER_TOKEN || "piper-dev";
-const USING_DEFAULT_TOKEN = !process.env.PIPER_TOKEN;
+const DEFAULT_TOKEN = "piper-dev";
+const TOKEN = process.env.PIPER_TOKEN || DEFAULT_TOKEN;
+// 「使用默认口令」按值比较（F3，第二轮返工）：未设、设为空串（回落默认值）、或
+// 显式 PIPER_TOKEN=piper-dev 都算默认口令——只看变量有没有设会让显式写出默认值
+// 的部署绕过下面的非回环拒启。
+const USING_DEFAULT_TOKEN = TOKEN === DEFAULT_TOKEN;
 const sessions = new Set();
 
 function isLoopbackHost(host) {
@@ -97,9 +101,9 @@ return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 
 // 默认口令只允许回环监听：非回环 + 默认口令的组合会把可写网关与设置面直接暴露给
-// 局域网，进程拒绝启动并写明原因（R2）。显式设置 PIPER_TOKEN 后可自由放开监听。
+// 局域网，进程拒绝启动并写明原因（R2）。把 PIPER_TOKEN 设置为非默认值后可自由放开监听。
 if (USING_DEFAULT_TOKEN && !isLoopbackHost(HOST)) {
-console.error(`拒绝启动：未设置 PIPER_TOKEN 时使用默认口令，只允许回环监听（127.0.0.1），但 PIPER_HOST=${HOST}。请先设置 PIPER_TOKEN 环境变量再放开监听地址。`);
+console.error(`拒绝启动：当前使用默认口令（PIPER_TOKEN 未设置、为空或显式设为 piper-dev），只允许回环监听（127.0.0.1），但 PIPER_HOST=${HOST}。请先把 PIPER_TOKEN 设置为非默认值再放开监听地址。`);
 process.exit(1);
 }
 
@@ -160,6 +164,14 @@ process.on(sig, () => {
 releaseDataLock();
 process.exit(0);
 });
+}
+
+// executing 崩溃恢复（F1）：上一进程若在网关执行途中死亡，Finding 会卡在 executing。
+// 本进程刚起、数据锁在手，不可能有别的活进程在执行——残留的 executing 全量退回
+// approved 并写审计 failed/interrupted，不自动重发（用户再批准时网关靠标记查重防双发）。
+{
+const recovered = recoverInterruptedExecutions({ olderThanMs: 0 });
+if (recovered > 0) console.log(`[piper] 启动恢复：${recovered} 条卡在 executing 的 Finding 已退回 approved（审计 failed/interrupted）`);
 }
 
 function sendJson(res, status, obj) {
@@ -523,7 +535,7 @@ return sendJson(res, err.status || 500, { error: redact(String(err?.message?? er
 });
 
 server.listen(PORT, HOST, () => {
-console.log(`Piper prototype listening on http://${HOST}:${PORT} (token: ${process.env.PIPER_TOKEN? "from env": "default piper-dev"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
+console.log(`Piper prototype listening on http://${HOST}:${PORT} (token: ${USING_DEFAULT_TOKEN? "default piper-dev": "from env"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
 // 定时调度启动：先 tick 一次（处理启动补跑与首次规划），之后每 30 秒推进状态机，
 // 并顺带做过期清理（R10 的显式触发点之二：GET 读路径不再写数据，靠周期点收口）。
 void scheduler.tick(new Date());
@@ -532,6 +544,13 @@ try {
 sweepExpiredFindings();
 } catch (err) {
 console.error(`[piper] 过期清理失败（下个周期重试）：${err?.message ?? err}`);
+}
+// executing 超时恢复（F1）：运行中进程自身异常残留的 executing 超过阈值同样退回。
+try {
+const recovered = recoverInterruptedExecutions();
+if (recovered > 0) console.log(`[piper] 周期恢复：${recovered} 条超时的 executing Finding 已退回 approved（审计 failed/interrupted）`);
+} catch (err) {
+console.error(`[piper] executing 恢复失败（下个周期重试）：${err?.message ?? err}`);
 }
 void scheduler.tick(new Date());
 }, 30 * 1000);

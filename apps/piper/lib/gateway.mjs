@@ -24,6 +24,9 @@
 //     failed/precondition_changed 退回 approved；复检取证失败同样退回，不误发；
 //   - 发评论前先查该 PR 已有评论里是否带本批准的幂等标记
 //     <!-- piper:approval=<approvalId> -->，有则复用该评论记 executed，不再 POST；
+//     查重必须翻页取尽（F2，第二轮返工）：per_page=100、上限 10 页——只看第一页
+//     会漏掉靠后页的标记而重复发评论；到上限仍没取尽且没找到标记时不发，
+//     failed/comments_check_incomplete 退回 approved（宁可不发，不能冒险双发）；
 //   - POST 的正文 = 快照正文 + 幂等标记；成功写审计 executed（带评论 URL）、Finding 转 executed；
 //   - 任一网络步失败：Finding 从 executing 退回 approved、写审计 failed，错误可见可重试。
 // 凭证只经 lib/settings.mjs 的 githubToken() 读取，本文件不直读环境变量与设置文件。
@@ -33,6 +36,7 @@ import { getBot } from "./store.mjs";
 import { getFinding, updateFinding } from "./findings.mjs";
 import { appendAudit } from "./audit.mjs";
 import { evaluateReviews } from "./pr-review.mjs";
+import { ghPage, PAGE_CAPS } from "./scan.mjs";
 
 // GitHub API 基址：缺省官方；可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归/测试指向本地桩）。
 function ghBase() {
@@ -49,6 +53,23 @@ async function ghJson(path, { method = "GET", token, body } = {}) {
 	});
 	if (!res.ok) throw new Error(`GitHub API ${res.status} ${method} ${path}`);
 	return res.json();
+}
+
+// 评论查重翻页（F2）：per_page=100 逐页取，直到某页不满 100 为止；最多取
+// COMMENTS_CHECK_MAX_PAGES 页。complete=false 表示到上限仍可能没取尽——调用方
+// 在没找到标记时不得发评论（无法证明「没发过」）。
+const COMMENTS_CHECK_PER_PAGE = 100;
+const COMMENTS_CHECK_MAX_PAGES = 10;
+
+async function fetchCommentsForCheck(repo, prNumber, token) {
+	const comments = [];
+	for (let page = 1; page <= COMMENTS_CHECK_MAX_PAGES; page += 1) {
+		const batch = await ghJson(`/repos/${repo}/issues/${prNumber}/comments?per_page=${COMMENTS_CHECK_PER_PAGE}&page=${page}`, { token });
+		const list = Array.isArray(batch) ? batch : [];
+		comments.push(...list);
+		if (list.length < COMMENTS_CHECK_PER_PAGE) return { comments, complete: true };
+	}
+	return { comments, complete: false };
 }
 
 function sameIntent(snapshot, finding) {
@@ -125,7 +146,9 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 	}
 	let reviews;
 	try {
-		reviews = await ghJson(`/repos/${finding.repo}/pulls/${snapshot.prNumber}/reviews?per_page=100`, { token });
+		// 复检取 reviews 与扫描共用同一翻页函数（F2 顺手项）：一页 100 条装不下时
+		// 只看第一页会漏掉靠后的 APPROVED / CHANGES_REQUESTED，判定会错。
+		reviews = (await ghPage(`/repos/${finding.repo}/pulls/${snapshot.prNumber}/reviews`, PAGE_CAPS.reviews)).items;
 	} catch (err) {
 		rollback();
 		return failed(`precondition_check_failed: ${err.message}`);
@@ -136,14 +159,21 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 	}
 
 	// 幂等查重：同一批准若已留过评论（例如上次 POST 成功后进程崩溃），直接复用，不再发第二条。
+	// 查重翻页取尽（F2）；到上限仍没取尽且没找到标记 → 无法证明没发过，不发。
 	const marker = `<!-- piper:approval=${approvalId} -->`;
 	let existing = null;
+	let commentsComplete = true;
 	try {
-		const comments = await ghJson(`/repos/${finding.repo}/issues/${snapshot.prNumber}/comments`, { token });
-		existing = (Array.isArray(comments) ? comments : []).find((c) => typeof c?.body === "string" && c.body.includes(marker)) ?? null;
+		const checked = await fetchCommentsForCheck(finding.repo, snapshot.prNumber, token);
+		commentsComplete = checked.complete;
+		existing = checked.comments.find((c) => typeof c?.body === "string" && c.body.includes(marker)) ?? null;
 	} catch (err) {
 		rollback();
 		return failed(`comments_check_failed: ${err.message}`);
+	}
+	if (!existing && !commentsComplete) {
+		rollback();
+		return failed("comments_check_incomplete");
 	}
 	if (existing) {
 		appendAudit({ ...base, result: "executed", commentUrl: existing.html_url ?? null });
