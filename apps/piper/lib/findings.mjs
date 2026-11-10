@@ -1,0 +1,174 @@
+// Finding 存储（P1-1）：分诊的核心对象——「需要人拍板的事项」的结构化记录。
+// 文件优先：data/findings.jsonl 一行一条，每次读写都现读落盘，进程重启不丢。
+// 校验在写入边界完成：没有 evidenceUrl 的对象不准存成有效 Finding；type / status /
+// writeIntent 只接受本批已定的枚举，非法值抛带 status 的 Error（路由层转 4xx）。
+// 文件路径可用环境变量 PIPER_FINDINGS_FILE 覆盖（仅供单元测试 / 评测隔离数据，缺省走 data/）。
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { DATA_DIR, ensureData } from "./store.mjs";
+
+export const FINDING_TYPES = ["ci_failed", "pr_needs_review"];
+export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed"];
+// 本批只允许一种写意图（P1-6 网关放行）：给指定 PR 发表一条评论。
+export const FINDING_WRITE_INTENT_KINDS = ["pr_comment"];
+
+function findingsFile() {
+	return process.env.PIPER_FINDINGS_FILE || join(DATA_DIR, "findings.jsonl");
+}
+
+function badRequest(message) {
+	return Object.assign(new Error(message), { status: 400 });
+}
+
+function readAll() {
+	const file = findingsFile();
+	if (!existsSync(file)) return [];
+	return readFileSync(file, "utf8")
+		.split("\n")
+		.filter(Boolean)
+		.map((line) => {
+			try {
+				return JSON.parse(line);
+			} catch {
+				return null;
+			}
+		})
+		.filter(Boolean);
+}
+
+function rewriteAll(all) {
+	ensureData();
+	writeFileSync(findingsFile(), all.map((f) => JSON.stringify(f)).join("\n") + (all.length ? "\n" : ""), "utf8");
+}
+
+function requireNonEmptyString(value, field) {
+	if (typeof value !== "string" || !value.trim()) throw badRequest(`Finding.${field} 必填且须为非空字符串`);
+	return value;
+}
+
+function validateEvidenceUrl(value) {
+	requireNonEmptyString(value, "evidenceUrl");
+	let url;
+	try {
+		url = new URL(value);
+	} catch {
+		throw badRequest(`Finding.evidenceUrl 不是合法 URL: ${value}`);
+	}
+	if (url.protocol !== "http:" && url.protocol !== "https:") {
+		throw badRequest(`Finding.evidenceUrl 只允许 http/https: ${value}`);
+	}
+	return value;
+}
+
+function validateWriteIntent(value) {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "object" || Array.isArray(value)) throw badRequest("Finding.writeIntent 须为对象或 null");
+	if (!FINDING_WRITE_INTENT_KINDS.includes(value.kind)) {
+		throw badRequest(`Finding.writeIntent.kind 非法: ${value.kind}（本批只允许 ${FINDING_WRITE_INTENT_KINDS.join("/")}）`);
+	}
+	// pr_comment：仓库沿用 Finding.repo，正文与 PR 号必须齐全（PR 号即 subject，但意图里再存一份供网关独立校验）。
+	requireNonEmptyString(value.body, "writeIntent.body");
+	const prNumber = Number(value.prNumber);
+	if (!Number.isInteger(prNumber) || prNumber <= 0) throw badRequest("Finding.writeIntent.prNumber 须为正整数");
+	return { kind: value.kind, prNumber, body: value.body };
+}
+
+function validateExpiresAt(value) {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+		throw badRequest(`Finding.expiresAt 不是合法时间: ${value}`);
+	}
+	return value;
+}
+
+// 校验并组装一条 Finding（不落盘）。createFinding 与 updateFinding 共用字段校验口径。
+function buildFinding(input) {
+	if (!input || typeof input !== "object") throw badRequest("Finding 输入须为对象");
+	const repo = requireNonEmptyString(input.repo, "repo");
+	if (!repo.includes("/")) throw badRequest(`Finding.repo 须为 owner/name 形状: ${repo}`);
+	if (!FINDING_TYPES.includes(input.type)) {
+		throw badRequest(`Finding.type 非法: ${input.type}（本批只允许 ${FINDING_TYPES.join("/")}）`);
+	}
+	if (input.subject === undefined || input.subject === null || String(input.subject) === "") {
+		throw badRequest("Finding.subject 必填（PR 号或 workflow run id 等可去重键）");
+	}
+	const status = input.status ?? "open";
+	if (!FINDING_STATUSES.includes(status)) {
+		throw badRequest(`Finding.status 非法: ${status}（只允许 ${FINDING_STATUSES.join("/")}）`);
+	}
+	return {
+		repo,
+		type: input.type,
+		subject: String(input.subject),
+		title: requireNonEmptyString(input.title, "title"),
+		summary: typeof input.summary === "string" ? input.summary : "",
+		evidenceUrl: validateEvidenceUrl(input.evidenceUrl),
+		suggestedAction: typeof input.suggestedAction === "string" ? input.suggestedAction : "",
+		writeIntent: validateWriteIntent(input.writeIntent),
+		expiresAt: validateExpiresAt(input.expiresAt),
+		status,
+		botId: requireNonEmptyString(input.botId, "botId"),
+	};
+}
+
+export function createFinding(input) {
+	const now = new Date().toISOString();
+	const entry = {
+		id: `f-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+		...buildFinding(input),
+		createdAt: now,
+		updatedAt: now,
+	};
+	ensureData();
+	appendFileSync(findingsFile(), JSON.stringify(entry) + "\n", "utf8");
+	return entry;
+}
+
+// 按 status / repo / botId 过滤（都给才叠加），新在前。
+export function listFindings({ status, repo, botId } = {}) {
+	if (status !== undefined && !FINDING_STATUSES.includes(status)) {
+		throw badRequest(`Finding.status 非法: ${status}（只允许 ${FINDING_STATUSES.join("/")}）`);
+	}
+	return readAll()
+		.filter((f) => status === undefined || f.status === status)
+		.filter((f) => repo === undefined || f.repo === repo)
+		.filter((f) => botId === undefined || f.botId === botId)
+		.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+export function getFinding(id) {
+	return readAll().find((f) => f.id === id) ?? null;
+}
+
+// 同一仓库、同一类型、同一 subject 是否已有 open 的 Finding（P1-2 扫描去重用）。
+export function findOpenFinding(repo, type, subject) {
+	return readAll().find((f) => f.repo === repo && f.type === type && f.subject === String(subject) && f.status === "open") ?? null;
+}
+
+// 可改字段：status / title / summary / suggestedAction / writeIntent / expiresAt。
+// 其余字段（repo/type/subject/evidenceUrl/botId）是取证事实，立住后不许改。
+const PATCHABLE = ["status", "title", "summary", "suggestedAction", "writeIntent", "expiresAt"];
+
+export function updateFinding(id, patch) {
+	const all = readAll();
+	const idx = all.findIndex((f) => f.id === id);
+	if (idx < 0) return null;
+	const merged = { ...all[idx] };
+	for (const key of PATCHABLE) {
+		if (patch && patch[key] !== undefined) merged[key] = patch[key];
+	}
+	// 借 buildFinding 复检合并结果（status/writeIntent/expiresAt 的合法性都在里面）
+	const checked = buildFinding(merged);
+	const next = { ...all[idx], ...checked, id: all[idx].id, createdAt: all[idx].createdAt, updatedAt: new Date().toISOString() };
+	all[idx] = next;
+	rewriteAll(all);
+	return next;
+}
+
+export function deleteFinding(id) {
+	const all = readAll();
+	const next = all.filter((f) => f.id !== id);
+	if (next.length === all.length) return false;
+	rewriteAll(next);
+	return true;
+}

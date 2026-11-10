@@ -143,6 +143,12 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
 - `settings-github.json`：设置页保存的 GitHub 令牌（明文只存此文件，L0-4；经 `githubToken()` 读取）
 - `notifications.jsonl`：应用内通知一行一条（L0-5），扫描完成 / 整轮失败时写入；`approval.pending` 只预留类型、未写入
+- `findings.jsonl`：分诊 Finding 一行一条（P1-1，见 `lib/findings.mjs`）：需要人拍板的事项的结构化对象
+  （repo / type / subject 去重键 / evidenceUrl 必填 / suggestedAction / writeIntent / expiresAt /
+  status（open|approved|rejected|expired|executed）/ botId），每次读写现读落盘、重启不丢；
+  校验在写入边界：无 evidenceUrl、非法 type/status/writeIntent 一律拒绝。只读 API：
+  `GET /api/findings`（可按 status/repo/botId 过滤）、`GET /api/findings/:id`。
+  文件路径可用环境变量 `PIPER_FINDINGS_FILE` 覆盖（仅供单元测试 / 评测隔离，缺省即此文件）
 - `about-me.md`：账号级「关于我」，只有一份——设置页（`PUT /api/about-me`，需登录）、右栏记忆
   与对话注入读的都是它；上限 20000 字符，超限拒绝且不写坏原文件（L0-3）
 - `workspaces/<botId>/`：每 bot 隔离工作区，`memory.md` 为其记忆（右栏只读展示）
@@ -187,9 +193,20 @@ npm run regression       # 或 node scripts/regression.mjs
 `server.mjs`，逐项断言后退出：原 26 项覆盖未登录 401、登录、bot CRUD、chat 无 Key 的
 `MODEL_NOT_CONFIGURED`、草案规则兜底全链路、晨间扫描与产物、收件箱、记忆与首页托管；
 L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显全文、测试连接坏端点不崩溃、
-清除恢复未配置），当前共 **30 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
+清除恢复未配置）；L0-3 至 L0-5 续扩至 43 项；P1-1 续扩第 44-46 项覆盖 Finding 只读 API
+（未登录 401、列表结构、不存在 404），当前共 **46 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
 其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
 整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
+
+Finding 存储层的单元测试在 `scripts/test-findings.mjs`（不走 HTTP、不打网络，用临时文件隔离）：
+
+```bash
+cd apps/piper
+npm run test:findings    # 或 node scripts/test-findings.mjs
+```
+
+覆盖写入补齐字段、按 status/repo/botId 过滤、缺 evidenceUrl / 非法 status / 非法 type /
+非法 writeIntent 被拒绝、改状态后去重不再命中、新进程从文件读回（重启不丢）、删除。
 
 ## 实测
 
@@ -369,3 +386,28 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
   未接 P1 的待批事项（仅预留类型）。
 - 截图类验收（通知入口徽标、通知列表观感）本环境做不了（无浏览器工具），以构建 +
   契约证据替代，留待用户本地目检。
+
+### P1-1 Finding 模型与存储实测（2026-11-10，分支 feat/p1-1-finding-model）
+
+- 存储：`lib/findings.mjs` 管 `data/findings.jsonl`（一行一条，现读落盘）。字段按切片表全量落地：
+  id / repo / type（本批只允许 `ci_failed`、`pr_needs_review`）/ subject（去重键，归一为字符串）/
+  title / summary / evidenceUrl（必填且须为 http/https URL）/ suggestedAction /
+  writeIntent（可空；只允许 `pr_comment` + prNumber + body）/ expiresAt / status
+  （open / approved / rejected / expired / executed）/ botId / createdAt / updatedAt。
+  取证字段（repo/type/subject/evidenceUrl/botId）立住后不可改，可改的只有 status 与建议类字段。
+  存储层提供 create / list（按 status/repo/botId 过滤）/ get / update / delete / findOpenFinding
+  （P1-2 去重用）。文件路径可用 `PIPER_FINDINGS_FILE` 覆盖，仅供测试与评测隔离。
+- 接口：`GET /api/findings`（可过滤）、`GET /api/findings/:id`（不存在 404），未登录 401。
+  本切片不改扫描产物格式，日报仍是旧统计形态（改造在 P1-2）。
+- 单元测试：`node scripts/test-findings.mjs` **18/18 通过**（临时文件隔离、不打网络）：
+  合法写入补齐字段、writeIntent 归一、缺/坏 evidenceUrl 被拒、非法 status/type/writeIntent 被拒、
+  三维过滤、改状态、去重命中与关闭后不再命中、删除、以及另起一个 node 进程从同一文件读回
+  已落盘条目（等价进程重启后还在）。
+- 回归：脚本扩展至 46 项，`node scripts/regression.mjs` **46/46 通过**（新增 44-46 为
+  Finding 只读 API 三项）；`npm run check` 无错误。本切片无界面改动，无截图项。
+- 环境备注（如实记录）：首轮回归 42/46，失败的 20/41/42/43 全是依赖活 GitHub API 的扫描项——
+  本机共享出口 IP 的未授权限额被耗尽（`API rate limit exceeded for 104.29.194.34`，core
+  remaining=0），扫描整轮取证失败，与本切片代码无关（本切片未动 scan）。等限额窗口重置后
+  复跑即 46/46。这与 L0-5 记录的同类抖动一致：无令牌回归对共享 IP 限额敏感，连跑需间隔。
+- 明确不做核对：未改扫描算法、未做审批与网关、未做评测夹具（P1-3）、未改 `packages/`、
+  未改 SSE 事件名。

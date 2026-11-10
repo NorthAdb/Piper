@@ -213,6 +213,7 @@ async function main() {
 		await runProfileChecks({ req, check, anon });
 		await runConnectorChecks({ req, check });
 		await runNotificationChecks({ req, check, anon });
+		await runFindingChecks({ req, check, anon });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -487,6 +488,27 @@ async function runNotificationChecks({ req, check, anon }) {
 		failOk && restoreOk,
 		`failOk=${failOk} restoreOk=${restoreOk}`,
 	);
+}
+
+// P1-1（44-46）：Finding 只读 API——未登录 401、列表结构合法（本切片不改扫描，列表可为空）、
+// 不存在的 id 返回 404。存储层校验与持久化由 scripts/test-findings.mjs 覆盖，不在这里重复。
+async function runFindingChecks({ req, check, anon }) {
+	const unauth = await anon("/api/findings");
+	check("未登录 GET /api/findings 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
+
+	const list = await req("/api/findings");
+	check(
+		"GET /api/findings 返回 findings 数组且每条带 evidenceUrl 与合法 status",
+		list.status === 200 &&
+			Array.isArray(list.json?.findings) &&
+			(list.json?.findings ?? []).every(
+				(f) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed"].includes(f.status),
+			),
+		`实际 ${list.status} 条数=${list.json?.findings?.length}`,
+	);
+
+	const missing = await req("/api/findings/f-no-such-id");
+	check("GET /api/findings/:id 不存在返回 404", missing.status === 404, `实际 ${missing.status}`);
 }
 
 main().catch((err) => {

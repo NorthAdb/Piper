@@ -15,6 +15,8 @@
 // GET /api/artifacts 产物列表
 // GET /api/artifacts/:id 产物正文
 // GET /api/approvals 待批收件箱（雏形占位，恒为空数组）
+// GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
+// GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
 // GET /api/settings/model 模型设置读回（configured/baseUrl/modelId/apiKeyHint，绝无 Key 全文）
 // PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除），保存即热生效
@@ -62,6 +64,7 @@ import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extrac
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
 import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings} from "./lib/settings.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
+import { getFinding, listFindings} from "./lib/findings.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
 const TOKEN = process.env.PIPER_TOKEN || "piper-dev";
@@ -268,6 +271,19 @@ const art = readArtifact(artMatch[1]);
 return art? sendJson(res, 200, { artifact: art}): sendJson(res, 404, { error: "产物不存在"});
 }
 if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: []});
+if (path === "/api/findings" && req.method === "GET") {
+const filters = {};
+for (const key of ["status", "repo", "botId"]) {
+const v = url.searchParams.get(key);
+if (v) filters[key] = v;
+}
+return sendJson(res, 200, { findings: listFindings(filters)});
+}
+const findingMatch = path.match(/^\/api\/findings\/([\w-]+)$/);
+if (findingMatch && req.method === "GET") {
+const finding = getFinding(findingMatch[1]);
+return finding? sendJson(res, 200, { finding}): sendJson(res, 404, { error: "Finding 不存在"});
+}
 const memMatch = path.match(/^\/api\/memory\/([\w-]+)$/);
 if (memMatch && req.method === "GET") {
 if (!getBot(memMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});
