@@ -142,7 +142,12 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 - `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
 - `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
 - `settings-github.json`：设置页保存的 GitHub 令牌（明文只存此文件，L0-4；经 `githubToken()` 读取）
-- `notifications.jsonl`：应用内通知一行一条（L0-5），扫描完成 / 整轮失败时写入；`approval.pending` 只预留类型、未写入
+- `notifications.jsonl`：应用内通知一行一条（L0-5），扫描完成 / 整轮失败时写入；P1-6 起
+  `approval.pending`（新待批写操作）、`approval.executed` / `approval.failed`（网关执行结果）真正写入
+- `audit.jsonl`：网关审计一行一条（P1-6，见 `lib/audit.mjs`），只追加：时间、bot、意图摘要
+  （kind / repo / prNumber / 正文长度与脱敏预览，不含任何秘密）、结果
+  （denied / approved / executed / failed / rejected）、原因、关联 Finding、评论链接；
+  `GET /api/audit?findingId=` 可追溯。文件路径可用 `PIPER_AUDIT_FILE` 覆盖（仅供测试隔离）
 - `findings.jsonl`：分诊 Finding 一行一条（P1-1，见 `lib/findings.mjs`）：需要人拍板的事项的结构化对象
   （repo / type / subject 去重键 / evidenceUrl 必填 / suggestedAction / writeIntent / expiresAt /
   status（open|approved|rejected|expired|executed）/ botId），每次读写现读落盘、重启不丢；
@@ -168,7 +173,9 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 `session / delta / tool / system / draft / error / done`；草案卡结构
 `{name, systemPrompt, tools, repos, memoryScope, source}`，经 `POST /api/bots/draft-confirm` 确认才落库；
 `GET /api/approvals` 自 P1-5 起读真实存储：待批项即带 `writeIntent` 的 open/approved
-Finding 的审批视图（不另存一份），`POST /api/approvals/:id/approve|reject` 写回状态。
+Finding 的审批视图（不另存一份）；`POST /api/approvals/:id/approve` 自 P1-6 起批准后
+经薄网关（`lib/gateway.mjs`，默认拒绝、只放行 `pr_comment` 一种写）真正执行，
+`reject` 只改状态不产生写操作。
 定时调度（P1-4）：`server.mjs` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
 （缺省 08:00，时区读基础资料），与手动触发走同一执行函数、同一通知语义；
 只读状态端点 `GET /api/schedule/status` 给出时区、下次运行、上次运行与结果。
@@ -183,7 +190,7 @@ Finding 的审批视图（不另存一份），`POST /api/approvals/:id/approve|
 | 每 bot 独立会话与工作区 | 已实现（sessions/<botId>.jsonl、workspaces/<botId>/） |
 | Routine 示例：晨间只读扫描出拍板清单 + 日报 | 已实现（GitHub 公开 REST；主产物为 Finding（P1-2，响应带 `findings`），日报存 artifacts 且清单在前、观察在后，右栏可读） |
 | 待批收件箱 | 已实现（P1-5：独立整页视图，列表读真实 Finding 存储，批准/驳回写回状态；网关执行在 P1-6） |
-| 不做：权限网关 / 记忆自动沉淀 / 多模型 / 移动端 | 按规格未做；记忆页签只读 |
+| 不做：记忆自动沉淀 / 多模型 / 移动端 | 按规格未做；记忆页签只读。权限网关已由第一件落地为薄网关（P1-6，一种有闸写 + 正负审计） |
 
 实测记录见本文件末尾「实测」节（随提交更新）。
 
@@ -206,7 +213,8 @@ L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显
 （扫描响应带 findings、与只读 API 同一存储）；P1-4 续扩第 49-52 项（调度状态端点 401 与
 结构、schedule 机器可解析且带 nextRunAt）；P1-5 把第 23 项 approvals 断言按切片授权
 改成「来自真实存储且结构合法」口径并续扩第 53-56 项（未登录读写 401、不存在项批准/
-驳回 404、例程与产物带 botId），当前共 **56 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
+驳回 404、例程与产物带 botId）；P1-6 续扩第 57-58 项（审计端点未登录 401、结构与
+按 findingId 过滤），当前共 **58 项**。晨间扫描一项真实调用 GitHub 公开 API（与产品行为一致），
 其余不依赖外网。设置组断言带保护：`data/settings-model.json` 若在运行前已存在（真实配置），
 整组跳过且不覆盖，运行后脚本自建的设置文件会被删除、恢复无文件状态。
 
@@ -228,6 +236,17 @@ npm run test:schedule    # 或 node scripts/test-schedule.mjs
 
 覆盖下一次运行的时区换算、到点只触发一次、失败 15 分钟内补跑 3 次后放弃、补跑成功即停、
 启动补跑（已过点未成功才补）、并发重入返回 busy、skipped 不推进计划、status 形状。
+
+网关另有替身测试 `scripts/test-gateway.mjs`（进程内 fetch 替身 + 临时 findings/audit/
+notifications 文件，不打活网、不对真实仓库发评论）：
+
+```bash
+npm run test:gateway    # 或 node scripts/test-gateway.mjs
+```
+
+覆盖拒绝路径（未批准直调、意图被改、仓库未绑定、不支持的意图、正文含令牌）与执行
+路径（批准恰好发一次、无令牌失败可重试、PR 已关闭保持 approved、写接口失败可重试），
+两类审计齐全性与脱敏，以及源码绕过断言（只有 gateway.mjs 构造评论写端点）。
 
 扫描规则另有替身测试 `scripts/test-scan.mjs`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
 
@@ -577,3 +596,47 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
 - 明确不做核对：未实现任何写仓库操作、未做网关判定；未改 `packages/`、未改 SSE
   事件名、未重做视觉。截图（收件箱空状态、主 bot 右栏隔离）本环境做不了，以构建产物
   文案断言 + 契约回归替代，留待用户本地目检。
+
+### P1-6 薄网关 + PR 评论 + 正负审计实测（2026-11-10，分支 feat/p1-6-gateway-comment）
+
+- 网关：新增 `lib/gateway.mjs`，是 apps/piper 层唯一能对外写副作用的入口，默认拒绝。
+  唯一放行的写意图是 `pr_comment`。批准执行前逐条复检：Finding 存有 writeIntent；
+  请求动作与 Finding.writeIntent 逐字一致（kind / prNumber / body）；种类为 pr_comment；
+  目标仓在 bot 绑定仓内；状态为 approved（未经批准的直调一律 denied/not_approved）；
+  未过期（过期顺手转 expired）；正文不含当前令牌。执行前再复检目标 PR 仍为 open
+  （现查 GitHub）。凭证只经 `githubToken()`（L0-4 唯一入口）；无令牌回
+  failed/no_token，明确失败、绝不假成功。成功后 Finding 转 executed 并返回评论链接；
+  失败（PR 已关闭、写接口报错、无令牌）Finding 保持 approved、原因经审计进入收件箱
+  的 lastError 展示，再次点批准即重试。
+- 数据接线：扫描（P1-2 规则二）自本切片起给 pr_needs_review 附带规则模板 writeIntent
+  （正文即模板评论，扫描本身仍全程只读、不发送）；扫描新开这类 Finding 时服务端逐条
+  写 `approval.pending` 通知。批准成功写 `approval.executed` 通知并落一份
+  `gateway-execution` 审计 artifact（写了什么、评论链接、证据、正文全文，进对应 bot
+  的产物列表）；失败写 `approval.failed` 通知。驳回只改状态 + 审计 rejected，零写调用。
+- 审计：新增 `lib/audit.mjs` 管 `data/audit.jsonl`（只追加）。executed 样例字段：
+  `{ id, ts, botId: "repo-keeper", intent: { kind: "pr_comment", repo: "NorthAdb/LinkForge",
+  prNumber: 42, bodyLength: 48, bodyPreview: "晨间分诊提醒：这个 PR 尚未获得任何批准…" },
+  result: "executed", reason: null, findingId, approvalId（与 findingId 同值）,
+  commentUrl: "https://github.com/NorthAdb/LinkForge/pull/42#issuecomment-4242" }`
+  （此为替身测试中的真实记录形状）。`GET /api/audit?findingId=` 按 Finding 追溯。
+  脱敏实测中抓到一个真问题：意图被拒（正文含令牌）时，审计的 bodyPreview 会把正文里
+  的令牌原样落盘——已在 `summarizeIntent` 里对当前令牌做替换脱敏（bodyLength 仍记
+  原长度），测试断言整个审计文件不含令牌全文。
+- 测试：`node scripts/test-gateway.mjs` **15/15 通过**（fetch 替身计数 + 临时文件，
+  不打活网）。拒绝路径 6 条：未批准直调 denied/not_approved（写 API 0 次）、意图
+  篡改 denied/intent_mismatch、仓库未绑定 denied/repo_not_bound、手写 merge_pr 意图
+  denied/unsupported_intent、正文含令牌 denied/secret_in_body、过期（open 批准回 409
+  且转 expired；approved 过期 denied/expired）。执行路径 5 条：批准恰好发一次且参数
+  （路径 / 正文 / Authorization）与批准内容一致并转 executed、无令牌 failed/no_token
+  后补令牌重试成功、PR 已关闭 failed/pr_not_open 且 lastError 在收件箱可见、写接口
+  500 failed/comment_failed 保持 approved、驳回零调用且已关闭再批准回 409。另有审计
+  字段与脱敏断言、源码绕过断言（lib 与 server 中只有 gateway.mjs 构造 `/comments`
+  写端点；scan / kernel / approvals / findings 无 GitHub POST 写调用）。
+- 回归：脚本扩展至 58 项，`node scripts/regression.mjs` **58/58 通过**（新增 57-58
+  为审计端点 401 与结构/过滤）。同批复跑：test-findings 18/18、test-scan 5/5、
+  test-schedule 12/12、eval:scan 5/5、`npm run check` 无错误、`npm run build:web`
+  成功（bundle 含「批准并执行」）。全部网关测试走替身，未对任何真实仓库发评论——
+  真实写入的验收在 P1-7 试用切片。
+- 明确不做核对：未做打标签 / 合并 PR / 改代码 / 自动合并；未接第二种写意图；网关
+  未打进 `packages/`；未改 SSE 事件名。截图（待批详情）本环境做不了，以替身测试的
+  参数断言 + 审计样例替代，留待 P1-7 真实试用时一并目检。

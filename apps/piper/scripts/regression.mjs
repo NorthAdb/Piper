@@ -242,6 +242,7 @@ async function main() {
 		await runScanFindingChecks({ req, check, run });
 		await runScheduleChecks({ req, check, anon });
 		await runApprovalChecks({ req, check, anon });
+		await runAuditChecks({ req, check, anon });
 	} finally {
 		proc.kill("SIGTERM");
 	}
@@ -623,6 +624,27 @@ async function runApprovalChecks({ req, check, anon }) {
 		(routines.json?.routines ?? []).every((r) => typeof r.botId === "string") &&
 			(artifacts.json?.artifacts ?? []).every((a) => "botId" in a),
 		`routines=${(routines.json?.routines ?? []).length} artifacts=${(artifacts.json?.artifacts ?? []).length}`,
+	);
+}
+
+// P1-6（57-58）：网关审计的只读追溯端点——未登录 401；登录后结构合法且可按 findingId
+// 过滤。网关的拒绝/执行全路径（替身写 API 计数、正负审计）在 scripts/test-gateway.mjs 覆盖，
+// 这里不拿活仓库做写断言。
+async function runAuditChecks({ req, check, anon }) {
+	const unauth = await anon("/api/audit");
+	check("未登录 GET /api/audit 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
+
+	const all = await req("/api/audit");
+	const filtered = await req("/api/audit?findingId=f-no-such-item");
+	check(
+		"GET /api/audit 返回 records 数组（元素带 result 与 ts），按 findingId 过滤不报错",
+		all.status === 200 &&
+			Array.isArray(all.json?.records) &&
+			(all.json?.records ?? []).every((r) => typeof r.result === "string" && typeof r.ts === "string") &&
+			filtered.status === 200 &&
+			Array.isArray(filtered.json?.records) &&
+			(filtered.json?.records ?? []).every((r) => r.findingId === "f-no-such-item"),
+		`实际 all=${all.status}/${all.json?.records?.length} filtered=${filtered.status}/${filtered.json?.records?.length}`,
 	);
 }
 

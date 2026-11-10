@@ -8,6 +8,8 @@
 // 令牌经 lib/settings.mjs 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
 // 本文件不直读环境变量；无令牌走公开限额。单仓失败不中断整体，失败原因写进日报；
 // 全部仓库失败时由调用方判定整轮失败（L0-5 语义，本文件只回 failures/total）。
+// 本文件全程只读，绝不调用任何 GitHub 写接口：pr_needs_review 附带的 writeIntent 只是
+// 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
 import { githubToken } from "./settings.mjs";
 import { createFinding, findOpenFinding } from "./findings.mjs";
 
@@ -84,6 +86,8 @@ async function scanRepo(repo, botId, now) {
 	}
 
 	// 规则二：pr_needs_review。draft 不取审查、直接跳过（也不产生 Finding）。
+	// 附带 writeIntent：建议的写动作是「在该 PR 下发一条规则模板评论」——只是待批参数，
+	// 扫描本身不发送；人在收件箱批准后由网关（P1-6）执行，批不批由人决定。
 	for (const p of data.pulls) {
 		if (p.draft) continue;
 		if (await hasApprovedReview(repo, p.number)) continue;
@@ -98,7 +102,12 @@ async function scanRepo(repo, botId, now) {
 				title: `PR 待审查：#${p.number} ${p.title}（${repo}）`,
 				summary: `PR #${p.number} 由 ${p.user?.login ?? "?"} 于 ${fmtDate(p.created_at)} 打开，尚未获得任何批准（APPROVED）审查。`,
 				evidenceUrl: p.html_url,
-				suggestedAction: "请审查该 PR 并给出结论，或留言跟进。",
+				suggestedAction: "请审查该 PR 并给出结论，或批准收件箱里的模板评论由网关发到 PR 下跟进。",
+				writeIntent: {
+					kind: "pr_comment",
+					prNumber: p.number,
+					body: `晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。\n\n（由 Piper 仓库管家在晨间扫描中生成，经人工批准后由网关发送。）`,
+				},
 				expiresAt: expiresAtFrom(now),
 			}),
 		);

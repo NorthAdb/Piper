@@ -69,14 +69,15 @@ export type ProfileSettings = {
 	timezone: string;
 };
 
-// 应用内通知（GET /api/notifications 的线格式）：approval.pending 仅为预留类型，第一件才真正写入
+// 应用内通知（GET /api/notifications 的线格式）：approval.* 自 P1-6 起真正写入
 export type NotificationEntry = {
 	id: string;
-	type: "routine.completed" | "routine.failed" | "approval.pending";
+	type: "routine.completed" | "routine.failed" | "approval.pending" | "approval.executed" | "approval.failed";
 	title: string;
 	body: string;
 	routineId: string | null;
 	artifactId: string | null;
+	findingId?: string | null;
 	read: boolean;
 	createdAt: string;
 };
@@ -117,6 +118,18 @@ export type Approval = {
 	expiresAt: string | null;
 	createdAt: string;
 	updatedAt: string;
+	// 来自审计（P1-6）：最近一次执行失败原因与已执行的评论链接
+	lastError: string | null;
+	commentUrl: string | null;
+};
+
+// 批准执行的网关结果（POST /api/approvals/:id/approve 的 execution 字段，P1-6）
+export type ApprovalExecution = {
+	ok: boolean;
+	result: string;
+	reason?: string;
+	commentUrl?: string | null;
+	artifactId?: string;
 };
 
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）

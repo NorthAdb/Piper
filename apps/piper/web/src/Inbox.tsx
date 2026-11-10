@@ -1,8 +1,8 @@
-// 待批收件箱（P1-5）：独立整页视图，是「拍板」的主界面——列出带 writeIntent 的待批
-// Finding（类型 / 仓库 / 证据 / 建议 / 完整写参数 / 过期时间），批准 / 驳回写回状态。
-// P1-5 阶段批准只记录决定（状态 approved），不执行任何对外写操作；批准后经网关执行
-// 写入是 P1-6 的接入点，卡面文案如实标注，不声称已发送。
-import { ArrowLeftIcon, CheckIcon, ExternalLinkIcon, InboxIcon, XIcon } from "lucide-react";
+// 待批收件箱（P1-5 独立视图 + P1-6 网关执行）：「拍板」的主界面——列出带 writeIntent
+// 的待批 Finding（类型 / 仓库 / 证据 / 建议 / 完整写参数 / 过期时间）。
+// 批准后经薄网关执行写入（本批唯一写操作：给指定 PR 发模板评论），结果当场可见：
+// 成功给出评论链接；失败保持已批准状态、显示原因、可再次点批准重试。驳回不产生写操作。
+import { ArrowLeftIcon, CheckIcon, ExternalLinkIcon, InboxIcon, RotateCcwIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { approveApproval, listApprovals, rejectApproval, UnauthorizedError } from "./api";
 import { Badge } from "@/components/ui/badge";
@@ -48,8 +48,12 @@ export function Inbox({
 		setNotice("");
 		try {
 			if (action === "approve") {
-				await approveApproval(a.id);
-				setNotice(`已批准「${a.title}」。写入会经网关执行（网关接入后生效），当前尚未向 GitHub 发送任何内容。`);
+				const { execution } = await approveApproval(a.id);
+				if (execution.ok) {
+					setNotice(`已执行「${a.title}」，评论已发到 ${a.repo} 的 PR #${a.writeIntent.prNumber}${execution.commentUrl ? `：${execution.commentUrl}` : ""}`);
+				} else {
+					setNotice(`「${a.title}」已批准但执行未成功（${execution.reason ?? execution.result}），保持已批准状态，可再次点批准重试。`);
+				}
 			} else {
 				await rejectApproval(a.id);
 				setNotice(`已驳回「${a.title}」，不会执行任何写操作。`);
@@ -125,10 +129,15 @@ export function Inbox({
 										</p>
 										<pre className="pt-1.5 font-mono text-xs break-words whitespace-pre-wrap">{a.writeIntent.body}</pre>
 									</div>
+									{a.status === "approved" && a.lastError ? (
+										<p className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm">
+											上次执行未成功：{a.lastError}。问题解决后可再次点「批准」重试。
+										</p>
+									) : null}
 									<div className="flex gap-2">
-										<Button type="button" size="sm" disabled={busyId === a.id || a.status === "approved"} onClick={() => void act(a, "approve")}>
-											<CheckIcon />
-											{a.status === "approved" ? "已批准" : "批准"}
+										<Button type="button" size="sm" disabled={busyId === a.id} onClick={() => void act(a, "approve")}>
+											{a.status === "approved" ? <RotateCcwIcon /> : <CheckIcon />}
+											{a.status === "approved" ? "再次执行" : "批准并执行"}
 										</Button>
 										<Button type="button" size="sm" variant="outline" disabled={busyId === a.id} onClick={() => void act(a, "reject")}>
 											<XIcon />

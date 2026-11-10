@@ -17,9 +17,11 @@
 // 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.mjs）
 // GET /api/artifacts 产物列表
 // GET /api/artifacts/:id 产物正文
-// GET /api/approvals 待批收件箱（P1-5：读真实存储——带 writeIntent 的 open/approved Finding 的审批视图）
-// POST /api/approvals/:id/approve 批准（P1-5 只改状态为 approved，不执行写；网关执行在 P1-6 接入）
+// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved Finding 的审批视图）
+// POST /api/approvals/:id/approve 批准并经薄网关执行（P1-6）：回 { approval, execution }；
+//   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
 // POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
+// GET /api/audit 网关审计记录（可按 findingId 过滤）：denied / approved / executed / failed / rejected
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
@@ -72,6 +74,7 @@ import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
 import { approveApproval, listApprovals, rejectApproval} from "./lib/approvals.mjs";
+import { listAudit} from "./lib/audit.mjs";
 
 const PORT = Number(process.env.PORT || 4310);
 const TOKEN = process.env.PIPER_TOKEN || "piper-dev";
@@ -179,6 +182,10 @@ const repos = bot?.repos?.length? bot.repos: ["NorthAdb/LinkForge", "NorthAdb/Lo
 const routineName = routine?.name?? "晨间仓库扫描";
 try {
 const { artifact, report, failures, total, findings} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
+// 新开的带 writeIntent 的 Finding 即新的待批写操作（P1-6）：逐条写 approval.pending 通知。
+for (const f of findings) {
+if (f.writeIntent) addNotification({ type: "approval.pending", title: `待批写操作：${f.title}`, body: `建议在 ${f.repo} 的 PR #${f.writeIntent.prNumber} 下发表模板评论，请到待批收件箱批准或驳回。证据：${f.evidenceUrl}`, routineId: "morning-scan", artifactId: artifact.id, findingId: f.id});
+}
 if (total > 0 && failures >= total) {
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "failed"});
 addNotification({ type: "routine.failed", title: `${routineName}失败`, body: `${total} 个仓库全部取证失败，详情见日报：${artifact.title}`, routineId: "morning-scan", artifactId: artifact.id});
@@ -336,8 +343,16 @@ return art? sendJson(res, 200, { artifact: art}): sendJson(res, 404, { error: "�
 if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: listApprovals()});
 const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject)$/);
 if (approvalMatch && req.method === "POST") {
-const approval = approvalMatch[2] === "approve"? approveApproval(approvalMatch[1]): rejectApproval(approvalMatch[1]);
+if (approvalMatch[2] === "approve") {
+const out = await approveApproval(approvalMatch[1]);
+return out? sendJson(res, 200, { approval: out.approval, execution: out.execution}): sendJson(res, 404, { error: "待批项不存在"});
+}
+const approval = rejectApproval(approvalMatch[1]);
 return approval? sendJson(res, 200, { approval}): sendJson(res, 404, { error: "待批项不存在"});
+}
+if (path === "/api/audit" && req.method === "GET") {
+const findingId = url.searchParams.get("findingId");
+return sendJson(res, 200, { records: listAudit(findingId? { findingId}: {})});
 }
 if (path === "/api/findings" && req.method === "GET") {
 const filters = {};

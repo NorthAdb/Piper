@@ -1,6 +1,6 @@
 // 设置页「通知」组（L0-5）：应用内通知列表（文件持久化，新在前），可逐条或全部标记已读。
-// 当前来源只有例程：晨间扫描完成写 routine.completed、整轮失败写 routine.failed；
-// approval.pending 是预留类型，第一件接入后才有数据，本组件不造假待批通知。
+// 来源：例程（routine.completed / routine.failed）与待批写操作（approval.pending /
+// approval.executed / approval.failed，P1-6 起真正写入）。
 import { BellRingIcon, CheckCheckIcon, CheckIcon, CircleAlertIcon, CircleCheckIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getNotifications, markNotificationsRead, UnauthorizedError } from "./api";
@@ -13,6 +13,8 @@ const TYPE_META: Record<NotificationEntry["type"], { label: string; icon: typeof
 	"routine.completed": { label: "例程完成", icon: CircleCheckIcon },
 	"routine.failed": { label: "例程失败", icon: CircleAlertIcon },
 	"approval.pending": { label: "待批事项", icon: BellRingIcon },
+	"approval.executed": { label: "写操作已执行", icon: CircleCheckIcon },
+	"approval.failed": { label: "写操作失败", icon: CircleAlertIcon },
 };
 
 export function NotificationsSettings({ onUnauthorized }: { onUnauthorized: () => void }) {
@@ -56,7 +58,7 @@ export function NotificationsSettings({ onUnauthorized }: { onUnauthorized: () =
 						</Button>
 					) : null}
 				</div>
-				<CardDescription>例程完成 / 失败会写到这里（文件持久化，重启不丢）。外部消息渠道不在本批范围，后续作为同一事件的第二个出口。</CardDescription>
+				<CardDescription>例程完成 / 失败、待批写操作的出现与执行结果会写到这里（文件持久化，重启不丢）。外部消息渠道不在本批范围，后续作为同一事件的第二个出口。</CardDescription>
 			</CardHeader>
 			<CardContent>
 				{items === null ? (
@@ -72,7 +74,7 @@ export function NotificationsSettings({ onUnauthorized }: { onUnauthorized: () =
 							const Icon = meta.icon;
 							return (
 								<div key={n.id} className={`flex items-start gap-3 py-3 ${n.read ? "opacity-60" : ""}`}>
-									<Icon className={`mt-0.5 size-4 shrink-0 ${n.type === "routine.failed" ? "text-destructive" : "text-emerald-400"}`} />
+									<Icon className={`mt-0.5 size-4 shrink-0 ${n.type === "routine.failed" || n.type === "approval.failed" ? "text-destructive" : "text-emerald-400"}`} />
 									<div className="min-w-0 flex-1">
 										<div className="flex flex-wrap items-center gap-2">
 											<span className="text-sm font-medium">{n.title}</span>
