@@ -584,6 +584,40 @@ console.log("种子（待批 Finding）已写入");
 	if (!chatClip) throw new Error("找不到左右栏元素，无法截 18 号特写");
 	await shotClip("18-chat-turn-closeup.png", chatClip);
 
+	// 轨迹视图（19/20，feat/trace-view）：主 bot 会话已有两轮带 PR-D 时间字段
+	// 的回合（11 的工具轮 + 15 的分段思考轮）。切到轨迹页：统计（总时长/轮次/
+	// 工具调用）、分段时长条、按轮时间线应齐备，思考行摘要带「挡位 high」。
+	// 断言一律限定在 [data-testid="trace-view"] 内，避免误中被 visibility 隐藏
+	// 的对话窗格 DOM。
+	const traceHas = (text) =>
+		`(() => { const el = document.querySelector('[data-testid="trace-view"]'); return Boolean(el) && (el.textContent || '').includes(${JSON.stringify(text)}); })()`;
+	// 切换不卸载对话状态：先在输入框留一句草案（不发送），切去轨迹再切回，
+	// 草案应仍在（双窗格 visibility 叠放的实现以此断言钉住）。
+	await waitFor(`document.querySelector('textarea') !== null`, "对话输入框出现（轨迹切换前）");
+	await evaluate(`document.querySelector('textarea').focus()`);
+	await cdp("Input.insertText", { text: "草稿不要丢" }, sessionId);
+	await waitFor(`document.querySelector('textarea')?.value.includes('草稿不要丢')`, "草案已输入");
+	await clickText("轨迹");
+	await waitFor(`document.querySelector('[data-testid="trace-bar"]') !== null`, "轨迹页时长条出现", 30000);
+	await waitFor(traceHas("工具调用"), "轨迹页统计出现「工具调用」", 30000);
+	await waitFor(traceHas("第 2 轮"), "轨迹时间线出现第 2 轮", 30000);
+	await waitFor(traceHas("挡位 high"), "轨迹时间线思考行摘要出现「挡位 high」", 30000);
+	await new Promise((r) => setTimeout(r, 800));
+	await shot("19-trace-view.png");
+
+	// 展开一条工具行：参数区（Parameters + 夹具页 URL）应在轨迹视图内出现。
+	await evaluate(
+		`(() => { const root = document.querySelector('[data-testid="trace-view"]'); const btn = [...(root?.querySelectorAll('button') ?? [])].find((b) => (b.textContent || '').includes('web_fetch')); btn?.click(); return Boolean(btn); })()`,
+	);
+	await waitFor(traceHas("Parameters"), "展开工具行出现参数区 Parameters", 30000);
+	await waitFor(traceHas("/page"), "展开工具行参数里出现夹具页 URL", 30000);
+	await new Promise((r) => setTimeout(r, 800));
+	await shot("20-trace-tool-expanded.png");
+
+	// 切回对话：草案仍在输入框里（ChatPane 未卸载的实证）。
+	await clickText("对话");
+	await waitFor(`document.querySelector('textarea')?.value.includes('草稿不要丢')`, "切回对话后草案仍在", 30000);
+
 	console.log(`\n截图完成：${shots.length} 张，目录 ${SCREENS_DIR}`);
 	console.log("注意：脚本不做内容断言，请逐张目检 Key 区为掩码、无真实秘密。");
 } finally {

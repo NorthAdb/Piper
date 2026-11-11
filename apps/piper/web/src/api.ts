@@ -15,6 +15,7 @@ import type {
 	ModelSettingsInput,
 	ProfileSettings,
 	Routine,
+	TraceData,
 } from "./model";
 
 export class UnauthorizedError extends Error {
@@ -68,6 +69,11 @@ export async function confirmDraft(draft: BotDraft): Promise<Bot> {
 
 export async function listMessages(botId: string): Promise<HistoryEntry[]> {
 	return (await api<{ messages: HistoryEntry[] }>(`/api/bots/${botId}/messages`)).messages;
+}
+
+// 轨迹（PR-E）：当前 bot 会话流水的按轮归一化视图，形状见 model.ts 的 TraceData。
+export function getTrace(botId: string): Promise<TraceData> {
+	return api(`/api/bots/${botId}/trace`);
 }
 
 export async function listRoutines(): Promise<Routine[]> {

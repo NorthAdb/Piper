@@ -10,6 +10,7 @@ import { ChatPane } from "./ChatPane";
 import { Desktop } from "./Desktop";
 import { Inbox } from "./Inbox";
 import { Settings } from "./Settings";
+import { TraceView } from "./TraceView";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -28,6 +29,10 @@ export function App() {
 	const [busyBotIds, setBusyBotIds] = useState<ReadonlySet<string>>(new Set());
 	const [form, setForm] = useState<FormState>({ open: false, bot: null });
 	const [view, setView] = useState<"main" | "settings" | "inbox">("main");
+	// 中栏视图（对话 / 轨迹，PR-E）：轨迹窗格首次打开后保持挂载，两个窗格靠
+	// visibility 叠放切换——ChatPane 不卸载，滚动位置与输入草稿不丢。
+	const [paneView, setPaneView] = useState<"chat" | "trace">("chat");
+	const [traceSeen, setTraceSeen] = useState(false);
 	const [settingsTab, setSettingsTab] = useState("model");
 	const [token, setToken] = useState("");
 	const [loginErr, setLoginErr] = useState("");
@@ -176,6 +181,37 @@ export function App() {
 					) : (
 						<span className="text-sm font-medium text-muted-foreground">选择一个 bot 开始对话</span>
 					)}
+					{currentBot ? (
+						<div className="flex h-9 shrink-0 items-center rounded-lg border bg-muted/40 p-1" role="tablist" aria-label="主栏视图切换">
+							<button
+								type="button"
+								role="tab"
+								aria-selected={paneView === "chat"}
+								onClick={() => setPaneView("chat")}
+								className={cn(
+									"flex h-full items-center rounded-md px-3 text-[13px] transition-colors duration-150",
+									paneView === "chat" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+								)}
+							>
+								对话
+							</button>
+							<button
+								type="button"
+								role="tab"
+								aria-selected={paneView === "trace"}
+								onClick={() => {
+									setPaneView("trace");
+									setTraceSeen(true);
+								}}
+								className={cn(
+									"flex h-full items-center rounded-md px-3 text-[13px] transition-colors duration-150",
+									paneView === "trace" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground",
+								)}
+							>
+								轨迹
+							</button>
+						</div>
+					) : null}
 					<Badge variant="outline" className="ml-auto gap-1.5">
 						<span className={cn("size-1.5 rounded-full", modelConfigured ? "bg-emerald-400" : "bg-amber-400")} />
 						{modelConfigured ? "模型已配置" : "未配置模型"}
@@ -185,13 +221,28 @@ export function App() {
 					) : null}
 				</header>
 				{currentBot ? (
-					<ChatPane
-						key={currentBot.id}
-						bot={currentBot}
-						onRunningChange={onRunningChange}
-						onDraftConfirmed={() => void reloadBots()}
-						onUnauthorized={onUnauthorized}
-					/>
+					<div className="relative min-h-0 flex-1">
+						<div
+							className={cn("absolute inset-0 flex flex-col", paneView === "chat" ? "visible" : "invisible")}
+							aria-hidden={paneView !== "chat"}
+						>
+							<ChatPane
+								key={currentBot.id}
+								bot={currentBot}
+								onRunningChange={onRunningChange}
+								onDraftConfirmed={() => void reloadBots()}
+								onUnauthorized={onUnauthorized}
+							/>
+						</div>
+						{traceSeen ? (
+							<div
+								className={cn("absolute inset-0 flex flex-col", paneView === "trace" ? "visible" : "invisible")}
+								aria-hidden={paneView !== "trace"}
+							>
+								<TraceView key={currentBot.id} bot={currentBot} onUnauthorized={onUnauthorized} />
+							</div>
+						) : null}
+					</div>
 				) : null}
 			</main>
 
