@@ -1733,3 +1733,50 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
   本轮未改任何文案与语义）。
 - 明确不做：未改任何 API、SSE 事件、路由与数据逻辑；未动右栏结构与
   对话区组件；未改 `packages/`；未加新依赖；未引入浅色模式。
+
+### 右栏桌面区重构实测（2026-11-11，分支 feat/ui-desktop-panel）
+
+视觉优化轮第二个 PR：只重构右栏「bot 桌面区」（`web/src/Desktop.tsx`）的
+呈现层，站在视觉基线（feat/ui-foundation）之上：zinc 灰阶 + 发丝边框 +
+唯一 Pied Piper 绿，层级靠明度与留白，黑名单不变。数据来源、API、交互
+语义（页签切换、例程立即运行、产物展开、记忆刷新）全部原样。
+
+- 栏头与页签：标题改「bot 名（semibold）+ 的桌面（弱化）」的两段层级，
+  内边距统一 16px 基准（px-4）；三页签在本组件内覆写 shadcn Tabs 为
+  分段控件——发丝边框容器（bg-background/40）+ 激活态靠 sidebar-accent
+  明度差、无阴影、150ms 只动颜色；例程/产物页签带计数小字（tabular-nums）。
+  设置页共用的 ui/tabs.tsx 未动，覆写只在本组件 className 层（dark: 变体
+  与组件默认同特异性，靠 cn 合并顺序胜出）。
+- 例程页：条目改规整行卡（rounded-lg border bg-card，px-4 py-3.5）——
+  首行名称 + 状态（去掉描边彩色 Badge，改 1.5px 圆点 + 原文：ok 绿点、
+  其余 destructive 点），描述 13px 弱化行，元信息一行流式排布（计划带
+  CalendarClock 图标、上次运行、下次运行）；「立即运行」按钮行为不变。
+  空状态改居中构图：描边圆 + CalendarClock 弱化图标 + 既有文案「该 bot
+  暂无例程」（无现成创建入口，未发明新功能、未加按钮）。
+- 产物页：列表改两行式行卡——按 kind 取 lucide 图标（morning-scan /
+  morning-report 日报 → Newspaper、note → StickyNote、report → FileText、
+  其余 → File），首行标题、次行「kind · 日期」（tabular-nums）；选中/悬停
+  态沿用 sidebar-accent。空状态同构图（FileText 图标 + 既有文案）。产物
+  元数据无大小字段，未编造，只用 kind 与 createdAt。详情 Artifact 组件未动。
+- 记忆页：分组小标题与左栏 BOTS 微标签对齐（11px 大写 tracking 0.08em）；
+  「Bot 记忆（只读）」拆为标题「Bot 记忆」+ 锁图标「只读」弱化标注（词
+  不变、形态变）；正文 pre 补 leading-relaxed；「关于我」为空时原先渲染
+  空框，现补占位文案「（暂无「关于我」）」（本轮唯一新增文案）。长文仍是
+  max-h-72 滚动（全局细滚动条），展开/刷新交互未动。
+- 滚动与骨架：右栏滚动区仍为 Radix ScrollArea（滑块 bg-border 白 8%，
+  与基线细滚动条同口径），记忆 pre 的原生滚动走全局细滚动条；栏宽
+  360px 与 border-l 分隔线在 App.tsx，本轮未动。
+- 构建与回归：`npm run test` 聚合退出码 0（build:web、check 过）：
+  findings 27、scan 10、pr-review 16、schedule 14、gateway 27、recovery 7、
+  listen 9、badtz 4、secrets 21、model-stub 10、model-providers 57、r10 22、
+  webfetch 48、eval:scan 21、regression 72，与基线逐项一致（纯视觉改动）。
+- 截图：全套 17 张复跑；右栏相关 01（空状态新构图）、02（例程行卡）、
+  03（产物两行行卡 + 日报图标）、16（全景）更新，新增
+  `17-desktop-panel-closeup.png`（右栏顶部裁剪特写：标题 + 分段页签 +
+  例程行卡；shots.mjs 新增 shotClip 裁剪辅助与该步）。其余图字节变化为
+  种子随机端口/时间戳抖动，逐张目检形态无回归、无真实秘密。记忆页签在
+  既有 shots 套件中无专门图号（存量缺口），本轮改动为 class 层，未新增
+  其截图。
+- 明确不做：未改任何 API、SSE、数据结构与业务逻辑；未改 ui/tabs.tsx
+  等共用组件；未改 `packages/`；未加新依赖；除上述标注的一句占位文案
+  外未动文案。

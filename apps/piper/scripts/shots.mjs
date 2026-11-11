@@ -360,6 +360,15 @@ async function shot(fileName) {
 	console.log(`已截图：docs/screens/${fileName}`);
 }
 
+// 局部裁剪截图（17 号右栏特写用）：clip 为视口 CSS 像素坐标。
+async function shotClip(fileName, clip) {
+	const { data } = await cdp("Page.captureScreenshot", { format: "png", clip: { ...clip, scale: 1 } }, sessionId);
+	mkdirSync(SCREENS_DIR, { recursive: true });
+	writeFileSync(join(SCREENS_DIR, fileName), Buffer.from(data, "base64"));
+	shots.push(fileName);
+	console.log(`已截图：docs/screens/${fileName}`);
+}
+
 try {
 	await waitReady();
 	sessionId = await connectCdp();
@@ -381,6 +390,10 @@ try {
 	await clickText("仓库管家", { maxX: 264 });
 	await waitFor(bodyHas("晨间仓库扫描"), "仓库管家右栏出现晨间扫描例程");
 	await shot("02-main-repo-keeper-desktop.png"); // 选中仓库管家：右栏有晨间扫描例程
+	// 右栏特写（feat/ui-desktop-panel）：裁右栏顶部——标题、分段页签与例程行卡。
+	const panelClip = await evaluate(`(() => { const el = document.querySelectorAll('aside')[1]; if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x, y: 0, width: r.width, height: 460 }; })()`);
+	if (!panelClip) throw new Error("找不到右栏元素，无法截 17 号特写");
+	await shotClip("17-desktop-panel-closeup.png", panelClip);
 	await clickText("产物", { minX: 1080 });
 	await waitFor(bodyHas("晨间仓库日报"), "仓库管家产物列表出现日报");
 	await shot("03-main-repo-keeper-artifacts.png");
