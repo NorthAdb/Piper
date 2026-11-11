@@ -1,11 +1,11 @@
 // 模型服务商目录：派生自 Pi 基座 pi-ai 的内置目录，不再手写名单。
 //
-// 派生方式（与 lib/kernel.mjs 同一懒加载口径）：动态 import 基座
+// 派生方式（与 lib/kernel.ts 同一懒加载口径）：动态 import 基座
 // packages/ai/dist/providers/all.js，用 builtinProviders() 枚举服务商
 // （id / name / baseUrl），用 getBuiltinModels(id) 取该服务商的 chat 模型。
 //
 // 筛选口径（内核兼容性）：Piper 内核只用 pi-ai 的 openAICompletionsApi 建
-// provider、模型 api 恒为 "openai-completions"（见 lib/kernel.mjs），所以：
+// provider、模型 api 恒为 "openai-completions"（见 lib/kernel.ts），所以：
 //   - 服务商至少要有一个 api === "openai-completions" 的 chat 模型；
 //   - 目录里该服务商的模型名单只含这类模型（混合 api 的服务商只列兼容子集）；
 //   - baseUrl 取兼容子集第一个模型的 baseUrl，且必须非空（azure 的兼容模型
@@ -23,15 +23,15 @@
 //
 // 本模块还提供 fetchUpstreamModels：设置页填了端点与 Key 后从端点
 // GET {baseUrl}/models 拉取真实模型名单。Key 的使用守卫在 server 路由层
-// （缺省 Key 只许复用到与已保存配置完全一致的端点，见 server.mjs 的
+// （缺省 Key 只许复用到与已保存配置完全一致的端点，见 server.ts 的
 // fetch-models 路由）；本函数只负责带 Key 出站与解析，错误文本一律脱敏、
 // 不带 Key。
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { APP_DIR } from "./store.mjs";
-import { THINKING_LEVELS } from "./settings.mjs";
-import { redact, REDACTED } from "./redact.mjs";
+import { APP_DIR } from "./store.js";
+import { THINKING_LEVELS } from "./settings.js";
+import { redact, REDACTED } from "./redact.js";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
 
@@ -42,7 +42,7 @@ export const CUSTOM_PROVIDER = { id: "custom", name: "自定义端点", baseUrl:
 let catalogPromise = null;
 // 目录原始模型索引（providerId -> Map(modelId -> pi-ai Model)）：只含兼容子集，
 // 供内核按 (provider, modelId) 取回原始 Model（reasoning / thinkingLevelMap 是
-// pi-ai 做挡位吸附与厂商参数翻译的依据，见 lib/kernel.mjs）。
+// pi-ai 做挡位吸附与厂商参数翻译的依据，见 lib/kernel.ts）。
 let catalogModelIndex = new Map();
 
 async function buildCatalog() {

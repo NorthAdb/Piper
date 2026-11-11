@@ -121,8 +121,8 @@ const files = readdirSync(FIXTURE_DIR).filter((f) => f.endsWith(".json")).sort()
 const caseResults = [];
 
 try {
-	const { runMorningScan } = await import("../lib/scan.mjs");
-	const { listFindings } = await import("../lib/findings.mjs");
+	const { runMorningScan } = await import("../dist/lib/scan.js");
+	const { listFindings } = await import("../dist/lib/findings.js");
 	const { writeFileSync } = await import("node:fs");
 
 	for (const file of files) {

@@ -5,7 +5,7 @@
 // 文件路径可用环境变量 PIPER_FINDINGS_FILE 覆盖（仅供单元测试 / 评测隔离数据，缺省走 data/）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData, writeFileAtomicSync } from "./store.mjs";
+import { DATA_DIR, ensureData, writeFileAtomicSync } from "./store.js";
 
 export const FINDING_TYPES = ["ci_failed", "pr_needs_review"];
 export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed", "executing"];

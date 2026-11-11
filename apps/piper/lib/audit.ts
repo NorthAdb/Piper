@@ -6,8 +6,8 @@
 // 文件路径可用环境变量 PIPER_AUDIT_FILE 覆盖（仅供单元测试隔离，缺省走 data/）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData } from "./store.mjs";
-import { redact } from "./redact.mjs";
+import { DATA_DIR, ensureData } from "./store.js";
+import { redact } from "./redact.js";
 
 // executing（R1）：网关领取执行、真正发出评论之前先落一条，进程崩溃后能看到「发到一半」。
 // expired（R5）：扫描前对账把失效的 open/approved Finding 自动退役时落一条，
@@ -19,7 +19,7 @@ function auditFile() {
 }
 
 // 意图摘要：正文只留长度与前 120 字符预览（收件箱里有全文，审计是追责用的摘要）。
-// 脱敏是硬要求：预览先经统一 redact（lib/redact.mjs，覆盖当前/历史令牌、模型 Key 与
+// 脱敏是硬要求：预览先经统一 redact（lib/redact.ts，覆盖当前/历史令牌、模型 Key 与
 // 前缀模式）再落盘——审计文件本身绝不能成为秘密的第二个落点。R7 前这里只替换当前
 // GitHub 令牌，旧令牌与模型 Key 都漏（审计 M4）。
 export function summarizeIntent(intent) {

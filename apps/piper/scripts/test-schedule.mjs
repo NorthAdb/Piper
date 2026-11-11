@@ -12,7 +12,7 @@ import { join } from "node:path";
 const tmp = mkdtempSync(join(tmpdir(), "piper-schedule-"));
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 
-const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../lib/schedule.mjs");
+const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../dist/lib/schedule.js");
 
 const results = [];
 let seq = 0;

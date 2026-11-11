@@ -47,6 +47,7 @@ console.log(`使用 Chromium：${chromeBin}`);
 
 // ---- 构建前端（public/ 是构建产物，截图必须对着最新构建） ----
 execFileSync("npm", ["run", "build:web"], { cwd: APP_DIR, stdio: "inherit" });
+execFileSync("npm", ["run", "build:server"], { cwd: APP_DIR, stdio: "inherit" });
 
 // ---- 隔离目录与种子 ----
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-shots-"));
@@ -164,7 +165,7 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 await new Promise((r) => shotsModelStub.listen(0, "127.0.0.1", r));
 const SHOTS_MODEL_BASE = `http://127.0.0.1:${shotsModelStub.address().port}/v1`;
 
-const libUrl = (name) => `file://${join(APP_DIR, "lib", name)}`;
+const libUrl = (name) => `file://${join(APP_DIR, "dist", "lib", name.replace(/\.mjs$/, ".js"))}`;
 runSeed(`
 import { ensureData, saveArtifact, updateRoutine } from "${libUrl("store.mjs")}";
 import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
@@ -212,7 +213,7 @@ const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
 const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE, PIPER_WEB_FETCH_TEST_ALLOW: `127.0.0.1:${FIXTURE_PORT}`, PIPER_TEST_MODE: "1" };
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
-const serverProc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+const serverProc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 let serverLog = "";
 serverProc.stdout.on("data", (d) => (serverLog += d));
 serverProc.stderr.on("data", (d) => (serverLog += d));

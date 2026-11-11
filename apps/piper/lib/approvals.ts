@@ -1,8 +1,8 @@
 // 待批收件箱（P1-5 读模型 + P1-6 批准执行 + R1 返工）：待批项不是另一份存储——它就是带
-// writeIntent 的 Finding 的审批视图。Finding 是唯一事实源（lib/findings.mjs），本模块
+// writeIntent 的 Finding 的审批视图。Finding 是唯一事实源（lib/findings.ts），本模块
 // 负责读模型整形、批准/驳回的状态迁移；过期清理由显式步骤触发（见 sweepExpiredFindings）；
-// 批准后经 lib/gateway.mjs 执行写入
-//（本模块不直接调用任何 GitHub 写接口）。审计（lib/audit.mjs）记录 approved /
+// 批准后经 lib/gateway.ts 执行写入
+//（本模块不直接调用任何 GitHub 写接口）。审计（lib/audit.ts）记录 approved /
 // rejected / 以及网关的 denied / executing / executed / failed，收件箱据审计展示最近失败原因。
 // 执行失败时 Finding 保持 approved：错误经 lastError 展示，再次点批准即重试。
 // R1：批准动作先落一条 append-only 批准记录（data/approvals.jsonl）——批准时刻的意图
@@ -12,11 +12,11 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getFinding, listFindings, updateFinding } from "./findings.mjs";
-import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.mjs";
-import { gatewayExecuteWrite } from "./gateway.mjs";
-import { addNotification } from "./notify.mjs";
-import { DATA_DIR, ensureData, saveArtifact } from "./store.mjs";
+import { getFinding, listFindings, updateFinding } from "./findings.js";
+import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.js";
+import { gatewayExecuteWrite } from "./gateway.js";
+import { addNotification } from "./notify.js";
+import { DATA_DIR, ensureData, saveArtifact } from "./store.js";
 
 function conflict(message) {
 	return Object.assign(new Error(message), { status: 409 });
@@ -117,7 +117,7 @@ export function recoverInterruptedExecutions({ now = new Date(), olderThanMs = E
 
 // 过期清理：open 且 expiresAt 已过的 Finding 转 expired。R10 起 GET 读路径不再顺带
 // 做这件事（读接口无写副作用）——只由显式步骤调用：晨间扫描开始前、调度周期 tick
-// （server.mjs 每 30 秒）、以及批准/驳回的写路径（requireApprovable）。approved 的
+// （server.ts 每 30 秒）、以及批准/驳回的写路径（requireApprovable）。approved 的
 // 过期由网关执行前复检处理，不在这里悄悄改状态。
 export function sweepExpiredFindings(now = new Date()) {
 	let swept = 0;

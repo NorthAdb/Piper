@@ -3,7 +3,7 @@
 // 进入拍板清单的规则是程序化的（本批就这两条，不要临时扩种类）：
 //   ci_failed：按工作流分别取各自在默认分支上最新一条已结束（status=completed）的 run，
 //   仅 conclusion 为 failure 才开单（cancelled/timed_out/startup_failure 不报、不回溯）；
-//   pr_needs_review：open、非 draft、且按「已批准」锁定语义（lib/pr-review.mjs：每位审查人
+//   pr_needs_review：open、非 draft、且按「已批准」锁定语义（lib/pr-review.ts：每位审查人
 //   最新一条为准、陈旧批准不算数）仍待审的 PR。
 // 取证完整性（R6）：pulls/reviews/runs 都翻页取尽（各自有上限，触顶时日报写明「仅检查
 // 前 N 条」）；一个仓的全部取证先完成，再统一计算、统一落盘——任一环节失败整仓不开
@@ -17,17 +17,17 @@
 // 或同工作流 CI 已转绿/已被新失败 run 取代的，自动转 expired 并写审计 reconciled:<原因>，
 // 退出待批。建议先用规则模板，不上模型润色，
 // 模型不得发明 GitHub 上不存在的 PR 或 CI（后续步骤若引入模型写建议，同样受此约束）。
-// 令牌经 lib/settings.mjs 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
+// 令牌经 lib/settings.ts 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
 // 本文件不直读令牌环境变量；无令牌走公开限额。API 基址缺省 https://api.github.com，
 // 可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归用本地 GitHub 桩，全程离线、结果确定）。
 // 单仓失败不中断整体，失败原因写进日报；
 // 全部仓库失败时由调用方判定整轮失败（L0-5 语义，本文件只回 failures/total）。
 // 本文件全程只读，绝不调用任何 GitHub 写接口：pr_needs_review 附带的 writeIntent 只是
 // 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
-import { githubToken } from "./settings.mjs";
-import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.mjs";
-import { evaluateReviews, prNeedsReview } from "./pr-review.mjs";
-import { appendAudit } from "./audit.mjs";
+import { githubToken } from "./settings.js";
+import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.js";
+import { evaluateReviews, prNeedsReview } from "./pr-review.js";
+import { appendAudit } from "./audit.js";
 
 function ghBase() {
 	return (process.env.PIPER_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
@@ -45,7 +45,7 @@ async function gh(path) {
 // 翻页取尽（R6）：按 per_page 逐页拉，直到某页不满 per_page 为止；累计到 maxItems
 // 且最后一页仍满页时记 truncated（调用方在日报写明「仅检查前 N 条」）。
 // extract 把响应体映射成数组（runs 接口是 { workflow_runs: [...] } 包装）。
-// 本函数与上限表同时供 lib/gateway.mjs 复检取 reviews 使用（F2，第二轮返工）：
+// 本函数与上限表同时供 lib/gateway.ts 复检取 reviews 使用（F2，第二轮返工）：
 // 扫描与网关共用同一套翻页口径，不各写一份。
 export const PAGE_CAPS = {
 	pulls: { perPage: 100, maxItems: 200 },

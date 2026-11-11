@@ -7,7 +7,7 @@
 //   F5①：跨审查人——A 批准、B 最新为 CHANGES_REQUESTED → 仍待审（changes_requested）。
 //   陈旧批准不变：最新一条 APPROVED 的 commit_id 与当前 head 不一致 → stale_approval；
 //   head 缺失（null/undefined）时不判陈旧、按未变处理（F5 末段，审计已同意保留）。
-import { evaluateReviews } from "../lib/pr-review.mjs";
+import { evaluateReviews } from "../dist/lib/pr-review.js";
 
 const results = [];
 let seq = 0;

@@ -36,7 +36,7 @@ function baseEnv(port) {
 }
 
 function startServer(env) {
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let out = "";
 	proc.stdout.on("data", (d) => (out += d));
 	proc.stderr.on("data", (d) => (out += d));

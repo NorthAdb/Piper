@@ -8,7 +8,7 @@
 //   - 条目自带 ts 是 appendSession 的落盘戳（ISO 字符串；落盘戳引入前的极
 //     老文件可能没有）——解析得出的是真实记录时刻，不是编造。
 //   - startedAt/endedAt/durationMs 是 PR-D 起新落盘的事件时刻（epoch 毫秒
-//     数，见 server.mjs handleChat 的落盘字段）。
+//     数，见 server.ts handleChat 的落盘字段）。
 //   - 事件时刻 ts：tool 取 startedAt、thinking 取段首 startedAt（事件真正
 //     发生的时刻，比回合末尾的落盘戳更适合画时间线），缺失回落条目 ts；
 //     其余种类取条目 ts。无任何证据（字段缺失或解析不出）一律 null，不拿
@@ -19,7 +19,7 @@
 // 出参脱敏：正文预览过 redact() 后截断（落盘时已脱敏，这里是接口层兜底，
 // 老文件里的未脱敏文本不出接口）；tool 的 args/result 沿用落盘的已脱敏
 // 版本，再过一遍 redactDeep 兜底，不在接口层产生任何新明文。
-import { redact, redactDeep } from "./redact.mjs";
+import { redact, redactDeep } from "./redact.js";
 
 const PREVIEW_MAX_CHARS = 200;
 

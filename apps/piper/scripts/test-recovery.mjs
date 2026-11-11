@@ -67,7 +67,7 @@ const stubPort = stub.address().port;
 function startPiper() {
 	const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: DATA_DIR, PIPER_GITHUB_API_BASE: `http://127.0.0.1:${stubPort}`, PIPER_TOKEN: TOKEN, GITHUB_TOKEN: "stub-gh-token" };
 	delete env.PIPER_HOST;
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let out = "";
 	proc.stdout.on("data", (d) => (out += d));
 	proc.stderr.on("data", (d) => (out += d));

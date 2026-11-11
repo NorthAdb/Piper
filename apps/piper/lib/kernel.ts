@@ -25,11 +25,11 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { isThinkingLevel, readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.mjs";
-import { getCatalogModel, resolveModelProviderId } from "./model-providers.mjs";
-import { webFetch, webSearch } from "./webfetch.mjs";
-import { redact } from "./redact.mjs";
-import { APP_DIR } from "./store.mjs";
+import { isThinkingLevel, readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.js";
+import { getCatalogModel, resolveModelProviderId } from "./model-providers.js";
+import { webFetch, webSearch } from "./webfetch.js";
+import { redact } from "./redact.js";
+import { APP_DIR } from "./store.js";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
 

@@ -24,7 +24,7 @@ function check(name, ok, detail = "") {
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
-const { isBlockedAddress, webFetch, buildFetchRequestOptions, WEB_FETCH_TIMEOUT_MS, WEB_FETCH_MAX_DOWNLOAD_BYTES } = await import("../lib/webfetch.mjs");
+const { isBlockedAddress, webFetch, buildFetchRequestOptions, WEB_FETCH_TIMEOUT_MS, WEB_FETCH_MAX_DOWNLOAD_BYTES } = await import("../dist/lib/webfetch.js");
 
 // ---------- 1. 地址判定表 ----------
 const blockedIps = ["127.0.0.1", "127.1.2.3", "0.0.0.0", "10.0.0.1", "10.255.255.255", "172.16.0.1", "172.31.255.255", "192.168.1.1", "169.254.169.254", "169.254.0.1", "100.64.0.1", "224.0.0.1", "::1", "::", "fe80::1", "febf::ffff", "fc00::1", "fd12:3456::1", "ff02::1", "::ffff:127.0.0.1", "::ffff:8.8.8.8".replace("8.8.8.8", "10.0.0.9")];
@@ -450,7 +450,7 @@ const env = {
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
 for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
-const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 let serverLog = "";
 proc.stdout.on("data", (d) => (serverLog += d));
 proc.stderr.on("data", (d) => (serverLog += d));
@@ -659,7 +659,7 @@ try {
 	let directErr = "";
 	try {
 		process.env.PIPER_DATA_DIR = TMP_DATA;
-		const { webToolsForBot } = await import("../lib/kernel.mjs");
+		const { webToolsForBot } = await import("../dist/lib/kernel.js");
 		directToolNames = webToolsForBot({ id: "piper-main" }).map((t) => t.name);
 	} catch (e) {
 		directErr = String(e?.message ?? e);

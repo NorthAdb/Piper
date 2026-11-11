@@ -24,10 +24,10 @@ function check(name, ok, detail = "") {
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
-const { createFinding, updateFinding, getFinding } = await import("../lib/findings.mjs");
-const { listApprovals, getApproval, sweepExpiredFindings } = await import("../lib/approvals.mjs");
-const { listConnectors, saveProfileSettings } = await import("../lib/settings.mjs");
-const { saveArtifact, listArtifacts, readArtifact } = await import("../lib/store.mjs");
+const { createFinding, updateFinding, getFinding } = await import("../dist/lib/findings.js");
+const { listApprovals, getApproval, sweepExpiredFindings } = await import("../dist/lib/approvals.js");
+const { listConnectors, saveProfileSettings } = await import("../dist/lib/settings.js");
+const { saveArtifact, listArtifacts, readArtifact } = await import("../dist/lib/store.js");
 
 const findingsFile = join(TMP_DATA, "findings.jsonl");
 const noTmpResidue = (dir) => readdirSync(dir).every((f) => !f.includes(".tmp-"));
@@ -100,7 +100,7 @@ function startServer(port) {
 		PIPER_GITHUB_API_BASE: "http://127.0.0.1:9",
 	};
 	delete env.PIPER_HOST;
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let out = "";
 	proc.stdout.on("data", (d) => (out += d));
 	proc.stderr.on("data", (d) => (out += d));

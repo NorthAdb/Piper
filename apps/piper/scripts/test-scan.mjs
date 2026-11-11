@@ -65,8 +65,8 @@ function installStub(scenario) {
 const saveArtifactStub = ({ title }) => ({ id: "stub-artifact", title });
 
 try {
-	const { runMorningScan } = await import("../lib/scan.mjs");
-	const findingsMod = await import("../lib/findings.mjs");
+	const { runMorningScan } = await import("../dist/lib/scan.js");
+	const findingsMod = await import("../dist/lib/findings.js");
 
 	// ---- 场景 A：失败 CI（中间夹一条进行中与一条别分支失败）+ 待审 PR + draft PR ----
 	process.env.PIPER_FINDINGS_FILE = join(tmp, "a.jsonl");

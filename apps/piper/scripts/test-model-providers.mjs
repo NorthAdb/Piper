@@ -80,8 +80,8 @@ const STUB_V1 = `${STUB_BASE}/v1`;
 const modelsHitCount = () => stubHits.filter((h) => h.path === "/v1/models").length;
 
 async function unitPart() {
-	const mp = await import("../lib/model-providers.mjs");
-	const settings = await import("../lib/settings.mjs");
+	const mp = await import("../dist/lib/model-providers.js");
+	const settings = await import("../dist/lib/settings.js");
 
 	check(
 		"lib 导出 loadModelProviders 与 fetchUpstreamModels（目录改为异步派生 + 拉取函数）",
@@ -271,7 +271,7 @@ async function waitReady(proc, port, timeoutMs = 20000) {
 function startServer(port, dataDir) {
 	const env = { ...process.env, PORT: String(port), PIPER_TOKEN: "providers-test-token", PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: "http://127.0.0.1:9" };
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN", "PIPER_HOST"]) delete env[k];
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let log = "";
 	proc.stdout.on("data", (d) => (log += d));
 	proc.stderr.on("data", (d) => (log += d));

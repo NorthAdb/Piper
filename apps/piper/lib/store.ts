@@ -10,9 +10,21 @@ import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { redact } from "./redact.mjs";
+import { redact } from "./redact.js";
 
-export const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
+// 应用根目录（apps/piper）：本文件在源码布局下位于 lib/、构建后位于 dist/lib/，
+// 两处到应用根的层数不同，固定层数推导必然有一处错位——改为从本文件目录向上
+// 逐级找 package.json 所在目录（apps/piper/package.json 先于仓库根命中）。
+function findAppDir() {
+	let dir = dirname(fileURLToPath(import.meta.url));
+	for (;;) {
+		if (existsSync(join(dir, "package.json"))) return dir;
+		const parent = dirname(dir);
+		if (parent === dir) throw new Error("无法定位 Piper 应用根目录（向上未找到 package.json）");
+		dir = parent;
+	}
+}
+export const APP_DIR = findAppDir();
 // 数据目录：缺省 apps/piper/data；可用 PIPER_DATA_DIR 覆盖（相对路径按进程 cwd 解析）。
 // R4 起所有测试/回归脚本都经它指向临时目录，与用户真实 data/ 完全隔离。
 export const DATA_DIR = process.env.PIPER_DATA_DIR ? resolve(process.env.PIPER_DATA_DIR) : join(APP_DIR, "data");

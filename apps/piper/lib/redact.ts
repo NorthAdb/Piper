@@ -12,12 +12,12 @@
 //      常见令牌前缀（ghp_/gho_/ghu_/ghs_/ghr_/github_pat_/sk- 家族）同样替换。
 // 本模块绝不把秘密写进任何日志；收集只在内存里进行。
 //
-// 实现说明：秘密来源直接读设置文件（文件名与 lib/settings.mjs 的定义保持一致，
-// 那里是设置文件的属主），不 import settings.mjs——store/settings/redact 三者存在
+// 实现说明：秘密来源直接读设置文件（文件名与 lib/settings.ts 的定义保持一致，
+// 那里是设置文件的属主），不 import settings.ts——store/settings/redact 三者存在
 // 互相引用，经 settings 读会形成循环 import 并在模块求值期撞上 TDZ。
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR } from "./store.mjs";
+import { DATA_DIR } from "./store.js";
 
 export const REDACTED = "[REDACTED]";
 
@@ -68,8 +68,8 @@ export function redact(text) {
 }
 
 // 结构化字段的深脱敏：逐个字符串过 redact()，非字符串原样保留。会话 tool
-// 条目的 args/result 落盘前在 server.mjs 里有一份同口径的本地实现；轨迹接口
-// 出参（lib/trace.mjs）用这一份，对老文件里未脱敏的结构化字段兜底。
+// 条目的 args/result 落盘前在 server.ts 里有一份同口径的本地实现；轨迹接口
+// 出参（lib/trace.ts）用这一份，对老文件里未脱敏的结构化字段兜底。
 export function redactDeep(value) {
 	if (typeof value === "string") return redact(value);
 	if (Array.isArray(value)) return value.map(redactDeep);

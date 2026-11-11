@@ -12,7 +12,7 @@
 // DELETE /api/bots/:id 删除 bot（主 bot 不可删）
 // POST /api/bots/draft-confirm {draft} 草案卡确认落库（未确认不落库）
 // GET /api/bots/:id/messages 该 bot 的会话流水（JSONL 读出）
-// GET /api/bots/:id/trace 轨迹数据（PR-D，lib/trace.mjs）：会话流水按轮归一化为
+// GET /api/bots/:id/trace 轨迹数据（PR-D，lib/trace.ts）：会话流水按轮归一化为
 //   {turns:[{index,startedAt,endedAt,durationMs,events}]}，时间统一 epoch 毫秒、
 //   无证据为 null；bot 不存在回 404（与 /api/memory/:botId 同口径）
 // GET /api/about-me 账号级「关于我」全文
@@ -21,7 +21,7 @@
 // POST /api/routines/morning-scan/run 手动跑晨间扫描，生成日报产物（与定时触发同一执行函数；正在运行时回 409）
 // GET /api/schedule/status 定时调度只读状态（时区、下次运行、上次运行/结果、是否运行中、补跑次数）
 // 定时（P1-4）：进程内调度，默认每天 08:00（routines.schedule 的 "HH:MM"），时区读基础资料；
-// 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.mjs）
+// 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.ts）
 // GET /api/artifacts 产物列表（支持 ?botId= 按 bot 过滤，桌面产物走服务端过滤，R10）
 // GET /api/artifacts/:id 产物正文
 // GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved/executing Finding 的审批视图，含 approvalId 与 intentHash）；纯读无写副作用，过期清理由扫描开始与调度周期显式执行（R10）
@@ -87,18 +87,18 @@ saveArtifact,
 listArtifacts,
 readArtifact,
 readBotMemory,
-} from "./lib/store.mjs";
-import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.mjs";
-import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
-import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.mjs";
-import { redact } from "./lib/redact.mjs";
-import { buildTrace} from "./lib/trace.mjs";
-import { runMorningScan} from "./lib/scan.mjs";
-import { getFinding, listFindings} from "./lib/findings.mjs";
-import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
-import { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.mjs";
-import { listAudit} from "./lib/audit.mjs";
+} from "./lib/store.js";
+import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.js";
+import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.js";
+import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.js";
+import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.js";
+import { redact } from "./lib/redact.js";
+import { buildTrace} from "./lib/trace.js";
+import { runMorningScan} from "./lib/scan.js";
+import { getFinding, listFindings} from "./lib/findings.js";
+import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.js";
+import { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.js";
+import { listAudit} from "./lib/audit.js";
 
 const PORT = Number(process.env.PORT || 4310);
 const HOST = process.env.PIPER_HOST || "127.0.0.1";
@@ -163,7 +163,7 @@ return null;
 
 ensureData();
 
-// 双进程防护（R10）：同一数据目录只允许一个服务进程（锁在 lib/store.mjs）。
+// 双进程防护（R10）：同一数据目录只允许一个服务进程（锁在 lib/store.ts）。
 // 已有存活进程时拒绝启动；持有者退出（含信号）时释放，陈旧锁自动接管。
 let releaseDataLock;
 try {

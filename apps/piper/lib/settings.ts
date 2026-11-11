@@ -4,7 +4,7 @@
 // 本模块只负责读写文件——绝不把环境变量里的秘密自动写进文件。
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData, listBots, writeFileAtomicSync } from "./store.mjs";
+import { DATA_DIR, ensureData, listBots, writeFileAtomicSync } from "./store.js";
 
 // 设置文件含秘密（模型 Key、GitHub 令牌）：写盘权限钉死 0600（R7）。mode 作用于
 // 临时文件、rename 后即为目标文件权限；随后的 chmodSync 再兜一层。落盘走临时文件
@@ -37,7 +37,7 @@ export function readModelSettingsFile() {
 
 // 思考挡位词表：与 pi-ai / pi-agent-core 的 ThinkingLevel 完全一致（七挡），
 // 不自造。每款模型实际支持哪几挡由 pi-ai 目录元数据决定（见
-// lib/model-providers.mjs 的 supportedThinkingLevels），这里只管词表合法性。
+// lib/model-providers.ts 的 supportedThinkingLevels），这里只管词表合法性。
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 export function isThinkingLevel(value) {
@@ -45,7 +45,7 @@ export function isThinkingLevel(value) {
 }
 
 // 部分更新：字段出现才改；apiKey 传空字符串表示清除已保存的 Key。
-// provider 是服务商归属标记（目录 id，见 lib/model-providers.mjs）；合法性由
+// provider 是服务商归属标记（目录 id，见 lib/model-providers.ts）；合法性由
 // server 路由校验，本函数只落盘字符串。旧文件没有该字段，读回按 custom 处理。
 // thinkingLevel 同理：路由先校验词表，本函数只落盘；旧文件无此字段，读回按 off。
 export function saveModelSettingsFile(patch) {
@@ -67,7 +67,7 @@ export function saveModelSettingsFile(patch) {
 const PROFILE_SETTINGS_FILE = join(DATA_DIR, "settings-profile.json");
 export const DEFAULT_TIMEZONE = "Asia/Hong_Kong";
 
-// IANA 时区合法性：以 Intl 试构造为准（与 lib/schedule.mjs 的实际用法同一判据）。
+// IANA 时区合法性：以 Intl 试构造为准（与 lib/schedule.ts 的实际用法同一判据）。
 export function isValidTimezone(timezone) {
 	if (typeof timezone !== "string" || !timezone) return false;
 	try {

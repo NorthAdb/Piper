@@ -1,4 +1,4 @@
-// 定时调度（P1-4）：在 server.mjs 长驻进程内调度晨间扫描，不另起服务、不加外部依赖。
+// 定时调度（P1-4）：在 server.ts 长驻进程内调度晨间扫描，不另起服务、不加外部依赖。
 // 计划：每天固定时刻（routines.json 的 schedule 字段，机器可解析的 "HH:MM"），时区读
 // L0-3 基础资料（readProfileSettings().timezone，缺省 Asia/Hong_Kong），每次决策现读，
 // 设置页改时区后下一周期即生效。
@@ -9,7 +9,7 @@
 //   - 启动补跑：进程启动时若今日计划时刻已过、且今日尚未成功跑过（按存储中的例程状态
 //     lastRunAt/lastStatus 判断），补跑一次，避免「服务 7:50 才启动、今天就空了」——
 //     这不是随时乱扫：只在启动后的第一次规划时判定，且今日已成功则绝不补。
-import { readProfileSettings } from "./settings.mjs";
+import { readProfileSettings } from "./settings.js";
 
 export const DEFAULT_SCHEDULE_TIME = "08:00";
 // 补跑策略：到点失败后 15 分钟窗口内最多补跑 3 次，每次间隔 5 分钟。
