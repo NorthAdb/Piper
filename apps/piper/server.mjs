@@ -30,9 +30,13 @@
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
-// GET /api/settings/model 模型设置读回（configured/baseUrl/modelId/apiKeyHint，绝无 Key 全文）
-// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除），保存即热生效
+// GET /api/model-providers 模型服务商目录只读（派生自 pi-ai 内置目录，只含内核兼容的 openai-completions 服务商 + custom）
+// GET /api/settings/model 模型设置读回（configured/provider/baseUrl/modelId/apiKeyHint，绝无 Key 全文；
+//   旧文件无 provider、或 provider 已不在目录中，按 custom 读回）
+// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除；provider 须为目录 id，未知回 400），保存即热生效
 // POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
+// POST /api/settings/model/fetch-models 用表单端点与 Key 拉取端点 /models 的模型名单；缺省 Key 时只许端点
+//   与已保存配置完全一致时复用已保存 Key（R7 守卫），回 {ok:true,models} 或 {ok:false,status,error}
 // GET /api/settings/profile 基础资料读回（displayName/timezone，时区缺省 Asia/Hong_Kong；
 //   存量文件里的非法时区回落缺省并在日志提示一次，不把坏值交给调度层）
 // PUT /api/settings/profile 保存基础资料（部分字段可单独更新；时区非法回 400 且文件不变，R3）
@@ -78,7 +82,8 @@ readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.mjs";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
+import { listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
+import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId} from "./lib/model-providers.mjs";
 import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
@@ -203,10 +208,12 @@ return raw? JSON.parse(raw): {};
 }
 
 // 模型设置对外视图：只暴露是否已配置、端点、模型名与 Key 末四位掩码，绝不含 Key 全文。
-function modelSettingsView() {
+// provider 归属要查 pi-ai 派生目录（异步加载），所以本函数是 async。
+async function modelSettingsView() {
 const cfg = modelConfig();
 return {
 configured: cfg.configured,
+provider: await resolveModelProviderId(readModelSettingsFile()),
 baseUrl: cfg.baseUrl,
 modelId: cfg.modelId,
 apiKeyHint: secretHint(cfg.apiKey),
@@ -373,15 +380,20 @@ return res.end(JSON.stringify({ ok: true}));
 if (path.startsWith("/api/")) {
 if (!isAuthed(req)) return sendJson(res, 401, { error: "未登录"});
 if (path === "/api/session") return sendJson(res, 200, { authenticated: true, modelConfigured: modelConfig().configured});
-if (path === "/api/settings/model" && req.method === "GET") return sendJson(res, 200, modelSettingsView());
+if (path === "/api/model-providers" && req.method === "GET") return sendJson(res, 200, { providers: await loadModelProviders()});
+if (path === "/api/settings/model" && req.method === "GET") return sendJson(res, 200, await modelSettingsView());
 if (path === "/api/settings/model" && req.method === "PUT") {
 const body = await readBody(req);
 const patch = {};
+if (body.provider !== undefined) {
+if (typeof body.provider !== "string" || !(await isKnownModelProvider(body.provider))) return sendJson(res, 400, { error: `未知服务商：${String(body.provider)}（须为服务商目录中的 id）`});
+patch.provider = body.provider;
+}
 if (typeof body.baseUrl === "string") patch.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string") patch.modelId = body.modelId;
 if (typeof body.apiKey === "string") patch.apiKey = body.apiKey;
 saveModelSettingsFile(patch);
-return sendJson(res, 200, modelSettingsView());
+return sendJson(res, 200, await modelSettingsView());
 }
 if (path === "/api/settings/model/test" && req.method === "POST") {
 const body = await readBody(req);
@@ -396,6 +408,27 @@ if (hasBaseUrl) overrides.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string" && body.modelId) overrides.modelId = body.modelId;
 if (hasApiKey) overrides.apiKey = body.apiKey;
 return sendJson(res, 200, await testModelConfig(overrides));
+}
+if (path === "/api/settings/model/fetch-models" && req.method === "POST") {
+const body = await readBody(req);
+const baseUrl = typeof body.baseUrl === "string" ? body.baseUrl.trim() : "";
+if (!baseUrl) return sendJson(res, 400, { error: "baseUrl 必填"});
+if (!/^https?:\/\//i.test(baseUrl)) return sendJson(res, 400, { error: "baseUrl 必须是 http/https 地址"});
+let apiKey = typeof body.apiKey === "string" ? body.apiKey : "";
+if (!apiKey) {
+// R7 守卫（与 /test 同源）：缺省 Key 时只许复用已保存 Key，且端点必须与已保存
+// 配置的 baseUrl 完全一致（忽略末尾斜杠）——否则等于把已保存 Key 发往请求体
+// 另给的地址。不满足回 400，且不发出任何上游请求。
+const saved = readModelSettingsFile();
+const norm = (u) => String(u ?? "").trim().replace(/\/+$/, "");
+if (!saved.apiKey || norm(saved.baseUrl) !== norm(baseUrl)) {
+return sendJson(res, 400, { error: "未提供 apiKey，且端点与已保存配置不一致：不会把已保存的 Key 发往该地址，请填入 API Key 后再拉取"});
+}
+apiKey = saved.apiKey;
+}
+const r = await fetchUpstreamModels({ baseUrl, apiKey });
+if (!r.ok) return sendJson(res, 200, { ok: false, status: r.status, error: r.error });
+return sendJson(res, 200, { ok: true, models: r.models });
 }
 if (path === "/api/settings/connectors" && req.method === "GET") return sendJson(res, 200, { connectors: listConnectors()});
 if (path === "/api/settings/connectors/github" && req.method === "PUT") {

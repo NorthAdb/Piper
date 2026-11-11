@@ -49,15 +49,27 @@ export type ArtifactMeta = {
 
 export type Artifact = ArtifactMeta & { body: string };
 
+// 模型服务商目录（GET /api/model-providers）：服务端派生自 pi-ai 内置目录，
+// 只含 openai-completions 兼容服务商（models 为其兼容子集名单）+ custom；
+// baseUrl 与模型名都允许改填，模型名还能从端点实时拉取
+export type ModelProvider = {
+	id: string;
+	name: string;
+	baseUrl: string;
+	models: string[];
+};
+
 // 模型设置（GET/PUT /api/settings/model 的线格式）：apiKeyHint 只有末四位掩码，绝无全文
 export type ModelSettings = {
 	configured: boolean;
+	provider: string;
 	baseUrl: string;
 	modelId: string;
 	apiKeyHint: string;
 };
 
 export type ModelSettingsInput = {
+	provider?: string;
 	baseUrl?: string;
 	modelId?: string;
 	apiKey?: string;

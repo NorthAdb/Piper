@@ -76,6 +76,13 @@ await new Promise((r) => fixtureServer.listen(0, "127.0.0.1", r));
 const FIXTURE_PORT = fixtureServer.address().port;
 
 const shotsModelStub = createServer((reqHttp, resHttp) => {
+	// 模型名单拉取（改版截图 12 用）：设置页会用已保存 Key 向端点 GET /models，
+	// stub 回两个假模型名，证明拉取链路能把名单填进下拉。
+	if (reqHttp.url?.startsWith("/v1/models")) {
+		resHttp.writeHead(200, { "Content-Type": "application/json" });
+		resHttp.end(JSON.stringify({ object: "list", data: [{ id: "stub-alpha" }, { id: "stub-beta" }] }));
+		return;
+	}
 	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
 		resHttp.statusCode = 404;
 		resHttp.end(JSON.stringify({ error: { message: "not found" } }));
@@ -290,6 +297,27 @@ async function clickText(text, { maxX = Infinity, minX = 0 } = {}) {
 	await new Promise((r) => setTimeout(r, 700));
 }
 
+// 按表达式求出的坐标点做一次真实鼠标点击（Radix Select 的 trigger/option 靠
+// 指针事件开关，合成 .click() 不可靠，须走 CDP Input）。
+async function clickPoint(expression, description) {
+	const point = await evaluate(expression);
+	if (!point) throw new Error(`找不到可点击元素：${description}`);
+	await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 }, sessionId);
+	await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 }, sessionId);
+	await new Promise((r) => setTimeout(r, 500));
+}
+
+const centerOf = (selector) => `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`;
+
+async function selectRadixOption(triggerSelector, optionText) {
+	await clickPoint(centerOf(triggerSelector), `下拉触发器 ${triggerSelector}`);
+	await waitFor(`[...document.querySelectorAll('[role="option"]')].some((el) => (el.textContent || '').includes(${JSON.stringify(optionText)}))`, `下拉选项出现：${optionText}`);
+	await clickPoint(
+		`(() => { const el = [...document.querySelectorAll('[role="option"]')].find((e) => (e.textContent || '').includes(${JSON.stringify(optionText)})); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+		`下拉选项：${optionText}`,
+	);
+}
+
 const shots = [];
 async function shot(fileName) {
 	const { data } = await cdp("Page.captureScreenshot", { format: "png" }, sessionId);
@@ -325,8 +353,37 @@ try {
 
 	// 设置四组
 	await clickText("设置", { maxX: 264 });
-	await waitFor(bodyHas("只接一个 OpenAI 兼容端点"), "设置-模型组出现");
+	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "设置-模型组出现");
 	await shot("04-settings-model-configured.png"); // 模型已配置态：Key 只显示末四位掩码
+	// 服务商 + 拉取模型截图（改版口径）：把已保存配置直接写成 provider=deepseek、
+	// 但 baseUrl 指向本地模型 stub——截图里的端点是本地替身、不是真 DeepSeek，
+	// Key 也是种子假 Key。重载后表单读回 DeepSeek 归属，且已保存 Key 在场会
+	// 自动向 stub 拉一次 /models；等「已从端点拉取 2 个模型」出现后打开模型
+	// 下拉，名单里应是 stub 回的 stub-alpha / stub-beta。
+	runSeed(`
+import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+saveModelSettingsFile({ provider: "deepseek", baseUrl: "${SHOTS_MODEL_BASE}", modelId: "stub-alpha", apiKey: "${FAKE_KEY}" });
+console.log("截图 12 用配置已写入（provider=deepseek，端点=本地 stub）");
+`);
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "重载后主界面出现");
+	await clickText("设置", { maxX: 264 });
+	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "重载后设置-模型组出现");
+	await waitFor(bodyHas("已从端点拉取 2 个模型"), "自动拉取 stub 模型名单成功");
+	await clickPoint(centerOf("#model-id-select"), "打开模型下拉");
+	await waitFor(
+		`[...document.querySelectorAll('[role="option"]')].some((el) => (el.textContent || '').includes('stub-beta'))`,
+		"模型下拉出现 stub-beta",
+	);
+	await shot("12-settings-model-deepseek.png");
+	// 收起模型下拉再继续：Radix 下拉开着时点别处只会先关下拉、吞掉那次点击。
+	await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	const dropdownClosed = await evaluate(`document.querySelectorAll('[role="option"]').length === 0`).catch(() => false);
+	if (!dropdownClosed) {
+		await clickPoint(centerOf("#model-id-select"), "再次点击模型触发器收起下拉");
+		await waitFor(`document.querySelectorAll('[role="option"]').length === 0`, "模型下拉已收起");
+	}
 	await clickText("基础资料");
 	await waitFor(bodyHas("关于我"), "设置-基础资料组出现");
 	await shot("05-settings-profile.png");
@@ -345,7 +402,7 @@ try {
 	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
 	await waitFor(bodyHas("待批收件箱"), "启用后刷新主界面出现");
 	await clickText("设置", { maxX: 264 });
-	await waitFor(bodyHas("只接一个 OpenAI 兼容端点"), "启用后设置-模型组出现");
+	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "启用后设置-模型组出现");
 	await clickText("连接器");
 	await waitFor(bodyHas("GitHub"), "启用后设置-连接器组出现");
 	await evaluate(`(() => { const el = [...document.querySelectorAll('*')].find((e) => e.children.length === 0 && (e.textContent || '').trim() === '网页查询'); el?.scrollIntoView({ block: 'center' }); return Boolean(el); })()`);
