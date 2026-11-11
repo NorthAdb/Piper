@@ -4,7 +4,7 @@
 // 本模块只负责读写文件——绝不把环境变量里的秘密自动写进文件。
 import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData, listBots, writeFileAtomicSync } from "./store.js";
+import { DATA_DIR, ensureData, listBots, writeFileAtomicSync } from "./store.ts";
 
 // ---------- 设置文件形状（各文件的属主口径） ----------
 

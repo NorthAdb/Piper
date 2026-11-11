@@ -24,12 +24,12 @@
 // 全部仓库失败时由调用方判定整轮失败（L0-5 语义，本文件只回 failures/total）。
 // 本文件全程只读，绝不调用任何 GitHub 写接口：pr_needs_review 附带的 writeIntent 只是
 // 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
-import { githubToken } from "./settings.js";
-import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.js";
-import type { Finding, FindingInput } from "./findings.js";
-import { evaluateReviews, prNeedsReview } from "./pr-review.js";
-import { appendAudit } from "./audit.js";
-import type { ArtifactMeta } from "./store.js";
+import { githubToken } from "./settings.ts";
+import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.ts";
+import type { Finding, FindingInput } from "./findings.ts";
+import { evaluateReviews, prNeedsReview } from "./pr-review.ts";
+import { appendAudit } from "./audit.ts";
+import type { ArtifactMeta } from "./store.ts";
 
 // 一仓取证的汇总。info / commits / pulls / issues / runs 是 GitHub REST 的原始
 // 响应（外部边界，字段随接口变），消费方逐字段取用，故这几处保留 any——

@@ -19,8 +19,8 @@
 // 出参脱敏：正文预览过 redact() 后截断（落盘时已脱敏，这里是接口层兜底，
 // 老文件里的未脱敏文本不出接口）；tool 的 args/result 沿用落盘的已脱敏
 // 版本，再过一遍 redactDeep 兜底，不在接口层产生任何新明文。
-import { redact, redactDeep } from "./redact.js";
-import type { SessionEntry } from "./store.js";
+import { redact, redactDeep } from "./redact.ts";
+import type { SessionEntry } from "./store.ts";
 
 const PREVIEW_MAX_CHARS = 200;
 

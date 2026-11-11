@@ -4,8 +4,8 @@
 // 文件路径可用环境变量 PIPER_NOTIFICATIONS_FILE 覆盖（仅供单元测试隔离，缺省走 data/）。
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData } from "./store.js";
-import { redact } from "./redact.js";
+import { DATA_DIR, ensureData } from "./store.ts";
+import { redact } from "./redact.ts";
 
 export const NOTIFICATION_TYPES = ["routine.completed", "routine.failed", "approval.pending", "approval.executed", "approval.failed"] as const;
 export type NotificationType = (typeof NOTIFICATION_TYPES)[number];

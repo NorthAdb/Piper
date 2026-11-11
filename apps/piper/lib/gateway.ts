@@ -30,14 +30,14 @@
 //   - POST 的正文 = 快照正文 + 幂等标记；成功写审计 executed（带评论 URL）、Finding 转 executed；
 //   - 任一网络步失败：Finding 从 executing 退回 approved、写审计 failed，错误可见可重试。
 // 凭证只经 lib/settings.ts 的 githubToken() 读取，本文件不直读环境变量与设置文件。
-import { githubToken } from "./settings.js";
-import { containsSecret } from "./redact.js";
-import { getBot } from "./store.js";
-import { getFinding, updateFinding } from "./findings.js";
-import type { Finding } from "./findings.js";
-import { appendAudit } from "./audit.js";
-import { evaluateReviews } from "./pr-review.js";
-import { ghPage, PAGE_CAPS } from "./scan.js";
+import { githubToken } from "./settings.ts";
+import { containsSecret } from "./redact.ts";
+import { getBot } from "./store.ts";
+import { getFinding, updateFinding } from "./findings.ts";
+import type { Finding } from "./findings.ts";
+import { appendAudit } from "./audit.ts";
+import { evaluateReviews } from "./pr-review.ts";
+import { ghPage, PAGE_CAPS } from "./scan.ts";
 
 // 批准记录里的意图快照形状（属主在 lib/approvals.ts 的 intentSnapshotOf，
 // 网关执行前与 Finding 当前 writeIntent 逐字比对，用的是同一份形状）。

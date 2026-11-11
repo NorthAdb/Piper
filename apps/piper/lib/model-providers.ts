@@ -29,10 +29,10 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { APP_DIR } from "./store.js";
-import { THINKING_LEVELS } from "./settings.js";
-import type { ModelSettings } from "./settings.js";
-import { redact, REDACTED } from "./redact.js";
+import { APP_DIR } from "./store.ts";
+import { THINKING_LEVELS } from "./settings.ts";
+import type { ModelSettings } from "./settings.ts";
+import { redact, REDACTED } from "./redact.ts";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");

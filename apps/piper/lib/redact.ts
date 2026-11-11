@@ -17,7 +17,7 @@
 // 互相引用，经 settings 读会形成循环 import 并在模块求值期撞上 TDZ。
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR } from "./store.js";
+import { DATA_DIR } from "./store.ts";
 
 export const REDACTED = "[REDACTED]";
 

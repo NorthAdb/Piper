@@ -30,7 +30,8 @@ npm start            # 构建前端（vite build -> public/）+ 构建服务端�
 ## 后端 TypeScript
 
 产品后端已由 `.mjs` 迁到 TypeScript（零行为变化）：`server.ts` + `lib/*.ts` 就地取代原
-`.mjs`，`tsconfig.server.json` 开 strict、模块解析 NodeNext（相对 import 写 `.js` 后缀），
+`.mjs`，`tsconfig.server.json` 开 strict、模块解析 NodeNext（相对 import 按 Pi 基座全仓约定写
+`.ts` 源文件后缀，emit 时由 `rewriteRelativeImportExtensions` 改写回 `.js`），
 `tsc` 输出 `dist/`（`dist/server.js` + `dist/lib/*.js`，与 Pi 基座各包同一构建方式）；
 `npm run check` 同时覆盖前端与服务端类型。领域类型在各数据的属主模块里（Bot / 会话条目在
 `lib/store.ts`、设置文件形状在 `lib/settings.ts`、Finding 在 `lib/findings.ts` 等），
@@ -2015,3 +2016,11 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
   仅记录在案。
 - 明确不做：未改 `packages/`；未改 SSE 事件名与载荷、路由、落盘格式、日志与错误形状；
   未迁 scripts；未加新依赖；迁移中未顺手修任何存量行为（发现的问题只记录）。
+- CI 修复（PR #26 第四笔提交）：根级 `npm run check` 的 check:ts-imports 报 60 处违规——
+  Pi 全仓约定 .ts 源码的相对 import 写源文件 `.ts` 后缀（基座 packages/agent/src 即此
+  写法），本迁移按 NodeNext 习惯写了 `.js`。修复：server.ts 与 lib/*.ts 的 60 处相对
+  说明符改回 `.ts`，tsconfig.server.json 加 `rewriteRelativeImportExtensions: true`
+  （emit 时改写回 `.js`，dist 产物逐字不变，抽查 dist/lib/kernel.js 为 `./settings.js`）。
+  验证：根级 check-ts-relative-imports 0 违规、根 `npm run check` 整链退出码 0；
+  piper 聚合 `npm run test` 退出码 0、各套计数与上文基线逐项一致；shots 20 张全过
+  （字节抖动已还原不入 PR）。

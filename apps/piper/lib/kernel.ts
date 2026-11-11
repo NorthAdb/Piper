@@ -25,13 +25,13 @@
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { isThinkingLevel, readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.js";
-import type { ThinkingLevel } from "./settings.js";
-import { getCatalogModel, resolveModelProviderId } from "./model-providers.js";
-import { webFetch, webSearch } from "./webfetch.js";
-import { redact } from "./redact.js";
-import { APP_DIR } from "./store.js";
-import type { Bot, SessionEntry } from "./store.js";
+import { isThinkingLevel, readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.ts";
+import type { ThinkingLevel } from "./settings.ts";
+import { getCatalogModel, resolveModelProviderId } from "./model-providers.ts";
+import { webFetch, webSearch } from "./webfetch.ts";
+import { redact } from "./redact.ts";
+import { APP_DIR } from "./store.ts";
+import type { Bot, SessionEntry } from "./store.ts";
 import type { Api, ApiKeyAuth, CreateProviderOptions, Message, Model, ModelThinkingLevel, MutableModels, Provider, ProviderStreams, Usage } from "@earendil-works/pi-ai";
 import type { Agent, AgentTool, AgentToolResult, ThinkingLevel as AgentThinkingLevel } from "@earendil-works/pi-agent-core";
 

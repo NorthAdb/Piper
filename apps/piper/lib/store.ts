@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, rea
 import type { WriteFileOptions } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { redact } from "./redact.js";
+import { redact } from "./redact.ts";
 
 // ---------- 共享数据形状（落盘 JSON 的属主口径，其他模块一律引用这里） ----------
 

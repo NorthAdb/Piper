@@ -12,14 +12,14 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getFinding, listFindings, updateFinding } from "./findings.js";
-import type { Finding, FindingStatus, FindingType, WriteIntent } from "./findings.js";
-import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.js";
-import { gatewayExecuteWrite } from "./gateway.js";
-import type { GatewayResult, IntentSnapshot } from "./gateway.js";
-import { addNotification } from "./notify.js";
-import { DATA_DIR, ensureData, saveArtifact } from "./store.js";
-import type { ArtifactMeta } from "./store.js";
+import { getFinding, listFindings, updateFinding } from "./findings.ts";
+import type { Finding, FindingStatus, FindingType, WriteIntent } from "./findings.ts";
+import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.ts";
+import { gatewayExecuteWrite } from "./gateway.ts";
+import type { GatewayResult, IntentSnapshot } from "./gateway.ts";
+import { addNotification } from "./notify.ts";
+import { DATA_DIR, ensureData, saveArtifact } from "./store.ts";
+import type { ArtifactMeta } from "./store.ts";
 
 export interface ApprovalRecord {
 	approvalId: string;

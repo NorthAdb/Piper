@@ -88,22 +88,22 @@ saveArtifact,
 listArtifacts,
 readArtifact,
 readBotMemory,
-} from "./lib/store.js";
-import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.js";
-import type { ChatEvent} from "./lib/kernel.js";
-import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.js";
-import type { Finding} from "./lib/findings.js";
-import type { ModelSettings} from "./lib/settings.js";
-import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.js";
-import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.js";
-import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.js";
-import { redact } from "./lib/redact.js";
-import { buildTrace} from "./lib/trace.js";
-import { runMorningScan} from "./lib/scan.js";
-import { getFinding, listFindings} from "./lib/findings.js";
-import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.js";
-import { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.js";
-import { listAudit} from "./lib/audit.js";
+} from "./lib/store.ts";
+import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import type { ChatEvent} from "./lib/kernel.ts";
+import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.ts";
+import type { Finding} from "./lib/findings.ts";
+import type { ModelSettings} from "./lib/settings.ts";
+import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.ts";
+import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.ts";
+import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.ts";
+import { redact } from "./lib/redact.ts";
+import { buildTrace} from "./lib/trace.ts";
+import { runMorningScan} from "./lib/scan.ts";
+import { getFinding, listFindings} from "./lib/findings.ts";
+import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.ts";
+import { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
+import { listAudit} from "./lib/audit.ts";
 
 const PORT = Number(process.env.PORT || 4310);
 const HOST = process.env.PIPER_HOST || "127.0.0.1";

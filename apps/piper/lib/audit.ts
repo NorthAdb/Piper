@@ -6,8 +6,8 @@
 // 文件路径可用环境变量 PIPER_AUDIT_FILE 覆盖（仅供单元测试隔离，缺省走 data/）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData } from "./store.js";
-import { redact } from "./redact.js";
+import { DATA_DIR, ensureData } from "./store.ts";
+import { redact } from "./redact.ts";
 
 // executing（R1）：网关领取执行、真正发出评论之前先落一条，进程崩溃后能看到「发到一半」。
 // expired（R5）：扫描前对账把失效的 open/approved Finding 自动退役时落一条，

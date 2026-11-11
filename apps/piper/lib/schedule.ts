@@ -9,7 +9,7 @@
 //   - 启动补跑：进程启动时若今日计划时刻已过、且今日尚未成功跑过（按存储中的例程状态
 //     lastRunAt/lastStatus 判断），补跑一次，避免「服务 7:50 才启动、今天就空了」——
 //     这不是随时乱扫：只在启动后的第一次规划时判定，且今日已成功则绝不补。
-import { readProfileSettings } from "./settings.js";
+import { readProfileSettings } from "./settings.ts";
 
 export const DEFAULT_SCHEDULE_TIME = "08:00";
 // 补跑策略：到点失败后 15 分钟窗口内最多补跑 3 次，每次间隔 5 分钟。
