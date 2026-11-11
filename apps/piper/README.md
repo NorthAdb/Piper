@@ -1405,3 +1405,29 @@ PA—design 第二轮返工中归 R11 的三项：F6（MAJOR，补齐被变异�
   留作独立前端小项；只做 F10–F13，未碰 F1–F9（已交付）、F7（GitHub 操
   作）；未改 `packages/`、未改 SSE 事件名、未加第二种写意图、未加新依赖；
   未改锁定口径。
+
+### F7 CI 红绿演示（2026-11-11，整合 PR #16，DO NOT MERGE）
+
+返工第二轮 F7 要求 piper job 在 GitHub 上真跑一次并做红绿演示。整合 PR
+#16（head `fix/round2-f10-f13`，base `main`）触发 ci.yml，三段运行如下
+（结论只记 piper job 本身）：
+
+- 初始绿（head `bfdc59f`）：piper job success。
+  运行 https://github.com/NorthAdb/Piper/actions/runs/42932637784
+  job https://github.com/NorthAdb/Piper/actions/runs/42932637784/job/130234902971
+- 改坏红（临时提交 `ba8c20e`，把 `lib/scan.mjs` 里 ci_failed 规则的
+  conclusion 比较从 `"failure"` 临时改成 `"success"`）：piper job
+  failure。同一改动在本地跑 `eval:scan` 为 3/21、18 项 FAIL——规则反转
+  被冻结评测如期抓到（failure 的 run 不再开单、success 的 run 反被误开），
+  CI 红的失败点即在此。
+  运行 https://github.com/NorthAdb/Piper/actions/runs/42932841323
+  job https://github.com/NorthAdb/Piper/actions/runs/42932841323/job/130235685045
+- 还原绿：临时提交已从分支历史摘除（分支尖端回到 `bfdc59f` 后再叠加
+  本节 docs 提交），重新运行 piper job success。
+  运行 https://github.com/NorthAdb/Piper/actions/runs/42933314891
+  job https://github.com/NorthAdb/Piper/actions/runs/42933314891/job/130237246608
+
+临时提交不留在分支历史里（已核 `git log`，无 temp(ci-demo) 提交）。
+可选的把 ci.yml 的 `pull_request.branches` 放宽到堆叠分支本轮未做：
+堆叠 PR 的检查由整合 PR 与本地全套覆盖，放宽会让上游 job 在每个堆叠
+PR 上重复跑、引入无关噪声。
