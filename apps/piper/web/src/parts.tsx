@@ -31,32 +31,52 @@ export const MarkdownText: TextMessagePartComponent = ({ text, status }) => {
 export const PlainText: TextMessagePartComponent = ({ text }) => <span className="whitespace-pre-wrap">{text}</span>;
 
 // ---- 工具卡（AI Elements Tool：Collapsible + 状态徽标 + CodeBlock 详情） ----
-// 后端 tool 事件的 phase 是 call/start/end：进行中映射 input-available，
-// end 映射 output-available，end 且 detail.isError 为真映射 output-error。
+// 一次调用一张卡（ChatPane 按 toolCallId 合并 call/start/end 三段事件）：
+// phase 非 end 映射 input-available（Running），end 映射 output-available
+//（Completed），end 且 result.isError 为真映射 output-error（Error）。
+// 卡内同时留参数与结果摘要，end 后不必重开卡看执行结果。
 
-export type ToolArgs = { phase: string; detail: JsonValue };
+export type ToolArgs = { phase: string; args: JsonValue; result: JsonValue };
 
-function toolState(phase: string, detail: JsonValue): ToolPart["state"] {
+function resultRecord(result: JsonValue): { [key: string]: JsonValue } | null {
+	return typeof result === "object" && result !== null && !Array.isArray(result) ? result : null;
+}
+
+function toolState(phase: string, result: JsonValue): ToolPart["state"] {
 	if (phase !== "end") return "input-available";
-	if (typeof detail === "object" && detail !== null && !Array.isArray(detail) && detail.isError === true) {
-		return "output-error";
-	}
-	return "output-available";
+	return resultRecord(result)?.isError === true ? "output-error" : "output-available";
+}
+
+// 结果摘要行：一眼看清关键信息，不必展开 JSON（web_fetch：HTTP 200 · 内容已截断；
+// web_search：N 条结果；出错时就是错误文本本身）。
+function toolSummary(result: JsonValue): string | null {
+	const r = resultRecord(result);
+	if (!r) return null;
+	if (r.isError === true) return typeof r.error === "string" && r.error ? r.error : "工具执行出错";
+	const bits: string[] = [];
+	if (typeof r.status === "number") bits.push(`HTTP ${r.status}`);
+	if (r.truncated === true) bits.push("内容已截断");
+	if (typeof r.count === "number") bits.push(`${r.count} 条结果`);
+	return bits.length ? bits.join(" · ") : null;
 }
 
 export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, args }) => {
 	const phase = args?.phase ?? "";
-	const detail = args?.detail ?? null;
-	const state = toolState(phase, detail);
+	const input = args?.args ?? null;
+	const result = args?.result ?? null;
+	const state = toolState(phase, result);
+	const summary = phase === "end" ? toolSummary(result) : null;
 	return (
 		<Tool className="mb-0 border-border bg-card/60">
 			<ToolHeader type={`tool-${toolName}` as `tool-${string}`} state={state} title={toolName} />
 			<ToolContent>
+				{input !== null ? <ToolInput input={input} /> : null}
 				{phase === "end" ? (
-					<ToolOutput output={detail} errorText={state === "output-error" ? "工具执行出错" : undefined} />
-				) : (
-					<ToolInput input={detail ?? {}} />
-				)}
+					<>
+						{summary && state !== "output-error" ? <p className="text-sm text-muted-foreground">{summary}</p> : null}
+						<ToolOutput output={result} errorText={state === "output-error" ? (summary ?? "工具执行出错") : undefined} />
+					</>
+				) : null}
 			</ToolContent>
 		</Tool>
 	);

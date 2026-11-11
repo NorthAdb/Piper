@@ -154,29 +154,39 @@ export type ApprovalExecution = {
 };
 
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
+// role:"tool" 是工具调用条目：回合结束时按最终态落盘（见 server.mjs handleChat），
+// historyToMessages 把它还原成工具卡 part，挂到紧随其后的 assistant 消息开头。
 export type HistoryEntry = {
 	ts?: string;
-	role: "user" | "assistant" | "system";
+	role: "user" | "assistant" | "system" | "tool";
 	text?: string;
 	kind?: string;
 	code?: string;
 	draft?: BotDraft;
+	toolCallId?: string;
+	name?: string;
+	args?: JsonValue;
+	status?: string;
+	result?: JsonValue;
 };
 
 // POST /api/chat 的 SSE 事件（event 名 -> data 形状）
 export type ChatEvent =
 	| { event: "session"; data: { botId: string; sessionId: string } }
 	| { event: "delta"; data: { text: string } }
-	| { event: "tool"; data: { phase: string; name: string; detail: JsonValue } }
+	| { event: "tool"; data: { phase: string; name: string; toolCallId?: string; detail: JsonValue } }
 	| { event: "system"; data: { kind: string; text: string } }
 	| { event: "draft"; data: { draft: BotDraft } }
 	| { event: "error"; data: { code: string; message: string } }
 	| { event: "done"; data: { botId: string } };
 
 // 前端消息模型：external-store runtime 自持，convertMessage 转成 assistant-ui 的 ThreadMessageLike
+// tool part 是「一次调用一张卡」的合并模型：phase 随 call/start/end 推进，
+// args 是调用参数（call/start 的 detail），result 是 end 的结果摘要 detail
+//（{isError, url?, status?, truncated?, count?, error?}），历史还原时 phase 恒为 end。
 export type ChatPart =
 	| { type: "text"; text: string }
-	| { type: "tool"; id: string; name: string; phase: string; detail: JsonValue }
+	| { type: "tool"; id: string; name: string; phase: string; args: JsonValue; result: JsonValue }
 	| { type: "system"; kind: string; text: string }
 	| { type: "draft"; partId: string; draft: BotDraft; readOnly: boolean; confirmedBotName?: string }
 	| { type: "error"; code: string; message: string };
@@ -195,14 +205,36 @@ export function nextId(prefix: string): string {
 }
 
 // 历史流水 -> 前端消息模型（系统条目挂到 assistant 消息上以卡片 part 呈现）
+// tool 条目先攒着：紧随其后的 assistant 正文（或以错误收尾时的 error 条目）把它们
+// 作为开头 parts 带走，工具卡在前、正文/错误在后；若后面没有这样的条目（异常截断），
+// 单独成一条 assistant 消息显示，不丢卡。旧会话没有 tool 条目，行为不变。
 export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
 	const out: ChatMessage[] = [];
+	let pendingTools: ChatPart[] = [];
+	const flushTools = () => {
+		if (!pendingTools.length) return;
+		out.push({ id: nextId("hist"), role: "assistant", parts: pendingTools, running: false });
+		pendingTools = [];
+	};
 	for (const e of entries) {
-		if (e.role === "user") {
+		if (e.role === "tool") {
+			pendingTools.push({
+				type: "tool",
+				id: e.toolCallId ?? nextId("tool"),
+				name: e.name ?? "tool",
+				phase: "end",
+				args: e.args ?? null,
+				result: e.result ?? (e.status === "error" ? { isError: true } : null),
+			});
+		} else if (e.role === "user") {
+			flushTools();
 			out.push({ id: nextId("hist"), role: "user", parts: [{ type: "text", text: e.text ?? "" }], running: false });
 		} else if (e.role === "assistant") {
-			out.push({ id: nextId("hist"), role: "assistant", parts: [{ type: "text", text: e.text ?? "" }], running: false });
+			const parts: ChatPart[] = [...pendingTools, { type: "text", text: e.text ?? "" }];
+			pendingTools = [];
+			out.push({ id: nextId("hist"), role: "assistant", parts, running: false });
 		} else if (e.draft) {
+			flushTools();
 			out.push({
 				id: nextId("hist"),
 				role: "assistant",
@@ -210,13 +242,11 @@ export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
 				running: false,
 			});
 		} else if (e.code) {
-			out.push({
-				id: nextId("hist"),
-				role: "assistant",
-				parts: [{ type: "error", code: e.code, message: e.text ?? "" }],
-				running: false,
-			});
+			const parts: ChatPart[] = [...pendingTools, { type: "error", code: e.code, message: e.text ?? "" }];
+			pendingTools = [];
+			out.push({ id: nextId("hist"), role: "assistant", parts, running: false });
 		} else {
+			flushTools();
 			out.push({
 				id: nextId("hist"),
 				role: "assistant",
@@ -225,5 +255,6 @@ export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
 			});
 		}
 	}
+	flushTools();
 	return out;
 }

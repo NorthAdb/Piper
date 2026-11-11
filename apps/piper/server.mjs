@@ -245,6 +245,45 @@ emit("done", { botId: bot.id});
 return res.end();
 }
 
+// 工具调用落盘前的深脱敏：会话 JSONL 是秘密禁入面，appendSession 只脱 text 字段，
+// tool 条目的 args/result 是结构化字段，落盘前逐个字符串过 redact()（复用统一出口）。
+function redactDeep(value) {
+if (typeof value === "string") return redact(value);
+if (Array.isArray(value)) return value.map(redactDeep);
+if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
+return value;
+}
+
+// 本轮工具调用按 toolCallId 收集：直播事件只透传不落盘，回合结束时把最终态逐条写进
+// 会话流水、排在 assistant（或 error）条目之前，前端刷新/切 bot 回来据此还原工具卡。
+const toolCalls = new Map();
+const collectTool = (e) => {
+const id = e.toolCallId || `${e.name}:${toolCalls.size}`;
+const rec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null };
+if (e.name) rec.name = e.name;
+if (e.phase === "end") {
+rec.status = e.detail?.isError ? "error" : "complete";
+rec.result = e.detail ?? null;
+} else if (e.detail != null) {
+rec.args = e.detail;
+}
+toolCalls.set(id, rec);
+};
+const persistToolCalls = () => {
+for (const rec of toolCalls.values()) {
+appendSession(bot.id, {
+role: "tool",
+toolCallId: rec.toolCallId,
+name: rec.name,
+args: redactDeep(rec.args),
+// 回合已结束仍无 end 事件的调用视为中断，落盘为 error 而不是永远 running
+status: rec.status === "running" ? "error" : rec.status,
+result: redactDeep(rec.result),
+sessionId,
+});
+}
+};
+
 const history = readSession(bot.id);
 try {
 const { text} = await streamChat({
@@ -254,11 +293,16 @@ message,
 tools: webToolsForBot(bot),
 onEvent: (e) => {
 if (e.type === "delta") emit("delta", { text: e.text});
-else if (e.type === "tool") emit("tool", { phase: e.phase, name: e.name, detail: e.detail});
+else if (e.type === "tool") {
+collectTool(e);
+emit("tool", { phase: e.phase, name: e.name, toolCallId: e.toolCallId, detail: e.detail});
+}
 },
 });
+persistToolCalls();
 appendSession(bot.id, { role: "assistant", text, sessionId});
 } catch (err) {
+persistToolCalls();
 // 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
 // 这里是其余错误路径的兜底出口。
 const safeMessage = redact(String(err?.message?? err)).slice(0, 300);

@@ -1542,3 +1542,58 @@ model-providers 34、r10 22、webfetch 44、eval:scan 21、regression 72。
 `web_fetch`、回答引用夹具特征句，已目检；其余截图同轮字节抖动已还原。
 明确不做：未改 `packages/`、未改 SSE 事件类型名、未加新依赖、未动
 抓取安全口径。
+
+### 工具卡三合一、工具记录持久化与进行时状态行实测（2026-11-11，分支 feat/tool-cards-status）
+
+真机反馈：用真 DeepSeek 抓文章成功（HTTP 200），但对话里没有带
+running/complete 状态的工具卡——不知道在正常工作还是异常，也没有进度
+提示。代码核实出两个根因：直播时一次工具调用的 call/start/end 三段
+SSE 事件在前端各成一张卡（第二轮审计 F13 留作独立前端小项的「三合一」
+遗留）；服务端从不把工具事件写进会话 JSONL，刷新/切 bot 回来卡彻底
+消失。**F13 至此关闭。** 本轮三处一起补：
+
+- **事件带 id**：`lib/kernel.mjs` 的 tool 事件在 {phase, name, detail}
+  上补 `toolCallId`（call 取 toolCall.id，start/end 取事件的
+  toolCallId），三段同 id；end 的 detail 并入工具结果的 details
+  （web_fetch 的 {url, status, truncated}、web_search 的 {count}），
+  出错时再带 error 文本。SSE 事件类型名一律未改（session/delta/tool/
+  system/draft/error/done），只是 tool 的 data 多一个 id 字段。
+- **前端三合一**：ChatPane 按 toolCallId 把三段事件合并到同一个 part
+  （call/start 保留参数，end 置最终态），同一次调用永远只有一张卡；
+  ToolCard 按合并状态渲染（Running / Completed / Error 徽标），卡内
+  参数与结果并存，结果上方有一行摘要（如 web_fetch：`HTTP 200 · 内容
+  已截断`；web_search：`N 条结果`；出错时是错误文本）。
+- **持久化**：`server.mjs` 的 handleChat 在 streamChat 期间按 id 收集
+  工具调用，回合结束时逐条落盘到会话 JSONL、排在 assistant 条目之前
+  （以错误收尾时排在 error 条目之前；回合结束仍无 end 的调用落盘为
+  error，不留永远 running）。落盘形状：
+  `{role:"tool", toolCallId, name, args, status:"complete"|"error", result, sessionId}`；
+  args/result 的字符串字段落盘前逐个过 `redact()` 深脱敏（会话 JSONL
+  秘密禁入面不破）。`historyToMessages` 把 tool 条目还原为单卡最终态，
+  挂到紧随其后的 assistant 消息开头（工具卡在前、正文在后）；以错误
+  收尾时挂到错误卡所在消息；后面没有任何条目时单独成一条消息。旧会话
+  无 tool 条目，读回行为不变。工具条目不进模型历史（`toPiMessages`
+  只取 user/assistant 文本，原样未动）。
+- **进行时状态行**：ChatPane 在 running 期间于消息区下方显示一行
+  状态（转圈图标 + 文案 + 已用秒数，每秒 tick，done/error 后消失）：
+  无 part 时「正在思考…」；有未 end 的工具时「正在调用 web_fetch…」；
+  正在流式输出文本时「正在生成回答…」。全部由现有 SSE 事件与本地
+  状态推导，不新增事件类型。思考链不在本轮：内核 thinkingLevel 仍
+  写死 off，未动。
+
+测试：`scripts/test-webfetch.mjs` 新增 4 条断言——web_fetch 的
+call/start/end 三段齐全且 toolCallId 一致；end 的 detail 带结果摘要
+（status=200、url）；一轮抓取后历史接口能看到 web_fetch 落盘条目
+（status=complete、args.url、result.status=200 可还原）；被 SSRF 拦截
+的调用落盘为 error 且 result 带通用拒绝口径。专项 **48/48**（基线
+44，只增不减）。`npm run test` 聚合退出码 0：build:web、check、
+findings 27、scan 10、pr-review 16、schedule 14、gateway 27、recovery
+7、listen 9、badtz 4、secrets 21、model-stub 10、model-providers 34、
+r10 22、webfetch 48、eval:scan 21、regression 72（全部不低于基线）。
+截图：`docs/screens/11-chat-web-fetch-tool.png` 更新为一轮 web_fetch
+后只有一张 Completed 工具卡（展开可见参数与「HTTP 200」摘要行）；
+新增 `docs/screens/13-chat-tool-card-after-reload.png`——刷新页面后
+同一张卡从会话历史还原，内容一致。两张均已目检，无真实秘密；其余
+截图同轮字节抖动已还原。
+明确不做：未改 `packages/`、未改 SSE 事件类型名、未加新依赖、未动
+web 抓取安全口径与 8000 字注入上限、未动 thinkingLevel。

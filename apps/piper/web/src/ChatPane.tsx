@@ -33,7 +33,7 @@ function partToLike(part: ChatPart): LikePart {
 				type: "tool-call",
 				toolCallId: part.id,
 				toolName: part.name,
-				args: { phase: part.phase, detail: part.detail },
+				args: { phase: part.phase, args: part.args, result: part.result },
 			};
 		case "draft":
 			return {
@@ -104,7 +104,17 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 	const [messages, setMessagesState] = useState<ChatMessage[]>([]);
 	const [loading, setLoading] = useState(true);
 	const [running, setRunning] = useState(false);
+	// 进行时状态行用：本轮起点 + 每秒 tick（仅 running 期间挂定时器）
+	const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+	const [tickNow, setTickNow] = useState(() => Date.now());
 	const messagesRef = useRef<ChatMessage[]>([]);
+
+	useEffect(() => {
+		if (!running) return;
+		setTickNow(Date.now());
+		const t = setInterval(() => setTickNow(Date.now()), 1000);
+		return () => clearInterval(t);
+	}, [running]);
 
 	const setMessages = (next: readonly ChatMessage[]) => {
 		messagesRef.current = [...next];
@@ -159,6 +169,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 			{ id: asstId, role: "assistant", parts: [], running: true },
 		]);
 		setRunning(true);
+		setRunStartedAt(Date.now());
 		onRunningChange(bot.id, true);
 		try {
 			await streamChat(bot.id, text, (e) => {
@@ -172,12 +183,38 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 							return [...parts, { type: "text", text: e.data.text }];
 						});
 						break;
-					case "tool":
-						patchParts(asstId, (parts) => [
-							...parts,
-							{ type: "tool", id: nextId("tool"), name: e.data.name, phase: e.data.phase, detail: e.data.detail },
-						]);
+					case "tool": {
+						// 一次调用一张卡：call/start/end 按 toolCallId 合并到同一个 part，
+						// phase 推进状态，call/start 的 detail 是参数、end 的 detail 是结果摘要。
+						const toolId = e.data.toolCallId ?? nextId("tool");
+						patchParts(asstId, (parts) => {
+							const idx = parts.findIndex((p) => p.type === "tool" && p.id === toolId);
+							if (idx < 0) {
+								return [
+									...parts,
+									{
+										type: "tool",
+										id: toolId,
+										name: e.data.name,
+										phase: e.data.phase,
+										args: e.data.phase === "end" ? null : e.data.detail,
+										result: e.data.phase === "end" ? e.data.detail : null,
+									} as ChatPart,
+								];
+							}
+							const prev = parts[idx] as Extract<ChatPart, { type: "tool" }>;
+							const merged: ChatPart = {
+								...prev,
+								phase: e.data.phase,
+								args: e.data.phase === "end" ? prev.args : (e.data.detail ?? prev.args),
+								result: e.data.phase === "end" ? e.data.detail : prev.result,
+							};
+							const next = [...parts];
+							next[idx] = merged;
+							return next;
+						});
 						break;
+					}
 					case "system":
 						patchParts(asstId, (parts) => [...parts, { type: "system", kind: e.data.kind, text: e.data.text }]);
 						break;
@@ -206,6 +243,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		} finally {
 			patchMessage(asstId, (m) => ({ ...m, running: false }));
 			setRunning(false);
+			setRunStartedAt(null);
 			onRunningChange(bot.id, false);
 		}
 	};
@@ -220,6 +258,19 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 			patchDraftPart(partId, () => ({ type: "system", kind: "draft", text: "已放弃该 Bot 草案卡。" }));
 		},
 	};
+
+	// 进行时状态行口径（由现有 SSE 事件与本地状态推导，不新增事件类型）：
+	// 有未 end 的工具 → 正在调用该工具；已有文本在流出 → 正在生成回答；其余 → 正在思考。
+	const activeMessage = running ? messages[messages.length - 1] : undefined;
+	const runningToolPart = activeMessage?.parts
+		.filter((p): p is Extract<ChatPart, { type: "tool" }> => p.type === "tool" && p.phase !== "end")
+		.at(-1);
+	const statusLabel = runningToolPart
+		? `正在调用 ${runningToolPart.name}…`
+		: activeMessage?.parts.some((p) => p.type === "text" && p.text.length > 0)
+			? "正在生成回答…"
+			: "正在思考…";
+	const elapsedSec = runStartedAt ? Math.max(0, Math.floor((tickNow - runStartedAt) / 1000)) : 0;
 
 	const runtime = useExternalStoreRuntime<ChatMessage>({
 		messages,
@@ -253,6 +304,15 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 						</ThreadPrimitive.Empty>
 						<ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
 					</ThreadPrimitive.Viewport>
+					{running && runStartedAt !== null ? (
+						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
+							<div className="flex items-center gap-2 text-xs text-muted-foreground">
+								<Loader2Icon className="size-3.5 animate-spin" />
+								<span>{statusLabel}</span>
+								<span>· 已用 {elapsedSec} 秒</span>
+							</div>
+						</div>
+					) : null}
 					<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
 						<ComposerPrimitive.Root
 							className="flex w-full flex-col rounded-2xl border bg-card shadow-sm transition-shadow focus-within:ring-2 focus-within:ring-ring/40"
