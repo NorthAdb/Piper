@@ -1,5 +1,5 @@
-// 「已批准」判定单测（lib/pr-review.mjs，扫描与网关共用的同一实现）：
-// 用法（在 apps/piper 下）：npm run test:pr-review（或 node scripts/test-pr-review.mjs）
+// 「已批准」判定单测（lib/pr-review.ts，扫描与网关共用的同一实现）：
+// 用法（在 apps/piper 下）：npm run test:pr-review（或 node dist/scripts/test-pr-review.js）
 // 覆盖口径（R5 锁定 + 第二轮返工 F4/F5）：
 //   F4：取每位审查人「最新一条」时忽略 COMMENTED 与 PENDING——批准后 COMMENTED 仍算
 //   已批准，要求修改后 COMMENTED 仍待审；DISMISSED 顶掉该人先前表态（清掉先前批准
@@ -7,11 +7,12 @@
 //   F5①：跨审查人——A 批准、B 最新为 CHANGES_REQUESTED → 仍待审（changes_requested）。
 //   陈旧批准不变：最新一条 APPROVED 的 commit_id 与当前 head 不一致 → stale_approval；
 //   head 缺失（null/undefined）时不判陈旧、按未变处理（F5 末段，审计已同意保留）。
-import { evaluateReviews } from "../dist/lib/pr-review.js";
+import { evaluateReviews } from "../lib/pr-review.ts";
+import type { ReviewVerdict } from "../lib/pr-review.ts";
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, actual, expected) {
+function check(name: string, actual: ReviewVerdict, expected: { approved: boolean; reason: string }) {
 	seq += 1;
 	const ok = actual.approved === expected.approved && actual.reason === expected.reason;
 	results.push({ seq, name, ok });
@@ -19,7 +20,7 @@ function check(name, actual, expected) {
 		`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — 期望 ${JSON.stringify(expected)} 实际 ${JSON.stringify(actual)}`}`,
 	);
 }
-const R = (login, state, commit_id = "aaa111") => ({ user: { login }, state, commit_id });
+const R = (login: string, state: string, commit_id = "aaa111") => ({ user: { login }, state, commit_id });
 
 // 基线
 check("无审查 → 待审（no_approval）", evaluateReviews([], "aaa111"), { approved: false, reason: "no_approval" });

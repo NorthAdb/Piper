@@ -3,23 +3,24 @@
 // 也是 string），新增的事件时刻字段 startedAt/endedAt/durationMs 用 epoch 毫秒数；
 // 轨迹接口把两类时间统一归一化为 epoch 毫秒输出，无证据的时间一律 null，不编造。
 // 老会话文件（无 ts/无时间字段）读出 null 且不报错、不回写。
-// 用法（在 apps/piper 下）：node scripts/test-trace.mjs（或 npm run test:trace）
+// 用法（在 apps/piper 下）：node dist/scripts/test-trace.js（或 npm run test:trace）
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-trace-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 process.env.PIPER_DATA_DIR = TMP_DATA;
 for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete process.env[k];
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
@@ -28,20 +29,20 @@ function check(name, ok, detail = "") {
 const CHAT_KEY = "sk-trace-test-key-abcdef123456";
 const FAKE_SECRET = `ghp_${"A".repeat(24)}`;
 
-// ---------- 单元部分：lib/trace.mjs 的 buildTrace 归一化 ----------
+// ---------- 单元部分：lib/trace.ts 的 buildTrace 归一化 ----------
 async function unitPart() {
 	let buildTrace = null;
 	try {
-		const mod = await import("../dist/lib/trace.js");
+		const mod = await import("../lib/trace.ts");
 		buildTrace = typeof mod.buildTrace === "function" ? mod.buildTrace : null;
 	} catch {
 		buildTrace = null;
 	}
-	check("lib/trace.mjs 导出 buildTrace 函数", typeof buildTrace === "function", `buildTrace=${typeof buildTrace}`);
+	check("lib/trace.ts 导出 buildTrace 函数", typeof buildTrace === "function", `buildTrace=${typeof buildTrace}`);
 	const bt = buildTrace ?? (() => ({ turns: [] }));
 
 	const T0 = Date.parse("2026-11-11T00:01:00.000Z");
-	const iso = (ms) => new Date(ms).toISOString();
+	const iso = (ms: number) => new Date(ms).toISOString();
 	// 新形状：leading system 条目 + 一轮（user → thinking → tool → assistant）
 	const entries = [
 		{ role: "system", kind: "bot-created", text: "草案确认，已创建 bot：X", ts: iso(T0 - 60_000) },
@@ -149,7 +150,7 @@ async function unitPart() {
 }
 
 // ---------- 子进程部分：真 server 对话落盘 + 轨迹接口 ----------
-async function waitReady(proc, port, timeoutMs = 20000) {
+async function waitReady(proc: ChildProcess, port: number, timeoutMs = 20000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return false;
@@ -164,8 +165,8 @@ async function waitReady(proc, port, timeoutMs = 20000) {
 	return false;
 }
 
-function startServer(port, dataDir) {
-	const env = { ...process.env, PORT: String(port), PIPER_TOKEN: "trace-test-token", PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: "http://127.0.0.1:9" };
+function startServer(port: number, dataDir: string) {
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), PIPER_TOKEN: "trace-test-token", PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: "http://127.0.0.1:9" };
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN", "PIPER_HOST"]) delete env[k];
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let log = "";
@@ -174,14 +175,15 @@ function startServer(port, dataDir) {
 	return { proc, getLog: () => log };
 }
 
-function apiFor(port, token) {
-	return async (path, init = {}, authed = true) => {
+function apiFor(port: number, token: string) {
+	// json 是 HTTP 响应边界（外部数据，逐字段取用），与产品侧 readBody 同口径用 any。
+	return async (path: string, init: RequestInit = {}, authed = true): Promise<{ status: number; json: any; text: string }> => {
 		const res = await fetch(`http://127.0.0.1:${port}${path}`, {
 			...init,
 			headers: { "Content-Type": "application/json", ...(authed ? { Authorization: `Bearer ${token}` } : {}), ...(init.headers || {}) },
 		});
 		const text = await res.text();
-		let json = null;
+		let json: any = null;
 		try {
 			json = JSON.parse(text);
 		} catch {
@@ -202,8 +204,10 @@ async function serverPart() {
 			resHttp.end("<html><head><title>轨迹夹具</title></head><body><p>轨迹夹具特征句：河狸在溪边垒了坝。</p></body></html>");
 		}, 80);
 	});
-	await new Promise((r) => fixture.listen(0, "127.0.0.1", r));
-	const FIX_URL = `http://127.0.0.1:${fixture.address().port}/page`;
+	await new Promise<void>((r) => {
+		fixture.listen(0, "127.0.0.1", () => r());
+	});
+	const FIX_URL = `http://127.0.0.1:${(fixture.address() as AddressInfo).port}/page`;
 
 	const modelStub = createServer((reqHttp, resHttp) => {
 		if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
@@ -214,7 +218,13 @@ async function serverPart() {
 		let raw = "";
 		reqHttp.on("data", (c) => (raw += c));
 		reqHttp.on("end", () => {
-			let body = {};
+			let body: {
+				model?: string;
+				messages?: { role?: string; content?: unknown }[];
+				tools?: { function?: { name?: string }; name?: string }[];
+				stream?: unknown;
+				reasoning_effort?: unknown;
+			} = {};
 			try {
 				body = JSON.parse(raw || "{}");
 			} catch {
@@ -232,10 +242,10 @@ async function serverPart() {
 				return;
 			}
 			resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-			const chunk = (delta, finishReason = null) =>
+			const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
 				`data: ${JSON.stringify({ id: "chatcmpl-trace", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 			resHttp.write(chunk({ role: "assistant" }));
-			const finish = (reason) => {
+			const finish = (reason: string) => {
 				resHttp.write(chunk({}, reason));
 				resHttp.end("data: [DONE]\n\n");
 			};
@@ -258,16 +268,18 @@ async function serverPart() {
 			finish("stop");
 		});
 	});
-	await new Promise((r) => modelStub.listen(0, "127.0.0.1", r));
-	const STUB_V1 = `http://127.0.0.1:${modelStub.address().port}/v1`;
+	await new Promise<void>((r) => {
+		modelStub.listen(0, "127.0.0.1", () => r());
+	});
+	const STUB_V1 = `http://127.0.0.1:${(modelStub.address() as AddressInfo).port}/v1`;
 
 	const PORT = 4431;
 	const dataDir = join(TMP_ROOT, "data-server");
 	process.env.PIPER_TEST_MODE = "1";
-	process.env.PIPER_WEB_FETCH_TEST_ALLOW = `127.0.0.1:${fixture.address().port}`;
+	process.env.PIPER_WEB_FETCH_TEST_ALLOW = `127.0.0.1:${(fixture.address() as AddressInfo).port}`;
 	const { proc, getLog } = startServer(PORT, dataDir);
 	const api = apiFor(PORT, "trace-test-token");
-	const chat = async (message) => {
+	const chat = async (message: string) => {
 		const res = await fetch(`http://127.0.0.1:${PORT}/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Authorization: "Bearer trace-test-token" },
@@ -276,10 +288,21 @@ async function serverPart() {
 		});
 		return res.text();
 	};
-	const sessionEntries = () => {
+	// 会话 JSONL 是落盘数据边界：只声明本套件读的字段，其余透传。
+	interface SessionEntry {
+		role?: string;
+		name?: string;
+		text?: string;
+		ts?: string;
+		startedAt?: number;
+		endedAt?: number;
+		durationMs?: number;
+		[k: string]: unknown;
+	}
+	const sessionEntries = (): SessionEntry[] => {
 		const file = join(dataDir, "sessions", "piper-main.jsonl");
 		if (!existsSync(file)) return [];
-		return readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+		return readFileSync(file, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l) as SessionEntry);
 	};
 	try {
 		const ready = await waitReady(proc, PORT);
@@ -322,17 +345,17 @@ async function serverPart() {
 			typeof toolEntry?.startedAt === "number" &&
 				typeof toolEntry?.endedAt === "number" &&
 				typeof toolEntry?.durationMs === "number" &&
-				toolEntry.endedAt >= toolEntry.startedAt &&
-				toolEntry.durationMs === toolEntry.endedAt - toolEntry.startedAt &&
-				toolEntry.durationMs >= 30,
+				toolEntry!.endedAt! >= toolEntry!.startedAt! &&
+				toolEntry!.durationMs! === toolEntry!.endedAt! - toolEntry!.startedAt! &&
+				toolEntry!.durationMs! >= 30,
 			JSON.stringify({ startedAt: toolEntry?.startedAt, endedAt: toolEntry?.endedAt, durationMs: toolEntry?.durationMs }),
 		);
 		check(
 			"落盘 thinking 时间：每段带 startedAt（段首时刻）与 durationMs，段序与工具时序交错自洽（段一 startedAt ≤ tool.startedAt ≤ tool.endedAt ≤ 段二 startedAt）",
 			thinkEntries.length === 2 &&
 				thinkEntries.every((e) => typeof e.startedAt === "number" && typeof e.durationMs === "number" && e.durationMs >= 0) &&
-				thinkEntries[0].startedAt <= toolEntry.startedAt &&
-				toolEntry.endedAt <= thinkEntries[1].startedAt,
+				thinkEntries[0].startedAt! <= toolEntry!.startedAt! &&
+				toolEntry!.endedAt! <= thinkEntries[1].startedAt!,
 			`thinks=${JSON.stringify(thinkEntries.map((e) => ({ startedAt: e.startedAt, durationMs: e.durationMs })))} tool=${JSON.stringify({ s: toolEntry?.startedAt, e: toolEntry?.endedAt })}`,
 		);
 
@@ -342,20 +365,20 @@ async function serverPart() {
 			"轨迹接口一轮：turns 恰 1 轮，事件顺序 user→thinking→tool→thinking→assistant",
 			trace.status === 200 &&
 				trace.json?.turns?.length === 1 &&
-				JSON.stringify(t0?.events?.map((e) => e.kind)) === JSON.stringify(["user", "thinking", "tool", "thinking", "assistant"]),
-			`status=${trace.status} kinds=${JSON.stringify(t0?.events?.map((e) => e.kind))}`,
+				JSON.stringify(t0?.events?.map((e: { kind?: string }) => e.kind)) === JSON.stringify(["user", "thinking", "tool", "thinking", "assistant"]),
+			`status=${trace.status} kinds=${JSON.stringify(t0?.events?.map((e: { kind?: string }) => e.kind))}`,
 		);
-		const toolEv = t0?.events?.find((e) => e.kind === "tool");
-		const thinkEvs = t0?.events?.filter((e) => e.kind === "thinking") ?? [];
+		const toolEv = t0?.events?.find((e: { kind?: string }) => e.kind === "tool");
+		const thinkEvs = t0?.events?.filter((e: { kind?: string; level?: string; textChars?: number }) => e.kind === "thinking") ?? [];
 		check(
 			"轨迹接口时间与摘要：turn.startedAt=user 条目 ts 的毫秒值、durationMs=endedAt-startedAt；tool durationMs 与落盘一致；thinking 带 level=high 与 chars",
-			t0?.startedAt === Date.parse(userEntry.ts) &&
+			t0?.startedAt === Date.parse(userEntry!.ts!) &&
 				typeof t0?.endedAt === "number" &&
 				t0?.durationMs === t0.endedAt - t0.startedAt &&
-				toolEv?.durationMs === toolEntry.durationMs &&
-				toolEv?.ts === toolEntry.startedAt &&
+				toolEv?.durationMs === toolEntry!.durationMs &&
+				toolEv?.ts === toolEntry!.startedAt &&
 				thinkEvs.length === 2 &&
-				thinkEvs.every((e) => e.level === "high") &&
+				thinkEvs.every((e: { level?: string }) => e.level === "high") &&
 				thinkEvs[0]?.textChars === SEG_A.length &&
 				thinkEvs[1]?.textChars === SEG_B.length,
 			`turn=${JSON.stringify({ startedAt: t0?.startedAt, endedAt: t0?.endedAt, durationMs: t0?.durationMs })}`,
@@ -367,8 +390,8 @@ async function serverPart() {
 			"第二轮后 turns 为 2，第二轮 index=1 且事件顺序 user→thinking→assistant",
 			trace2.json?.turns?.length === 2 &&
 				trace2.json.turns[1].index === 1 &&
-				JSON.stringify(trace2.json.turns[1].events.map((e) => e.kind)) === JSON.stringify(["user", "thinking", "assistant"]),
-			`turns=${trace2.json?.turns?.length} kinds2=${JSON.stringify(trace2.json?.turns?.[1]?.events?.map((e) => e.kind))}`,
+				JSON.stringify(trace2.json.turns[1].events.map((e: { kind?: string }) => e.kind)) === JSON.stringify(["user", "thinking", "assistant"]),
+			`turns=${trace2.json?.turns?.length} kinds2=${JSON.stringify(trace2.json?.turns?.[1]?.events?.map((e: { kind?: string }) => e.kind))}`,
 		);
 	} finally {
 		proc.kill("SIGTERM");
@@ -400,7 +423,7 @@ async function legacyPart() {
 		if (!ready) return;
 		const trace = await api("/api/bots/piper-main/trace");
 		const t0 = trace.json?.turns?.[0];
-		const byKind = Object.fromEntries((t0?.events ?? []).map((e) => [e.kind, e]));
+		const byKind = Object.fromEntries((t0?.events ?? []).map((e: { kind?: string }) => [e.kind, e]));
 		check(
 			"老文件轨迹：200 且分轮正常；无 ts 的 user/tool 事件时间全 null，带 ISO 戳的 assistant 解析为毫秒",
 			trace.status === 200 &&

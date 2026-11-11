@@ -1,15 +1,15 @@
 // 晨间扫描规则测试（P1-2）：用进程内 fetch 替身喂假 GitHub 响应，断言拍板清单两条规则、
-// 去重与单仓失败不拖垮整轮。用法（在 apps/piper 下）：node scripts/test-scan.mjs（或 npm run test:scan）
+// 去重与单仓失败不拖垮整轮。用法（在 apps/piper 下）：node dist/scripts/test-scan.js（或 npm run test:scan）
 // Finding 落盘用临时文件隔离（PIPER_FINDINGS_FILE），PIPER_DATA_DIR 一并指向临时目录
 // （R4：ensureData 的种子文件也不落真实 data/），不访问网络。
-// P1-3 的冻结夹具评测（scripts/eval-scan.mjs）在这套断言口径上扩成入库夹具。
+// P1-3 的冻结夹具评测（scripts/eval-scan.ts）在这套断言口径上扩成入库夹具。
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
@@ -18,36 +18,48 @@ function check(name, ok, detail = "") {
 const tmp = mkdtempSync(join(tmpdir(), "piper-scan-"));
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 const realFetch = globalThis.fetch;
-const requested = [];
+const requested: string[] = [];
 
-function infoFor(name) {
+function infoFor(name: string) {
 	return { stargazers_count: 3, forks_count: 1, default_branch: "main", pushed_at: "2026-11-10T00:00:00Z" };
 }
 
 // scenario: { "Owner/Repo": { runs, pulls, reviews, commits?, issues? } | { error } }
-function installStub(scenario) {
+// 场景数据是 GitHub 响应的本地替身（外部数据形状）：只声明替身真正读的字段，其余透传。
+interface ScenarioRepo {
+	error?: number;
+	commits?: unknown[];
+	issues?: unknown[];
+	runs?: unknown[];
+	runsError?: number;
+	pulls?: { number?: number | string; [k: string]: unknown }[];
+	reviews?: Record<string, { error?: number } | unknown[]>;
+	pullDetails?: Record<string, unknown>;
+}
+function installStub(scenario: Record<string, ScenarioRepo>) {
 	requested.length = 0;
-	globalThis.fetch = async (url) => {
+	// 替身只实现扫描实际用到的 ok/status/json 三个面，不是完整 Response，故 cast 到 typeof fetch。
+	globalThis.fetch = (async (url: unknown) => {
 		const u = new URL(String(url));
 		requested.push(u.pathname);
 		const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
 		const entry = m ? scenario[m[1]] : undefined;
-		if (!entry) return { ok: false, status: 599, json: async () => ({}) };
+		if (!m || !entry) return { ok: false, status: 599, json: async () => ({}) };
 		if (entry.error) return { ok: false, status: entry.error, json: async () => ({}) };
 		const rest = m[2] ?? "";
 		// 分页（R6）：按请求的 page/per_page 切片，与真实 GitHub 及 eval 替身一致。
 		const page = Number(u.searchParams.get("page") ?? 1);
 		const perPage = Number(u.searchParams.get("per_page") ?? 30);
-		const pageOf = (arr) => (arr ?? []).slice((page - 1) * perPage, page * perPage);
-		let payload;
+		const pageOf = (arr: unknown[] | undefined) => (arr ?? []).slice((page - 1) * perPage, page * perPage);
+		let payload: unknown;
 		if (rest === "") payload = infoFor(m[1]);
 		else if (rest.startsWith("/commits")) payload = pageOf(entry.commits);
 		else if (rest.match(/^\/pulls\/\d+\/reviews/)) {
-			const rv = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+			const rv = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)?.[1] ?? ""] ?? [];
 			if (!Array.isArray(rv) && rv?.error) return { ok: false, status: rv.error, json: async () => ({}) };
-			payload = pageOf(rv);
+			payload = pageOf(Array.isArray(rv) ? rv : []);
 		} else if (rest.match(/^\/pulls\/\d+$/)) {
-			const num = rest.match(/^\/pulls\/(\d+)$/)[1];
+			const num = rest.match(/^\/pulls\/(\d+)$/)?.[1] ?? "";
 			const one = (entry.pulls ?? []).find((p) => String(p.number) === num) ?? entry.pullDetails?.[num];
 			if (!one) return { ok: false, status: 404, json: async () => ({}) };
 			payload = one;
@@ -59,14 +71,21 @@ function installStub(scenario) {
 		}
 		else return { ok: false, status: 599, json: async () => ({}) };
 		return { ok: true, status: 200, json: async () => payload };
-	};
+	}) as typeof fetch;
 }
 
-const saveArtifactStub = ({ title }) => ({ id: "stub-artifact", title });
+// 返回形状对齐 lib 的 ArtifactMeta（扫描只透传，本测试不断言其内容）。
+const saveArtifactStub = ({ title }: { title?: unknown }) => ({
+	id: "stub-artifact",
+	botId: "repo-keeper",
+	kind: "morning-scan",
+	title: String(title ?? ""),
+	createdAt: null,
+});
 
 try {
-	const { runMorningScan } = await import("../dist/lib/scan.js");
-	const findingsMod = await import("../dist/lib/findings.js");
+	const { runMorningScan } = await import("../lib/scan.ts");
+	const findingsMod = await import("../lib/findings.ts");
 
 	// ---- 场景 A：失败 CI（中间夹一条进行中与一条别分支失败）+ 待审 PR + draft PR ----
 	process.env.PIPER_FINDINGS_FILE = join(tmp, "a.jsonl");
@@ -92,12 +111,12 @@ try {
 	const pr = runA1.findings.find((f) => f.type === "pr_needs_review");
 	check(
 		"场景A：最近已结束 run 为 failure 时开 ci_failed，subject/evidenceUrl 指向该 run（跳过进行中与别分支）",
-		Boolean(ci) && ci.subject === "9001" && ci.evidenceUrl === "https://github.com/Acme/Widgets/actions/runs/9001" && ci.status === "open",
+		ci !== undefined && ci.subject === "9001" && ci.evidenceUrl === "https://github.com/Acme/Widgets/actions/runs/9001" && ci.status === "open",
 		JSON.stringify(runA1.findings.map((f) => `${f.type}:${f.subject}`)),
 	);
 	check(
 		"场景A：open 非 draft 且无 APPROVED 审查的 PR 开 pr_needs_review，draft PR 不开且不查其审查",
-		Boolean(pr) && pr.subject === "7" && pr.evidenceUrl === "https://github.com/Acme/Widgets/pull/7" && !requested.some((p) => p.includes("/pulls/8/reviews")),
+		pr !== undefined && pr.subject === "7" && pr.evidenceUrl === "https://github.com/Acme/Widgets/pull/7" && !requested.some((p) => p.includes("/pulls/8/reviews")),
 		JSON.stringify(runA1.findings.map((f) => `${f.type}:${f.subject}`)),
 	);
 	check(
@@ -139,7 +158,7 @@ try {
 	// ---- 场景 C（R5，审计探针 P5 的镜像）：驳回后冷却——头部未变连扫不再重开，
 	//      头部变化才重开。旧实现每轮新开 1 条（累计多条、待批列表堆积）。 ----
 	process.env.PIPER_FINDINGS_FILE = join(tmp, "c.jsonl");
-	const scenarioC = (headSha) => ({
+	const scenarioC = (headSha: string) => ({
 		"Acme/Probe": {
 			runs: [{ id: 6001, name: "CI", status: "completed", conclusion: "success", head_branch: "main", head_sha: headSha, html_url: "https://github.com/Acme/Probe/actions/runs/6001", created_at: "2026-11-10T01:00:00Z" }],
 			pulls: [
@@ -176,7 +195,7 @@ try {
 	// ---- 场景 D（R6）：按工作流分别取最新——test 最新成功不遮蔽 lint 最新失败；
 	//      e2e 最新为 cancelled 不报、也不回溯它更早的 failure。 ----
 	process.env.PIPER_FINDINGS_FILE = join(tmp, "d.jsonl");
-	const mkRun = (id, name, conclusion, ts) => ({
+	const mkRun = (id: number, name: string, conclusion: string, ts: string) => ({
 		id, name, status: "completed", conclusion, head_branch: "main",
 		html_url: `https://github.com/Acme/Multi/actions/runs/${id}`, created_at: ts,
 	});

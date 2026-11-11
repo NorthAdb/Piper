@@ -37,9 +37,11 @@ npm start            # 构建前端（vite build -> public/）+ 构建服务端�
 `lib/store.ts`、设置文件形状在 `lib/settings.ts`、Finding 在 `lib/findings.ts` 等），
 kernel 对 Pi 的调用面用顶层 `import type` 锚 pi-ai / pi-agent-core 的真实声明；`any` 只留
 在外部边界（GitHub / 搜索端点 / 上游模型接口的响应与请求体 wire 输入），每处有注释。
-`scripts/*.mjs` 是测试 / 截图工装，不在迁移范围：保持 `.mjs` 直跑，只把启动与 import 路径
-改指 `dist/` 的编译产物。由模块位置推导的路径（数据目录等）不按固定层数算，改为向上找
-`package.json` 定位应用根，`lib/` 与 `dist/lib/` 两种布局下数据目录位置一致。
+`scripts/*.ts` 是测试 / 截图工装，同样已迁 TypeScript 并纳入同一份
+`tsconfig.server.json` 编译，产物在 `dist/scripts/*.js`，入口统一经 package.json 的
+`npm run test:*` 等脚本（先 `build:server` 再跑编译产物，不直跑 `.ts` 源码）。
+由模块位置推导的路径（数据目录等）不按固定层数算，改为向上找 `package.json`
+定位应用根，`lib/` 与 `dist/lib/` 两种布局下数据目录位置一致。
 
 ## 前端
 
@@ -226,12 +228,12 @@ R1 起必须带回 intentHash（不一致回 409）且网关只执行批准时�
 > 先按「启动」节在仓库根目录构建基座链（顺序 telemetry → schema → ai → agent，
 > 与 CI 的 `piper` job 同口径，见 R8 实测节），再回 `apps/piper` 跑 `npm run test`。
 
-历次实测的 API 断言已固化为脚本 `scripts/regression.mjs`（L0-1 落地，后续切片只扩展它）：
+历次实测的 API 断言已固化为脚本 `scripts/regression.ts`（L0-1 落地，后续切片只扩展它）：
 
 ```bash
 cd apps/piper
 npm run build:web        # 脚本需要 public/ 已构建
-npm run regression       # 或 node scripts/regression.mjs
+npm run regression       # 或 node scripts/regression.ts
 ```
 
 脚本以「无模型 Key」的默认环境在测试端口（4398，可用 `REGRESSION_PORT` 覆盖）启动一份
@@ -258,46 +260,46 @@ SIGINT/SIGTERM 时脚本先杀子进程、关桩、删临时目录再退出。
 打真实 GitHub 的检查拆在独立的非门禁套件（数据目录同样隔离）：
 
 ```bash
-npm run regression:live  # 或 node scripts/regression-live.mjs
+npm run regression:live  # 或 node scripts/regression-live.ts
 ```
 
 它对绑定仓库跑一轮真实晨间扫描；遇 GitHub 403/429（限流）或网络不可达时输出
 `SKIP`（单列、不计通过）且退出码为 0，红只留给真实异常。
 
-Finding 存储层的单元测试在 `scripts/test-findings.mjs`（不走 HTTP、不打网络，用临时文件隔离）：
+Finding 存储层的单元测试在 `scripts/test-findings.ts`（不走 HTTP、不打网络，用临时文件隔离）：
 
 ```bash
 cd apps/piper
-npm run test:findings    # 或 node scripts/test-findings.mjs
+npm run test:findings    # 或 node scripts/test-findings.ts
 ```
 
 覆盖写入补齐字段、按 status/repo/botId 过滤、缺 evidenceUrl / 非法 status / 非法 type /
 非法 writeIntent 被拒绝、改状态后去重不再命中、新进程从文件读回（重启不丢）、删除。
 
-调度状态机另有假时钟测试 `scripts/test-schedule.mjs`（注入 now 与运行函数，不等真实时间）：
+调度状态机另有假时钟测试 `scripts/test-schedule.ts`（注入 now 与运行函数，不等真实时间）：
 
 ```bash
-npm run test:schedule    # 或 node scripts/test-schedule.mjs
+npm run test:schedule    # 或 node scripts/test-schedule.ts
 ```
 
 覆盖下一次运行的时区换算、到点只触发一次、失败 15 分钟内补跑 3 次后放弃、补跑成功即停、
 启动补跑（已过点未成功才补）、并发重入返回 busy、skipped 不推进计划、status 形状。
 
-网关另有替身测试 `scripts/test-gateway.mjs`（进程内 fetch 替身 + 临时 findings/audit/
+网关另有替身测试 `scripts/test-gateway.ts`（进程内 fetch 替身 + 临时 findings/audit/
 notifications 文件，不打活网、不对真实仓库发评论）：
 
 ```bash
-npm run test:gateway    # 或 node scripts/test-gateway.mjs
+npm run test:gateway    # 或 node scripts/test-gateway.ts
 ```
 
 覆盖拒绝路径（未批准直调、意图被改、仓库未绑定、不支持的意图、正文含令牌）与执行
 路径（批准恰好发一次、无令牌失败可重试、PR 已关闭保持 approved、写接口失败可重试），
 两类审计齐全性与脱敏，以及源码绕过断言（只有 gateway.ts 构造评论写端点）。
 
-扫描规则另有替身测试 `scripts/test-scan.mjs`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
+扫描规则另有替身测试 `scripts/test-scan.ts`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
 
 ```bash
-npm run test:scan    # 或 node scripts/test-scan.mjs
+npm run test:scan    # 或 node scripts/test-scan.ts
 ```
 
 覆盖两条规则的命中与证据链接、跳过进行中 run / 别分支 run / draft PR（且不查其审查）、
@@ -309,14 +311,14 @@ npm run test:scan    # 或 node scripts/test-scan.mjs
 
 ```bash
 cd apps/piper
-npm run eval:scan    # 或 node scripts/eval-scan.mjs
+npm run eval:scan    # 或 node scripts/eval-scan.ts
 ```
 
 - 夹具在 `test/fixtures/github/*.json`，一文件一用例。字段：`name` / `description` /
   `scans`（连扫几轮，缺省 1）/ `repos`（每仓的 `info`/`commits`/`issues`/`runs`/`pulls`/
   `reviews` 响应，或 `{ "error": 500 }` 表示全端点失败）/ `expect`（`failures`、
   `findings` 期望集合（repo/type/subject/evidenceUrl 精确比对）、可选 `reportIncludes`）。
-- 运行器 `scripts/eval-scan.mjs` 给每用例独立的临时 findings 文件，fetch 全域换成夹具
+- 运行器 `scripts/eval-scan.ts` 给每用例独立的临时 findings 文件，fetch 全域换成夹具
   替身：未映射的 URL 会被记录、回 599 并在结尾断言为空——评测永不访问真实 api.github.com，
   也不产生真实写入。每用例除期望 Finding 集合外，还断言累计新开条数与期望一致（去重被打穿
   会立刻变红）。当前十二用例：`ci-failed-latest`、`pr-needs-review`、`quiet-no-findings`、
@@ -325,7 +327,7 @@ npm run eval:scan    # 或 node scripts/eval-scan.mjs
   `pr-approved-then-new-commits`、`pr-approved-current`、`ci-green-after-fail`。
   R5 起运行器还支持 `seedFindings`（预置历史 Finding）、`phases`（逐轮换 GitHub 状态）
   与 `expect.createdPerScan` / `expired` / `statusFindings`，字段说明见
-  `scripts/eval-scan.mjs` 头部注释。
+  `scripts/eval-scan.ts` 头部注释。
 - 新增用例：往 `test/fixtures/github/` 放一个符合上面格式的 JSON 即可，不用改脚本；
   文件名即用例来源，`name` 字段写用例名。新增夹具应来自真实响应脱敏或手造的最小形状，
   不要把真实令牌写进夹具。

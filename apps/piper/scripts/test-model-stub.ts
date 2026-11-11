@@ -1,5 +1,5 @@
 // R9 模型链路离线回归：本地 OpenAI 兼容 stub 打通 L0-2 验收 3/4 的链路，全程不打活网。
-// 用法（在 apps/piper 下）：node scripts/test-model-stub.mjs（或 npm run test:model-stub）
+// 用法（在 apps/piper 下）：node dist/scripts/test-model-stub.js（或 npm run test:model-stub）
 // 覆盖：
 //   - 保存 stub 配置后 GET 读回只有掩码、响应不含 Key 全文；
 //   - 测试连接走 stub 返回 ok（completeSimple 非流式路径）；
@@ -11,12 +11,12 @@
 // 与用户真实 data/ 无关；结束清理临时目录。
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.MODEL_STUB_PORT || 4397);
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = "piper-dev";
@@ -27,9 +27,9 @@ const STUB_TEXT = STUB_TEXT_PARTS.join("");
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-model-stub-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
@@ -50,11 +50,13 @@ const ghStub = createServer((reqHttp, resHttp) => {
 	}
 	resHttp.end(JSON.stringify(payload));
 });
-await new Promise((r) => ghStub.listen(0, "127.0.0.1", r));
-const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
+await new Promise<void>((r) => {
+	ghStub.listen(0, "127.0.0.1", () => r());
+});
+const GH_BASE = `http://127.0.0.1:${(ghStub.address() as AddressInfo).port}`;
 
 // ---- 本地 OpenAI 兼容 stub：stream 走 SSE 分片，非 stream 回整段 JSON ----
-const seenAuth = [];
+const seenAuth: string[] = [];
 const modelStub = createServer((reqHttp, resHttp) => {
 	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
 		resHttp.statusCode = 404;
@@ -65,7 +67,7 @@ const modelStub = createServer((reqHttp, resHttp) => {
 	let raw = "";
 	reqHttp.on("data", (c) => (raw += c));
 	reqHttp.on("end", () => {
-		let body = {};
+		let body: { model?: string; stream?: unknown } = {};
 		try {
 			body = JSON.parse(raw || "{}");
 		} catch {
@@ -74,7 +76,7 @@ const modelStub = createServer((reqHttp, resHttp) => {
 		const model = body.model || "stub-model";
 		if (body.stream) {
 			resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-			const chunk = (delta, finishReason = null) =>
+			const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
 				`data: ${JSON.stringify({
 					id: "chatcmpl-stub",
 					object: "chat.completion.chunk",
@@ -103,11 +105,13 @@ const modelStub = createServer((reqHttp, resHttp) => {
 		}
 	});
 });
-await new Promise((r) => modelStub.listen(0, "127.0.0.1", r));
-const MODEL_BASE = `http://127.0.0.1:${modelStub.address().port}/v1`;
+await new Promise<void>((r) => {
+	modelStub.listen(0, "127.0.0.1", () => r());
+});
+const MODEL_BASE = `http://127.0.0.1:${(modelStub.address() as AddressInfo).port}/v1`;
 
 // ---- 起被测 server（隔离环境） ----
-const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
+const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
 for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
@@ -117,13 +121,14 @@ proc.stdout.on("data", (d) => (serverLog += d));
 proc.stderr.on("data", (d) => (serverLog += d));
 
 let cookie = "";
-async function req(path, init = {}) {
+// json/data 都是 HTTP/SSE 响应边界（外部数据，逐字段取用），与产品侧 readBody 同口径用 any。
+async function req(path: string, init: RequestInit = {}): Promise<{ status: number; json: any; text: string }> {
 	const res = await fetch(BASE + path, {
 		...init,
 		headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...(init.headers || {}) },
 	});
 	const text = await res.text();
-	let json = null;
+	let json: any = null;
 	try {
 		json = JSON.parse(text);
 	} catch {
@@ -132,7 +137,7 @@ async function req(path, init = {}) {
 	return { status: res.status, json, text };
 }
 
-async function chatEvents(message) {
+async function chatEvents(message: string) {
 	const res = await fetch(`${BASE}/api/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Cookie: cookie },
@@ -140,7 +145,7 @@ async function chatEvents(message) {
 		signal: AbortSignal.timeout(60000),
 	});
 	const raw = await res.text();
-	const events = [];
+	const events: { event: string; data: any }[] = [];
 	for (const block of raw.split("\n\n")) {
 		const ev = /event: (.*)/.exec(block)?.[1];
 		const data = /data: (.*)/s.exec(block)?.[1];

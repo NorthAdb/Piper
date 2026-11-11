@@ -1,5 +1,5 @@
 // 冻结夹具评测（P1-3）：把晨间扫描的两条拍板规则钉在入库夹具上回归。
-// 用法（在 apps/piper 下）：npm run eval:scan（或 node scripts/eval-scan.mjs）
+// 用法（在 apps/piper 下）：npm run eval:scan（或 node dist/scripts/eval-scan.js）
 // 夹具在 test/fixtures/github/*.json，一文件一用例，格式：
 //   { name, description, scans（默认 1）, comment（可选，说明本用例覆盖边界，不参与断言）,
 //     repos: { "Owner/Repo": { info, commits, issues, runs, pulls, reviews, pullDetails? } 或 { "error": 500 } },
@@ -25,18 +25,64 @@
 // 新增用例：往 test/fixtures/github/ 放一个符合上面格式的 JSON 即可，无需改本脚本。
 import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const FIXTURE_DIR = join(dirname(fileURLToPath(import.meta.url)), "..", "test", "fixtures", "github");
+const FIXTURE_DIR = join(APP_DIR, "test", "fixtures", "github");
+
+// 夹具是入库 JSON（外部数据）：只声明本脚本真正读的字段形状，其余字段透传给扫描的替身响应。
+interface FixtureRepo {
+	error?: number;
+	info?: unknown;
+	commits?: unknown[];
+	issues?: unknown[];
+	runs?: unknown[];
+	runsError?: number;
+	pulls?: { number?: number | string }[];
+	reviews?: Record<string, { error?: number } | unknown[]>;
+	pullDetails?: Record<string, unknown>;
+}
+interface SeedFindingInput {
+	repo: string;
+	type: string;
+	subject: string | number;
+	status: string;
+	headSha?: string;
+	workflow?: string;
+	updatedAtDaysAgo?: number;
+	createdAtDaysAgo?: number;
+	writeIntent?: unknown;
+}
+interface Fixture {
+	name: string;
+	scans?: number;
+	phases?: Record<string, FixtureRepo>[];
+	repos: Record<string, FixtureRepo>;
+	seedFindings?: SeedFindingInput[];
+	expect: {
+		failures: number;
+		findings: { repo: string; type: string; subject: string; evidenceUrl: string }[];
+		created?: number;
+		createdPerScan?: number[];
+		expired?: { repo: string; type: string; subject: string }[];
+		statusFindings?: { repo: string; type: string; subject: string | number; status: string }[];
+		reportIncludes?: string[];
+	};
+}
+interface FindingKey {
+	repo: string;
+	type: string;
+	subject: string;
+}
 const realFetch = globalThis.fetch;
 const tmp = mkdtempSync(join(tmpdir(), "piper-eval-"));
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 
-let unmapped = [];
-function installStub(repos) {
+let unmapped: string[] = [];
+function installStub(repos: Record<string, FixtureRepo>) {
 	unmapped = [];
-	globalThis.fetch = async (url) => {
+	// 替身只实现扫描实际用到的 ok/status/json 三个面，不是完整 Response，故 cast 到 typeof fetch。
+	globalThis.fetch = (async (url: unknown) => {
 		const u = new URL(String(url));
 		if (u.hostname !== "api.github.com") {
 			unmapped.push(String(url));
@@ -44,7 +90,7 @@ function installStub(repos) {
 		}
 		const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
 		const entry = m ? repos[m[1]] : undefined;
-		if (!entry) {
+		if (!m || !entry) {
 			unmapped.push(u.pathname);
 			return { ok: false, status: 599, json: async () => ({}) };
 		}
@@ -54,17 +100,17 @@ function installStub(repos) {
 		// 不带分页参数时按 GitHub 缺省 per_page=30、page=1。
 		const page = Number(u.searchParams.get("page") ?? 1);
 		const perPage = Number(u.searchParams.get("per_page") ?? 30);
-		const pageOf = (arr) => (arr ?? []).slice((page - 1) * perPage, page * perPage);
-		let payload;
+		const pageOf = (arr: unknown[] | undefined) => (arr ?? []).slice((page - 1) * perPage, page * perPage);
+		let payload: unknown;
 		if (rest === "") payload = entry.info;
 		else if (rest.startsWith("/commits")) payload = pageOf(entry.commits);
 		else if (rest.match(/^\/pulls\/\d+\/reviews/)) {
-			const rv = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+			const rv = entry.reviews?.[rest.match(/^\/pulls\/(\d+)\/reviews/)?.[1] ?? ""] ?? [];
 			if (!Array.isArray(rv) && rv?.error) return { ok: false, status: rv.error, json: async () => ({}) };
-			payload = pageOf(rv);
+			payload = pageOf(Array.isArray(rv) ? rv : []);
 		} else if (rest.match(/^\/pulls\/\d+$/)) {
 			// 单个 PR 查询（对账用）：先查 open 列表，再查 pullDetails，都没有回 404。
-			const num = rest.match(/^\/pulls\/(\d+)$/)[1];
+			const num = rest.match(/^\/pulls\/(\d+)$/)?.[1] ?? "";
 			const one = (entry.pulls ?? []).find((p) => String(p.number) === num) ?? entry.pullDetails?.[num];
 			if (!one) return { ok: false, status: 404, json: async () => ({}) };
 			payload = one;
@@ -79,18 +125,25 @@ function installStub(repos) {
 			return { ok: false, status: 599, json: async () => ({}) };
 		}
 		return { ok: true, status: 200, json: async () => payload };
-	};
+	}) as typeof fetch;
 }
 
-const saveArtifactStub = ({ title }) => ({ id: "eval-artifact", title });
-const keyOf = (f) => `${f.repo}|${f.type}|${f.subject}`;
-const sortFindings = (list) =>
+// 返回形状对齐 lib 的 ArtifactMeta（扫描只透传，本评测不断言其内容）。
+const saveArtifactStub = ({ title }: { title?: unknown }) => ({
+	id: "eval-artifact",
+	botId: "repo-keeper",
+	kind: "morning-scan",
+	title: String(title ?? ""),
+	createdAt: null,
+});
+const keyOf = (f: FindingKey) => `${f.repo}|${f.type}|${f.subject}`;
+const sortFindings = (list: (FindingKey & { evidenceUrl: string })[]) =>
 	list.map((f) => ({ repo: f.repo, type: f.type, subject: f.subject, evidenceUrl: f.evidenceUrl })).sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
-const sortKeys = (list) => list.map((f) => ({ repo: f.repo, type: f.type, subject: f.subject })).sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
+const sortKeys = (list: FindingKey[]) => list.map((f) => ({ repo: f.repo, type: f.type, subject: f.subject })).sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
 
 // 种子 Finding（R5）：模拟扫描开始前就存在的历史项（已驳回/已执行/已批准等）。
 // 直接写 JSONL 行（绕过 createFinding 的「时间恒为现在」），字段形状与存储层一致。
-function seedLines(fx) {
+function seedLines(fx: Fixture) {
 	const now = Date.now();
 	return (fx.seedFindings ?? []).map((s, i) => {
 		const updated = new Date(now - (s.updatedAtDaysAgo ?? 0) * 24 * 3600 * 1000).toISOString();
@@ -118,21 +171,21 @@ function seedLines(fx) {
 }
 
 const files = readdirSync(FIXTURE_DIR).filter((f) => f.endsWith(".json")).sort();
-const caseResults = [];
+const caseResults: { name: string; ok: boolean; problems: string[] }[] = [];
 
 try {
-	const { runMorningScan } = await import("../dist/lib/scan.js");
-	const { listFindings } = await import("../dist/lib/findings.js");
+	const { runMorningScan } = await import("../lib/scan.ts");
+	const { listFindings } = await import("../lib/findings.ts");
 	const { writeFileSync } = await import("node:fs");
 
 	for (const file of files) {
-		const fx = JSON.parse(readFileSync(join(FIXTURE_DIR, file), "utf8"));
+		const fx = JSON.parse(readFileSync(join(FIXTURE_DIR, file), "utf8")) as Fixture;
 		const scans = fx.phases ? fx.phases.length : (fx.scans ?? 1);
 		process.env.PIPER_FINDINGS_FILE = join(tmp, `${fx.name}.jsonl`);
 		const seeds = seedLines(fx);
 		if (seeds.length) writeFileSync(process.env.PIPER_FINDINGS_FILE, seeds.join("\n") + "\n", "utf8");
-		const problems = [];
-		let last = null;
+		const problems: string[] = [];
+		let last: { findings: unknown[]; failures: number; report: string } | null = null;
 		let createdTotal = 0;
 		const createdPerScan = [];
 		for (let i = 0; i < scans; i += 1) {
@@ -145,7 +198,8 @@ try {
 		if (fx.expect.createdPerScan && JSON.stringify(createdPerScan) !== JSON.stringify(fx.expect.createdPerScan)) {
 			problems.push(`逐轮新开 ${JSON.stringify(createdPerScan)}，期望 ${JSON.stringify(fx.expect.createdPerScan)}（冷却在哪一轮生效对不上）`);
 		}
-		if (last.failures !== fx.expect.failures) problems.push(`failures 期望 ${fx.expect.failures} 实际 ${last.failures}`);
+		const lastScan = last as { findings: unknown[]; failures: number; report: string };
+		if (lastScan.failures !== fx.expect.failures) problems.push(`failures 期望 ${fx.expect.failures} 实际 ${lastScan.failures}`);
 		const expected = sortFindings(fx.expect.findings);
 		const opened = sortFindings(listFindings({ status: "open" }));
 		if (JSON.stringify(opened) !== JSON.stringify(expected)) {
@@ -166,7 +220,7 @@ try {
 			if (!hit) problems.push(`期望存在 ${s.status} 状态的 Finding ${s.repo}|${s.type}|${s.subject}，实际没有`);
 		}
 		for (const s of fx.expect.reportIncludes ?? []) {
-			if (!last.report.includes(s)) problems.push(`日报未包含期望片段：${s}`);
+			if (!lastScan.report.includes(s)) problems.push(`日报未包含期望片段：${s}`);
 		}
 		if (unmapped.length) problems.push(`出现夹具未映射请求（疑似打活网或路径漂移）：${unmapped.join(", ")}`);
 		caseResults.push({ name: fx.name, ok: problems.length === 0, problems });

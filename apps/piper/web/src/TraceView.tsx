@@ -1,4 +1,4 @@
-// 中栏轨迹视图（PR-E）：消费 GET /api/bots/:id/trace（PR-D，lib/trace.mjs
+// 中栏轨迹视图（PR-E）：消费 GET /api/bots/:id/trace（PR-D，lib/trace.ts
 // 的 buildTrace 按轮归一化），把当前 bot 的会话流水画成统计 + 分段时长条 +
 // 分轮时间线。只读呈现：不改落盘、不发消息、不用 SSE。
 //

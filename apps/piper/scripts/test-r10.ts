@@ -2,35 +2,36 @@
 // 设置与 findings 原子写、双进程锁。用临时数据目录隔离（PIPER_DATA_DIR），模块级断言
 // 为主，产物过滤与进程锁另起真实 server 子进程核对。全程不打活网（GitHub 基址指向
 // 本机黑洞，启动补跑扫描只会快速失败、不影响断言）。
-// 用法（在 apps/piper 下）：node scripts/test-r10.mjs（或 npm run test:r10）
+// 用法（在 apps/piper 下）：node dist/scripts/test-r10.js（或 npm run test:r10）
 // 退出码 0 = 全部通过；1 = 有失败。
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { APP_DIR } from "./app-dir.ts";
 
 const SCRIPT = fileURLToPath(import.meta.url);
-const APP_DIR = join(dirname(SCRIPT), "..");
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-r10-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 process.env.PIPER_DATA_DIR = TMP_DATA;
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
-const { createFinding, updateFinding, getFinding } = await import("../dist/lib/findings.js");
-const { listApprovals, getApproval, sweepExpiredFindings } = await import("../dist/lib/approvals.js");
-const { listConnectors, saveProfileSettings } = await import("../dist/lib/settings.js");
-const { saveArtifact, listArtifacts, readArtifact } = await import("../dist/lib/store.js");
+const { createFinding, updateFinding, getFinding } = await import("../lib/findings.ts");
+const { listApprovals, getApproval, sweepExpiredFindings } = await import("../lib/approvals.ts");
+const { listConnectors, saveProfileSettings } = await import("../lib/settings.ts");
+const { saveArtifact, listArtifacts, readArtifact } = await import("../lib/store.ts");
 
 const findingsFile = join(TMP_DATA, "findings.jsonl");
-const noTmpResidue = (dir) => readdirSync(dir).every((f) => !f.includes(".tmp-"));
+const noTmpResidue = (dir: string) => readdirSync(dir).every((f) => !f.includes(".tmp-"));
 
 // ---------- 1. 原子写：findings 整表重写走 rename（inode 必变、无临时文件残留） ----------
 const f1 = createFinding({
@@ -91,8 +92,8 @@ check("连接器/通知页源码无「本批」与切片号残留", !devTone.tes
 
 // ---------- 5/6. 真实 server 子进程：产物服务端过滤 + 双进程锁 ----------
 const TOKEN = "r10-test-token";
-function startServer(port) {
-	const env = {
+function startServer(port: number) {
+	const env: NodeJS.ProcessEnv = {
 		...process.env,
 		PORT: String(port),
 		PIPER_TOKEN: TOKEN,
@@ -107,7 +108,7 @@ function startServer(port) {
 	return { proc, output: () => out };
 }
 
-async function waitReady(proc, port, timeoutMs = 15000) {
+async function waitReady(proc: ChildProcess, port: number, timeoutMs = 15000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return false;
@@ -122,7 +123,7 @@ async function waitReady(proc, port, timeoutMs = 15000) {
 	return false;
 }
 
-async function waitExit(proc, timeoutMs = 10000) {
+async function waitExit(proc: ChildProcess, timeoutMs = 10000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return true;
@@ -158,8 +159,10 @@ const s1 = startServer(4471);
 try {
 	check("server 子进程启动成功", await waitReady(s1.proc, 4471), s1.output().slice(-300));
 	const headers = { Authorization: `Bearer ${TOKEN}` };
-	const all = await (await fetch("http://127.0.0.1:4471/api/artifacts", { headers })).json();
-	const onlyA = await (await fetch("http://127.0.0.1:4471/api/artifacts?botId=bot-a", { headers })).json();
+	// /api/artifacts 响应是外部数据边界，只取本套件用到的 artifacts 字段形状。
+	interface ArtifactsResponse { artifacts: { botId?: string; title?: string }[] }
+	const all = (await (await fetch("http://127.0.0.1:4471/api/artifacts", { headers })).json()) as ArtifactsResponse;
+	const onlyA = (await (await fetch("http://127.0.0.1:4471/api/artifacts?botId=bot-a", { headers })).json()) as ArtifactsResponse;
 	check(
 		"?botId=bot-a 只返回该 bot 的产物",
 		(onlyA.artifacts ?? []).length >= 1 && onlyA.artifacts.every((a) => a.botId === "bot-a") && onlyA.artifacts.some((a) => a.title === "A 的产物"),

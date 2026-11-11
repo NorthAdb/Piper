@@ -6,24 +6,27 @@
 // 即可从端点 GET /models 拉取模型名单；缺省 Key 时只有端点与已保存配置完全
 // 一致才许复用已保存 Key（R7 守卫）。用临时 PIPER_DATA_DIR 起真 server +
 // 本地 stub 上游，全程离线。
-// 用法（在 apps/piper 下）：node scripts/test-model-providers.mjs（或 npm run test:model-providers）
+// 用法（在 apps/piper 下）：node dist/scripts/test-model-providers.js（或 npm run test:model-providers）
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import type { AddressInfo } from "node:net";
+import type { FetchModelsResult } from "../lib/model-providers.ts";
 import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { join } from "node:path";
+import { pathToFileURL } from "node:url";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const REPO_ROOT = join(APP_DIR, "..", "..");
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-providers-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 process.env.PIPER_DATA_DIR = TMP_DATA;
 for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete process.env[k];
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
@@ -36,7 +39,7 @@ const STUB_KEY = "sk-stub-fetch-key-0123456789abcdef";
 const TYPED_WRONG_KEY = "sk-wrong-typed-key-0000000000";
 
 // ---------- 本地 stub 上游：/v1/models 要 Bearer STUB_KEY，其余路径造各种坏响应 ----------
-const stubHits = [];
+const stubHits: { path: string; auth: string }[] = [];
 const stub = createServer((reqHttp, resHttp) => {
 	const u = new URL(reqHttp.url ?? "/", "http://stub.invalid");
 	stubHits.push({ path: u.pathname, auth: reqHttp.headers.authorization ?? "" });
@@ -74,14 +77,16 @@ const stub = createServer((reqHttp, resHttp) => {
 	resHttp.statusCode = 404;
 	resHttp.end("{}");
 });
-await new Promise((r) => stub.listen(0, "127.0.0.1", r));
-const STUB_BASE = `http://127.0.0.1:${stub.address().port}`;
+await new Promise<void>((r) => {
+	stub.listen(0, "127.0.0.1", () => r());
+});
+const STUB_BASE = `http://127.0.0.1:${(stub.address() as AddressInfo).port}`;
 const STUB_V1 = `${STUB_BASE}/v1`;
 const modelsHitCount = () => stubHits.filter((h) => h.path === "/v1/models").length;
 
 async function unitPart() {
-	const mp = await import("../dist/lib/model-providers.js");
-	const settings = await import("../dist/lib/settings.js");
+	const mp = await import("../lib/model-providers.ts");
+	const settings = await import("../lib/settings.ts");
 
 	check(
 		"lib 导出 loadModelProviders 与 fetchUpstreamModels（目录改为异步派生 + 拉取函数）",
@@ -89,7 +94,7 @@ async function unitPart() {
 		`loadModelProviders=${typeof mp.loadModelProviders} fetchUpstreamModels=${typeof mp.fetchUpstreamModels}`,
 	);
 	const providers = typeof mp.loadModelProviders === "function" ? await mp.loadModelProviders() : [];
-	const byId = (id) => providers.find((p) => p.id === id);
+	const byId = (id: string) => providers.find((p) => p.id === id);
 
 	check("派生目录服务商数量远大于手写 8 条（≥25，含 custom）", providers.length >= 25, `实际 ${providers.length}`);
 	check(
@@ -160,7 +165,10 @@ async function unitPart() {
 	);
 
 	// 与 pi-ai dist 交叉核对：混合 api 的服务商，我们列出的模型恰为其 openai-completions 子集。
-	const all = await import(pathToFileURL(join(REPO_ROOT, "packages", "ai", "dist", "providers", "all.js")).href);
+	// pi-ai dist 是动态加载的编译产物，无随附类型；只声明本套件用到的 getBuiltinModels 形状。
+	const all = (await import(pathToFileURL(join(REPO_ROOT, "packages", "ai", "dist", "providers", "all.js")).href)) as {
+		getBuiltinModels: (id: string) => { api: string; id: string }[];
+	};
 	let subsetOk = true;
 	let subsetDetail = "";
 	for (const pid of ["fireworks", "github-copilot", "opencode"]) {
@@ -178,8 +186,8 @@ async function unitPart() {
 	}
 	check("混合 api 服务商（fireworks/github-copilot/opencode）的名单恰为 pi-ai 的 openai-completions 子集", subsetOk, subsetDetail);
 
-	const isKnown = async (id) => (typeof mp.isKnownModelProvider === "function" ? await mp.isKnownModelProvider(id) : false);
-	const resolve = async (saved) => (typeof mp.resolveModelProviderId === "function" ? await mp.resolveModelProviderId(saved) : "custom");
+	const isKnown = async (id: unknown) => (typeof mp.isKnownModelProvider === "function" ? await mp.isKnownModelProvider(id) : false);
+	const resolve = async (saved: Parameters<typeof mp.resolveModelProviderId>[0]) => (typeof mp.resolveModelProviderId === "function" ? await mp.resolveModelProviderId(saved) : "custom");
 	check(
 		"归属判定按 pi-ai id：deepseek/moonshotai/openrouter 识别；旧手写 id（moonshot/zhipu/dashscope/siliconflow）回落 custom",
 		(await isKnown("deepseek")) &&
@@ -212,7 +220,8 @@ async function unitPart() {
 	);
 
 	// ---------- fetchUpstreamModels 单元（对本地 stub） ----------
-	const fetchModels = typeof mp.fetchUpstreamModels === "function" ? mp.fetchUpstreamModels : async () => ({ ok: false, status: 0, error: "函数不存在" });
+	const fetchModels: typeof mp.fetchUpstreamModels =
+		typeof mp.fetchUpstreamModels === "function" ? mp.fetchUpstreamModels : async () => ({ ok: false, status: 0, error: "函数不存在" }) as FetchModelsResult;
 	const okRes = await fetchModels({ baseUrl: STUB_V1, apiKey: STUB_KEY });
 	check(
 		"fetchUpstreamModels 正常解析：data[].id 去重排序、忽略无 id 项",
@@ -253,7 +262,7 @@ async function unitPart() {
 }
 
 // ---------- 子进程部分：真 server 上的目录接口、保存/读回与拉取接口 ----------
-async function waitReady(proc, port, timeoutMs = 20000) {
+async function waitReady(proc: ChildProcess, port: number, timeoutMs = 20000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return false;
@@ -268,8 +277,8 @@ async function waitReady(proc, port, timeoutMs = 20000) {
 	return false;
 }
 
-function startServer(port, dataDir) {
-	const env = { ...process.env, PORT: String(port), PIPER_TOKEN: "providers-test-token", PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: "http://127.0.0.1:9" };
+function startServer(port: number, dataDir: string) {
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), PIPER_TOKEN: "providers-test-token", PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: "http://127.0.0.1:9" };
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN", "PIPER_HOST"]) delete env[k];
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let log = "";
@@ -278,14 +287,15 @@ function startServer(port, dataDir) {
 	return { proc, getLog: () => log };
 }
 
-function apiFor(port, token) {
-	return async (path, init = {}, authed = true) => {
+function apiFor(port: number, token: string) {
+	// json 是 HTTP 响应边界（外部数据，逐字段取用），与产品侧 readBody 同口径用 any。
+	return async (path: string, init: RequestInit = {}, authed = true): Promise<{ status: number; json: any; text: string }> => {
 		const res = await fetch(`http://127.0.0.1:${port}${path}`, {
 			...init,
 			headers: { "Content-Type": "application/json", ...(authed ? { Authorization: `Bearer ${token}` } : {}), ...(init.headers || {}) },
 		});
 		const text = await res.text();
-		let json = null;
+		let json: any = null;
 		try {
 			json = JSON.parse(text);
 		} catch {
@@ -309,7 +319,13 @@ async function serverPart() {
 		check("GET /api/model-providers 未登录返回 401", unauth.status === 401, `实际 ${unauth.status}`);
 
 		const catalog = await api("/api/model-providers");
-		const catProviders = catalog.json?.providers ?? [];
+		interface CatalogProvider {
+			id?: string;
+			name?: string;
+			baseUrl?: string;
+			models?: { id?: string; supportedThinkingLevels?: string[] }[];
+		}
+		const catProviders: CatalogProvider[] = catalog.json?.providers ?? [];
 		const dsEntry = catProviders.find((p) => p.id === "deepseek");
 		check(
 			"GET /api/model-providers 200：派生目录 ≥25 条、deepseek 字段与 pi-ai 一致、无 anthropic、custom 在末尾",
@@ -318,15 +334,15 @@ async function serverPart() {
 				dsEntry?.name === "DeepSeek" &&
 				dsEntry?.baseUrl === "https://api.deepseek.com" &&
 				Array.isArray(dsEntry?.models) &&
-				dsEntry.models.some((m) => m.id === "deepseek-v4-pro") &&
+				(dsEntry?.models ?? []).some((m) => m.id === "deepseek-v4-pro") &&
 				!catProviders.some((p) => p.id === "anthropic") &&
 				catProviders[catProviders.length - 1]?.id === "custom",
 			`status=${catalog.status} count=${catProviders.length} body=${catalog.text.slice(0, 200)}`,
 		);
 		check(
 			"目录接口下发思考挡位：deepseek-flash 条目带 supportedThinkingLevels=[off,low,high,max]",
-			JSON.stringify(dsEntry?.models.find((m) => m.id === "deepseek-flash")?.supportedThinkingLevels) === JSON.stringify(["off", "low", "high", "max"]),
-			JSON.stringify(dsEntry?.models.find((m) => m.id === "deepseek-flash")),
+			JSON.stringify((dsEntry?.models ?? []).find((m) => m.id === "deepseek-flash")?.supportedThinkingLevels) === JSON.stringify(["off", "low", "high", "max"]),
+			JSON.stringify((dsEntry?.models ?? []).find((m) => m.id === "deepseek-flash")),
 		);
 
 		const save = await api("/api/settings/model", {
@@ -504,7 +520,16 @@ const ANSWER_TEXT = "答案如下。";
 const CHAT_KEY = "sk-chat-thinking-key-abcdef123456";
 
 async function thinkingPart() {
-	const chatBodies = [];
+	// chatBodies 是上游收到的请求体（外部数据）：只声明桩与断言读的字段。
+	interface ChatBody {
+		model?: string;
+		messages?: { role?: string; content?: unknown }[];
+		tools?: { function?: { name?: string }; name?: string }[];
+		stream?: unknown;
+		reasoning_effort?: unknown;
+		thinking?: unknown;
+	}
+	const chatBodies: ChatBody[] = [];
 	const chatStub = createServer((reqHttp, resHttp) => {
 		if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
 			resHttp.statusCode = 404;
@@ -514,7 +539,13 @@ async function thinkingPart() {
 		let raw = "";
 		reqHttp.on("data", (c) => (raw += c));
 		reqHttp.on("end", () => {
-			let body = {};
+			let body: {
+				model?: string;
+				messages?: { role?: string; content?: unknown }[];
+				tools?: { function?: { name?: string }; name?: string }[];
+				stream?: unknown;
+				reasoning_effort?: unknown;
+			} = {};
 			try {
 				body = JSON.parse(raw || "{}");
 			} catch {
@@ -525,7 +556,7 @@ async function thinkingPart() {
 			const wantsReasoning = typeof body.reasoning_effort === "string" && body.reasoning_effort !== "";
 			if (body.stream) {
 				resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-				const chunk = (delta, finishReason = null) =>
+				const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
 					`data: ${JSON.stringify({ id: "chatcmpl-think", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 				resHttp.write(chunk({ role: "assistant" }));
 				if (wantsReasoning) for (const part of REASONING_PARTS) resHttp.write(chunk({ reasoning_content: part }));
@@ -553,14 +584,16 @@ async function thinkingPart() {
 			}
 		});
 	});
-	await new Promise((r) => chatStub.listen(0, "127.0.0.1", r));
-	const CHAT_V1 = `http://127.0.0.1:${chatStub.address().port}/v1`;
+	await new Promise<void>((r) => {
+		chatStub.listen(0, "127.0.0.1", () => r());
+	});
+	const CHAT_V1 = `http://127.0.0.1:${(chatStub.address() as AddressInfo).port}/v1`;
 
 	const PORT = 4425;
 	const dataDir = join(TMP_ROOT, "data-thinking");
 	const { proc, getLog } = startServer(PORT, dataDir);
 	const api = apiFor(PORT, "providers-test-token");
-	const chat = async (message) => {
+	const chat = async (message: string) => {
 		const res = await fetch(`http://127.0.0.1:${PORT}/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Authorization: "Bearer providers-test-token" },
@@ -568,7 +601,7 @@ async function thinkingPart() {
 			signal: AbortSignal.timeout(60000),
 		});
 		const rawText = await res.text();
-		const events = [];
+		const events: { event: string; data: any }[] = [];
 		for (const block of rawText.split("\n\n")) {
 			const ev = /event: (.*)/.exec(block)?.[1];
 			const data = /data: (.*)/s.exec(block)?.[1];
@@ -613,7 +646,7 @@ async function thinkingPart() {
 		);
 
 		const msgs = await api("/api/bots/piper-main/messages");
-		const thinkEntry = (msgs.json?.messages ?? []).find((m) => m.role === "thinking");
+		const thinkEntry = (msgs.json?.messages ?? []).find((m: { role?: string; text?: string }) => m.role === "thinking");
 		const sessionRaw = existsSync(join(dataDir, "sessions", "piper-main.jsonl")) ? readFileSync(join(dataDir, "sessions", "piper-main.jsonl"), "utf8") : "";
 		check(
 			"回合后会话历史含 role=thinking 条目且文本完整，会话文件不含 Key 全文",
@@ -675,8 +708,10 @@ async function segmentPart() {
 		resHttp.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
 		resHttp.end("<html><head><title>分段夹具</title></head><body><p>分段夹具特征句：松鼠把橡果藏进树洞。</p></body></html>");
 	});
-	await new Promise((r) => fixture.listen(0, "127.0.0.1", r));
-	const FIX_URL = `http://127.0.0.1:${fixture.address().port}/page`;
+	await new Promise<void>((r) => {
+		fixture.listen(0, "127.0.0.1", () => r());
+	});
+	const FIX_URL = `http://127.0.0.1:${(fixture.address() as AddressInfo).port}/page`;
 
 	const segStub = createServer((reqHttp, resHttp) => {
 		if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
@@ -687,7 +722,13 @@ async function segmentPart() {
 		let raw = "";
 		reqHttp.on("data", (c) => (raw += c));
 		reqHttp.on("end", () => {
-			let body = {};
+			let body: {
+				model?: string;
+				messages?: { role?: string; content?: unknown }[];
+				tools?: { function?: { name?: string }; name?: string }[];
+				stream?: unknown;
+				reasoning_effort?: unknown;
+			} = {};
 			try {
 				body = JSON.parse(raw || "{}");
 			} catch {
@@ -705,10 +746,10 @@ async function segmentPart() {
 				return;
 			}
 			resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-			const chunk = (delta, finishReason = null) =>
+			const chunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
 				`data: ${JSON.stringify({ id: "chatcmpl-seg", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 			resHttp.write(chunk({ role: "assistant" }));
-			const finish = (reason) => {
+			const finish = (reason: string) => {
 				resHttp.write(chunk({}, reason));
 				resHttp.end("data: [DONE]\n\n");
 			};
@@ -740,16 +781,18 @@ async function segmentPart() {
 			finish("stop");
 		});
 	});
-	await new Promise((r) => segStub.listen(0, "127.0.0.1", r));
-	const SEG_V1 = `http://127.0.0.1:${segStub.address().port}/v1`;
+	await new Promise<void>((r) => {
+		segStub.listen(0, "127.0.0.1", () => r());
+	});
+	const SEG_V1 = `http://127.0.0.1:${(segStub.address() as AddressInfo).port}/v1`;
 
 	const PORT = 4427;
 	const dataDir = join(TMP_ROOT, "data-segments");
 	process.env.PIPER_TEST_MODE = "1";
-	process.env.PIPER_WEB_FETCH_TEST_ALLOW = `127.0.0.1:${fixture.address().port}`;
+	process.env.PIPER_WEB_FETCH_TEST_ALLOW = `127.0.0.1:${(fixture.address() as AddressInfo).port}`;
 	const { proc, getLog } = startServer(PORT, dataDir);
 	const api = apiFor(PORT, "providers-test-token");
-	const chat = async (message) => {
+	const chat = async (message: string) => {
 		const res = await fetch(`http://127.0.0.1:${PORT}/api/chat`, {
 			method: "POST",
 			headers: { "Content-Type": "application/json", Authorization: "Bearer providers-test-token" },
@@ -757,7 +800,7 @@ async function segmentPart() {
 			signal: AbortSignal.timeout(60000),
 		});
 		const rawText = await res.text();
-		const events = [];
+		const events: { event: string; data: any }[] = [];
 		for (const block of rawText.split("\n\n")) {
 			const ev = /event: (.*)/.exec(block)?.[1];
 			const data = /data: (.*)/s.exec(block)?.[1];
@@ -765,7 +808,14 @@ async function segmentPart() {
 		}
 		return events;
 	};
-	const allMessages = async () => (await api("/api/bots/piper-main/messages")).json?.messages ?? [];
+	interface MessageEntry {
+		role?: string;
+		text?: string;
+		seq?: number;
+		durationMs?: number;
+		level?: string;
+	}
+	const allMessages = async (): Promise<MessageEntry[]> => (await api("/api/bots/piper-main/messages")).json?.messages ?? [];
 	try {
 		const ready = await waitReady(proc, PORT);
 		check("思考分段 server 启动成功", ready, getLog().slice(-400));
@@ -792,7 +842,7 @@ async function segmentPart() {
 				!ev.some((e) => e.event === "error"),
 			`before=${JSON.stringify(thinkBefore.map((e) => e.data?.text))} after=${JSON.stringify(thinkAfter.map((e) => e.data?.text))}`,
 		);
-		const segRuns = [];
+		const segRuns: (number | undefined)[] = [];
 		for (const e of ev.filter((x) => x.event === "thinking")) {
 			if (segRuns[segRuns.length - 1] !== e.data?.seg) segRuns.push(e.data?.seg);
 		}
