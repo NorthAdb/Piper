@@ -21,16 +21,29 @@ npm --prefix packages/agent run build
 
 ```bash
 cd apps/piper
-npm start            # 先构建前端（vite build -> public/）再启动 node server.mjs
+npm start            # 构建前端（vite build -> public/）+ 构建服务端（tsc -> dist/）后启动 node dist/server.js
 # 打开 http://localhost:4310 ，口令默认 piper-dev
 ```
 
-（前端已构建过时也可直接 `node server.mjs`；改完前端源码重新 `npm start` 或 `npm run build:web` 即可。）
+（前后端都已构建过时也可直接 `node dist/server.js`；改完前端源码重新 `npm start` 或 `npm run build:web`，改完后端源码先 `npm run build:server`。）
+
+## 后端 TypeScript
+
+产品后端已由 `.mjs` 迁到 TypeScript（零行为变化）：`server.ts` + `lib/*.ts` 就地取代原
+`.mjs`，`tsconfig.server.json` 开 strict、模块解析 NodeNext（相对 import 写 `.js` 后缀），
+`tsc` 输出 `dist/`（`dist/server.js` + `dist/lib/*.js`，与 Pi 基座各包同一构建方式）；
+`npm run check` 同时覆盖前端与服务端类型。领域类型在各数据的属主模块里（Bot / 会话条目在
+`lib/store.ts`、设置文件形状在 `lib/settings.ts`、Finding 在 `lib/findings.ts` 等），
+kernel 对 Pi 的调用面用顶层 `import type` 锚 pi-ai / pi-agent-core 的真实声明；`any` 只留
+在外部边界（GitHub / 搜索端点 / 上游模型接口的响应与请求体 wire 输入），每处有注释。
+`scripts/*.mjs` 是测试 / 截图工装，不在迁移范围：保持 `.mjs` 直跑，只把启动与 import 路径
+改指 `dist/` 的编译产物。由模块位置推导的路径（数据目录等）不按固定层数算，改为向上找
+`package.json` 定位应用根，`lib/` 与 `dist/lib/` 两种布局下数据目录位置一致。
 
 ## 前端
 
 技术栈（2026-11-10 定案并落地）：**React 19 + TypeScript + Vite + Tailwind CSS v4**，
-源码在 `web/`，构建产物输出 `public/` 由 `server.mjs` 静态托管（`public/` 已 gitignore，不入库）。
+源码在 `web/`，构建产物输出 `public/` 由服务端（`dist/server.js`）静态托管（`public/` 已 gitignore，不入库）。
 后端 API 与 SSE 事件契约（`session / delta / tool / system / draft / error / done`）**一律未动**，
 前端历经三步：原生实现（feat/prototype）→ React + assistant-ui（feat/web-assistant-ui）→
 设计系统视觉升级（feat/web-visual-upgrade），逐项回归见文末实测节。
@@ -104,7 +117,7 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
 掩码口径见 R7：长 Key 给末四位，≤8 位短 Key 给固定掩码）。
 
 注（L0-4）：GitHub 令牌同样可在设置页「连接器」组保存到 `data/settings-github.json`，
-文件优先于 `GITHUB_TOKEN` 环境变量；扫描经 `lib/settings.mjs` 的 `githubToken()` 统一读取
+文件优先于 `GITHUB_TOKEN` 环境变量；扫描经 `lib/settings.ts` 的 `githubToken()` 统一读取
 （唯一的令牌入口），读回只给掩码（`GET /api/settings/connectors`，口径同模型 Key）。
 
 ## Pi 接入
@@ -129,7 +142,7 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
   settings / 资源加载 / 工具集体系，雏形不直接复用；雏形只用 agent-core 的 `Agent` + 自管 JSONL 会话，
   后续迭代若要接 coding-agent 的会话恢复与工具集，再在此处演进。
 
-实现位置：`lib/kernel.mjs`（`streamChat` / `extractDraftWithModel` / 规则兜底）。
+实现位置：`lib/kernel.ts`（`streamChat` / `extractDraftWithModel` / 规则兜底）。
 基座 dist 用动态 import 懒加载：未构建时只有对话路径报错（`BASE_NOT_BUILT`，错误信息含构建步骤），
 bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 抛 `MODEL_NOT_CONFIGURED`，
 路由层转成 SSE `error` 事件，文案明确写「未配置模型」。
@@ -142,28 +155,28 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 运行时数据在 `apps/piper/data/`（`.gitignore` 排除，仅保留 `.gitkeep`）：
 
 - `bots.json`：bot 元数据（雏形用 JSON 文件代替规格中的 SQLite，接口不变，后续可平滑替换）
-- `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.mjs`）
+- `settings-model.json`：设置页保存的模型配置（端点、模型名、Key 明文只存此文件，L0-2；见 `lib/settings.ts`）
 - `settings-profile.json`：设置页保存的基础资料（称呼、时区；时区缺省 `Asia/Hong_Kong`，L0-3）
 - `settings-github.json`：设置页保存的 GitHub 令牌（明文只存此文件，L0-4；经 `githubToken()` 读取）
 - `settings-web.json`：网页查询设置（抓取开关、搜索端点、搜索密钥明文只存此文件，0600，
-  读回只有掩码，L0-6；见 `lib/settings.mjs` 的 `readWebSettingsFile` 与 `lib/webfetch.mjs`）
+  读回只有掩码，L0-6；见 `lib/settings.ts` 的 `readWebSettingsFile` 与 `lib/webfetch.ts`）
 - `notifications.jsonl`：应用内通知一行一条（L0-5），扫描完成 / 整轮失败时写入；P1-6 起
   `approval.pending`（新待批写操作）、`approval.executed` / `approval.failed`（网关执行结果）真正写入
-- `audit.jsonl`：网关审计一行一条（P1-6，见 `lib/audit.mjs`），只追加：时间、bot、意图摘要
+- `audit.jsonl`：网关审计一行一条（P1-6，见 `lib/audit.ts`），只追加：时间、bot、意图摘要
   （kind / repo / prNumber / 正文长度与脱敏预览，不含任何秘密）、结果
   （denied / approved / executing / executed / failed / rejected）、原因、关联 Finding、评论链接；
   `GET /api/audit?findingId=` 可追溯。文件路径可用 `PIPER_AUDIT_FILE` 覆盖（仅供测试隔离）
-- `approvals.jsonl`：批准记录一行一条（R1，见 `lib/approvals.mjs`），只追加：approvalId、
+- `approvals.jsonl`：批准记录一行一条（R1，见 `lib/approvals.ts`），只追加：approvalId、
   关联 Finding、批准时刻的意图快照（kind / repo / prNumber / 正文）与 SHA-256 哈希、批准
   时间。网关只执行这份快照。文件路径可用 `PIPER_APPROVALS_FILE` 覆盖（仅供测试隔离）
-- `findings.jsonl`：分诊 Finding 一行一条（P1-1，见 `lib/findings.mjs`）：需要人拍板的事项的结构化对象
+- `findings.jsonl`：分诊 Finding 一行一条（P1-1，见 `lib/findings.ts`）：需要人拍板的事项的结构化对象
   （repo / type / subject 去重键 / evidenceUrl 必填 / suggestedAction / writeIntent / expiresAt /
   status（open|approved|rejected|expired|executed|executing）/ botId），每次读写现读落盘、重启不丢；
   状态迁移由显式迁移表强制（R1），writeIntent 落盘后不可改；
   校验在写入边界：无 evidenceUrl、非法 type/status/writeIntent 一律拒绝。只读 API：
   `GET /api/findings`（可按 status/repo/botId 过滤）、`GET /api/findings/:id`。
   文件路径可用环境变量 `PIPER_FINDINGS_FILE` 覆盖（仅供单元测试 / 评测隔离，缺省即此文件）
-- 待批收件箱不另存数据（P1-5）：`lib/approvals.mjs` 把带 writeIntent 的 Finding 整形成
+- 待批收件箱不另存数据（P1-5）：`lib/approvals.ts` 把带 writeIntent 的 Finding 整形成
   审批视图（id 与 findingId 同值），批准/驳回即改 Finding 状态；过期 open 项在读列表时
   惰性转 expired
 - `about-me.md`：账号级「关于我」，只有一份——设置页（`PUT /api/about-me`，需登录）、右栏记忆
@@ -178,15 +191,15 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 
 ## API 契约
 
-见 `server.mjs` 文件头注释（逐条列明）。要点：SSE 事件类型固定为
+见 `server.ts` 文件头注释（逐条列明）。要点：SSE 事件类型固定为
 `session / delta / tool / system / draft / error / done`；草案卡结构
 `{name, systemPrompt, tools, repos, memoryScope, source}`，经 `POST /api/bots/draft-confirm` 确认才落库；
 `GET /api/approvals` 自 P1-5 起读真实存储：待批项即带 `writeIntent` 的 open/approved/executing
 Finding 的审批视图（不另存一份），每条带批准记录 id 与 intentHash；`POST /api/approvals/:id/approve`
-自 P1-6 起批准后经薄网关（`lib/gateway.mjs`，默认拒绝、只放行 `pr_comment` 一种写）真正执行，
+自 P1-6 起批准后经薄网关（`lib/gateway.ts`，默认拒绝、只放行 `pr_comment` 一种写）真正执行，
 R1 起必须带回 intentHash（不一致回 409）且网关只执行批准时刻的意图快照、靠评论里的
 幂等标记防重复发送，`reject` 只改状态不产生写操作。
-定时调度（P1-4）：`server.mjs` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
+定时调度（P1-4）：`server.ts` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
 （缺省 08:00，时区读基础资料），与手动触发走同一执行函数、同一通知语义；
 只读状态端点 `GET /api/schedule/status` 给出时区、下次运行、上次运行与结果。
 
@@ -221,7 +234,7 @@ npm run regression       # 或 node scripts/regression.mjs
 ```
 
 脚本以「无模型 Key」的默认环境在测试端口（4398，可用 `REGRESSION_PORT` 覆盖）启动一份
-`server.mjs`，逐项断言后退出：原 26 项覆盖未登录 401、登录、bot CRUD、chat 无 Key 的
+服务端（`dist/server.js`），逐项断言后退出：原 26 项覆盖未登录 401、登录、bot CRUD、chat 无 Key 的
 `MODEL_NOT_CONFIGURED`、草案规则兜底全链路、晨间扫描与产物、收件箱、记忆与首页托管；
 L0-2 扩展第 27-30 项覆盖模型设置（无 Key 默认值、保存不回显全文、测试连接坏端点不崩溃、
 清除恢复未配置）；L0-3 至 L0-5 续扩至 43 项；P1-1 续扩第 44-46 项覆盖 Finding 只读 API
@@ -278,7 +291,7 @@ npm run test:gateway    # 或 node scripts/test-gateway.mjs
 
 覆盖拒绝路径（未批准直调、意图被改、仓库未绑定、不支持的意图、正文含令牌）与执行
 路径（批准恰好发一次、无令牌失败可重试、PR 已关闭保持 approved、写接口失败可重试），
-两类审计齐全性与脱敏，以及源码绕过断言（只有 gateway.mjs 构造评论写端点）。
+两类审计齐全性与脱敏，以及源码绕过断言（只有 gateway.ts 构造评论写端点）。
 
 扫描规则另有替身测试 `scripts/test-scan.mjs`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
 
@@ -1958,3 +1971,47 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
   （仅多一个切换入口）；未发明接口没有的事件种类（如参照图里的
   「上下文」，我们的数据里没有）；未改 `packages/`；未加新依赖；
   未做轨迹实时推送。
+
+### 后端 TS 迁移实测（2026-11-11，分支 feat/ts-migration）
+
+- 范围：`server.mjs` + `lib/*.mjs`（16 文件、约 3971 行）迁为同名 `.ts`（git mv 保史）；
+  `scripts/*.mjs` 不迁（工装），只把拉起服务端的路径改指 `dist/server.js`、把对 lib 的
+  import 改指 `dist/lib/*.js`；test-gateway 的源码绕过断言改为扫 `.ts` 源码（口径不变：
+  只有 gateway.ts 构造 `/comments` 写端点）；`packages/` 一行未改；未加新依赖
+  （typescript 5.9.3 已在 devDependencies）。
+- 构建：新增 `tsconfig.server.json`（strict、NodeNext、outDir `dist/`、rootDir `.`）与
+  `build:server`；`start` = build:web + build:server + `node dist/server.js`；聚合 `test`
+  链在套件前先 build:server；`check` 扩展为前端 + 服务端两次 `tsc --noEmit`，服务端
+  strict 零错误。
+- 路径审计：唯一结构性红线是 `lib/store` 的 APP_DIR 固定层数推导（`dist/lib` 比 `lib`
+  深一层）——改为从本文件目录向上找 `package.json` 定位应用根，kernel /
+  model-providers 的 REPO_ROOT 与 server 静态根都随 APP_DIR 自动正确。实测：不带
+  PIPER_DATA_DIR 直接 import `dist/lib/store.js`，APP_DIR=apps/piper、DATA_DIR=
+  apps/piper/data，与迁移前一致；隔离目录冒烟（见下）数据全落隔离目录。
+- 类型口径：边界优先——store 导出 Bot/Routine/SessionEntry/ArtifactMeta，settings 导出
+  各设置文件形状与 ThinkingLevel 词表，findings 导出 Finding/WriteIntent，gateway 导出
+  GatewayResult/IntentSnapshot，另有轨迹、调度、连接器等形状；kernel 与 model-providers
+  用顶层 `import type` 锚 pi-ai / pi-agent-core 真实声明（Model、MutableModels、
+  CreateProviderOptions、ApiKeyAuth、Agent、AgentTool，AgentEvent 按判别联合收窄，
+  pi-agent-core 自带七挡 ThinkingLevel 与 Piper 词表同集合、直接互通）。动态 dist 按文件
+  路径加载、编译期无法按路径解析类型，只给用到的成员留最小结构接口（PiAiRuntime /
+  PiAiProvidersModule / PiAiIndexModule，成员形状已与基座 .d.ts 核对）。
+- any 清单（全部在外部边界、各有注释）：scan 的 `gh()` 返回与 RepoData 的 GitHub 原始
+  响应字段、gateway 的 `ghJson()` 返回与 PR/评论对象、webfetch 的搜索端点 JSON、
+  kernel 抽草案时的模型输出 JSON、model-providers 拉取的上游 `/models` JSON、server 的
+  `readBody()`（请求体 wire 输入，各路由逐字段校验）、若干 catch 里取 message/status 的
+  局部 cast（错误对象形状由抛出方决定）。
+- 测试：聚合 `npm run test` 退出码 0（复跑两次确认，第一次的管道退出码读数有歧义、
+  第二次无管道复跑 AGG_EXIT=0），各套计数与迁移前基线逐项一致——findings 27、scan 10、
+  pr-review 16、schedule 14、gateway 27、recovery 7、listen 9、badtz 4、secrets 21、
+  model-stub 10、model-providers 57、r10 22、webfetch 48、trace 24、eval:scan 21、
+  regression 72；`npm run shots` 退出码 0、20 张截图全过（字节抖动已还原不入 PR）。
+- 冒烟：新 `npm start` 流程 + 隔离 PIPER_DATA_DIR 真起服务（监听 4417），预置模型设置
+  指向本地 OpenAI 兼容替身：登录 200 → 一轮对话 SSE 增量拼合为替身全文「冒烟回复 OK」
+  （会话 JSONL 落 user+assistant 两条）→ `GET /api/bots/piper-main/trace` 返回 1 轮
+  （user/assistant 两事件、时长 857ms、预览正确）；数据文件全在隔离目录内。
+  注：冒烟脚本自身收尾时子进程清理不净（kill 只打到 npm 包装层、脚本等待超时），
+  服务进程手动回收；产品侧行为已由上述实据与 test:model-stub 套件钉死，与迁移无关，
+  仅记录在案。
+- 明确不做：未改 `packages/`；未改 SSE 事件名与载荷、路由、落盘格式、日志与错误形状；
+  未迁 scripts；未加新依赖；迁移中未顺手修任何存量行为（发现的问题只记录）。
