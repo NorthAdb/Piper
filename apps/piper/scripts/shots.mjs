@@ -90,7 +90,7 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 	}
 	let raw = "";
 	reqHttp.on("data", (c) => (raw += c));
-	reqHttp.on("end", () => {
+	reqHttp.on("end", async () => {
 		let body = {};
 		try {
 			body = JSON.parse(raw || "{}");
@@ -114,13 +114,46 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 		resHttp.write(chunk({ role: "assistant" }));
 		if (last.role === "tool") {
 			const toolText = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
+			// 思考分段截图（15）：带「先想一想」的话先回第二段 reasoning 再回正文，
+			// 与工具调用前的第一段构成同轮两段思考。11 号图的工具结果不带这句，不受影响。
+			if (typeof body.reasoning_effort === "string" && body.reasoning_effort && userText.includes("先想一想")) {
+				resHttp.write(chunk({ reasoning_content: "再结合页面想一想：" }));
+				resHttp.write(chunk({ reasoning_content: "页面要点已经清楚，可以作答。" }));
+				// 停顿一下再回正文，让第二段的 durationMs 是真实秒数（摘要行不至于是 0 秒）
+				await new Promise((r) => setTimeout(r, 1200));
+			}
 			resHttp.write(chunk({ content: `页面要点：${toolText.slice(0, 220)}` }));
 			resHttp.write(chunk({}, "stop"));
+		} else if (
+			typeof body.reasoning_effort === "string" &&
+			body.reasoning_effort &&
+			toolNames.includes("web_fetch") &&
+			/https?:\/\//.test(userText) &&
+			userText.includes("先想一想")
+		) {
+			// 思考分段截图（15）第一段：先回一段 reasoning，再发 web_fetch 工具调用，
+			// 让工具调用把思考段打断。
+			const url = /https?:\/\/[^\s"']+/.exec(userText)[0];
+			resHttp.write(chunk({ reasoning_content: "先拆解问题：" }));
+			resHttp.write(chunk({ reasoning_content: "要先打开页面确认内容，再组织回答。" }));
+			// 停顿一下再发工具调用，让第一段的 durationMs 是真实秒数（摘要行不至于是 0 秒）
+			await new Promise((r) => setTimeout(r, 1200));
+			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots_seg", type: "function", function: { name: "web_fetch", arguments: "" } }] }));
+			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
+			resHttp.write(chunk({}, "tool_calls"));
 		} else if (toolNames.includes("web_fetch") && /https?:\/\//.test(userText)) {
 			const url = /https?:\/\/[^\s"']+/.exec(userText)[0];
 			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots", type: "function", function: { name: "web_fetch", arguments: "" } }] }));
 			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
 			resHttp.write(chunk({}, "tool_calls"));
+		} else if (typeof body.reasoning_effort === "string" && body.reasoning_effort) {
+			// 兜底 reasoning 分支：请求带 reasoning_effort 且不命中上面的工具/分段
+			// 分支时，先回两段 reasoning_content 增量、再回正文。必须放在 web_fetch
+			// 分支之后：11 号图的抓取首请求也带着挡位参数（种子已存 high），要先命中工具分支。
+			resHttp.write(chunk({ reasoning_content: "先拆解问题：" }));
+			resHttp.write(chunk({ reasoning_content: "1 加 1 是最基础的加法，结果为 2。" }));
+			resHttp.write(chunk({ content: "1 加 1 等于 2。" }));
+			resHttp.write(chunk({}, "stop"));
 		} else {
 			resHttp.write(chunk({ content: "好的。" }));
 			resHttp.write(chunk({}, "stop"));
@@ -384,6 +417,28 @@ console.log("截图 12 用配置已写入（provider=deepseek，端点=本地 st
 		await clickPoint(centerOf("#model-id-select"), "再次点击模型触发器收起下拉");
 		await waitFor(`document.querySelectorAll('[role="option"]').length === 0`, "模型下拉已收起");
 	}
+	// 思考挡位截图（14）：把已保存配置换成目录模型 deepseek-flash + 挡位 high
+	// （端点仍是本地 stub、Key 仍是种子假 Key），重载后在模型组打开思考挡位
+	// 下拉——选项应恰为 pi-ai 给该模型的支持集 off / low / high / max。
+	runSeed(`
+import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+saveModelSettingsFile({ provider: "deepseek", baseUrl: "${SHOTS_MODEL_BASE}", modelId: "deepseek-flash", apiKey: "${FAKE_KEY}", thinkingLevel: "high" });
+console.log("截图 14 用配置已写入（deepseek-flash + thinkingLevel=high）");
+`);
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "重载后主界面出现（思考挡位截图）");
+	await clickText("设置", { maxX: 264 });
+	await waitFor(bodyHas("思考挡位"), "设置-模型组出现思考挡位");
+	await evaluate(`document.querySelector('#model-thinking-level')?.scrollIntoView({ block: 'center' })`);
+	await clickPoint(centerOf("#model-thinking-level"), "打开思考挡位下拉");
+	await waitFor(
+		`(() => { const opts = [...document.querySelectorAll('[role="option"]')].map((el) => (el.textContent || '').trim()); return ['off', 'low', 'high', 'max'].every((l) => opts.includes(l)); })()`,
+		"思考挡位下拉出现 off/low/high/max",
+	);
+	await shot("14-settings-thinking-levels.png");
+	await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	await waitFor(`document.querySelectorAll('[role="option"]').length === 0`, "思考挡位下拉已收起");
 	await clickText("基础资料");
 	await waitFor(bodyHas("关于我"), "设置-基础资料组出现");
 	await shot("05-settings-profile.png");
@@ -475,6 +530,28 @@ console.log("种子（待批 Finding）已写入");
 	await waitFor(bodyHas("HTTP 200"), "刷新后展开工具卡仍看到结果摘要 HTTP 200", 30000);
 	await new Promise((r) => setTimeout(r, 800));
 	await shot("13-chat-tool-card-after-reload.png");
+
+	// 思考链（15）：当前已保存配置是 deepseek-flash + thinkingLevel=high（截图 14
+	// 的种子），向主 bot 发一个会触发 stub 分段分支的问题——同轮两段思考：第一段
+	// 被 web_fetch 工具调用打断、第二段在工具结果后、正文之前。回合结束两段都应
+	// 自动折叠为摘要行「已思考 Ns · 约 M 字」；点开第二段摘要，能看到左侧弱化
+	// 竖条内的推理全文。
+	await waitFor(`document.querySelector('textarea') !== null`, "主 bot 对话输入框出现（思考截图）");
+	await evaluate(`document.querySelector('textarea').focus()`);
+	await cdp("Input.insertText", { text: `先想一想：打开 http://127.0.0.1:${FIXTURE_PORT}/page 看看里面写了什么` }, sessionId);
+	await clickText("发送");
+	await waitFor(bodyHas("紫水晶海豹"), "分段回合的正文出现（引用夹具特征句）", 30000);
+	await waitFor(
+		`(document.body.innerText.match(/已思考/g) ?? []).length >= 2`,
+		"两段思考都已折叠为摘要行「已思考 Ns · 约 M 字」",
+		30000,
+	);
+	await evaluate(
+		`(() => { const btns = [...document.querySelectorAll('button')].filter((b) => b.textContent.includes('已思考')); const b = btns[btns.length - 1]; b?.scrollIntoView({ block: "center" }); b?.click(); return btns.length; })()`,
+	);
+	await waitFor(bodyHas("再结合页面想一想"), "点开第二段摘要看到弱化竖条内的推理全文", 30000);
+	await new Promise((r) => setTimeout(r, 800));
+	await shot("15-chat-thinking.png");
 
 	console.log(`\n截图完成：${shots.length} 张，目录 ${SCREENS_DIR}`);
 	console.log("注意：脚本不做内容断言，请逐张目检 Key 区为掩码、无真实秘密。");

@@ -16,13 +16,17 @@
 //   PIPER_MODEL_BASE_URL（默认 https://api.openai.com/v1）、PIPER_MODEL_ID（默认 gpt-4o-mini）。
 //   环境变量里的秘密不会被自动写进设置文件。无 Key 时 configured=false，
 //   调用方发「未配置模型」事件，不崩溃。modelConfig() 每次现读文件，保存后下一次 prompt 即生效。
+//   思考挡位（thinkingLevel）也在设置文件里：词表与 pi-ai 的 ThinkingLevel 一致
+//   （off/minimal/low/medium/high/xhigh/max），缺省 off；生效值在
+//   buildModelsAndModel 里按 pi-ai 目录模型的支持集吸附（clampThinkingLevel）。
 //
 // 说明：这里用动态 import 懒加载基座 dist——基座未构建时 app 的其余 API（bot CRUD/例程/产物）
 // 仍须可用，所以不能在模块顶层静态 import 一个可能不存在的 dist；失败原因会原样上报。
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
-import { readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.mjs";
+import { isThinkingLevel, readModelSettingsFile, webFetchEnabled, webSearchConfig, webToolBots } from "./settings.mjs";
+import { getCatalogModel, resolveModelProviderId } from "./model-providers.mjs";
 import { webFetch, webSearch } from "./webfetch.mjs";
 import { redact } from "./redact.mjs";
 import { APP_DIR } from "./store.mjs";
@@ -37,6 +41,9 @@ export function modelConfig() {
 		apiKey,
 		baseUrl: saved.baseUrl || process.env.PIPER_MODEL_BASE_URL || "https://api.openai.com/v1",
 		modelId: saved.modelId || process.env.PIPER_MODEL_ID || "gpt-4o-mini",
+		// 思考挡位只来自设置文件（无 env 兜底）；文件里的值不在七挡词表内
+		// （手改文件写错）按 off 读，不把坏值传给 Agent。
+		thinkingLevel: isThinkingLevel(saved.thinkingLevel) ? saved.thinkingLevel : "off",
 	};
 }
 
@@ -67,6 +74,17 @@ async function loadRuntime() {
 
 async function buildModelsAndModel(cfg) {
 	const { ai, openAICompletionsApi } = await loadRuntime();
+	// 思考挡位的依据必须落在构造出的 Model 上：pi-ai 的 openai-completions 在
+	// 发请求前会拿这个 Model 做 clampThinkingLevel 并按 thinkingLevelMap 翻译
+	// 厂商参数，reasoning 为假时则完全不发思考参数。所以命中 pi-ai 目录的
+	// 模型要把目录 Model 的 reasoning 与 thinkingLevelMap 原样带过来，并先用
+	// clampThinkingLevel 把已存挡位吸附到该模型的支持集，得到的生效挡位才
+	// 传给 Agent；目录里查不到的自定义模型无元数据可依，按支持 reasoning
+	// 处理（无 thinkingLevelMap）、挡位原样传 Agent，服务商不认时其错误走
+	// modelErrorMessage 的脱敏出口。
+	const saved = readModelSettingsFile();
+	const providerId = await resolveModelProviderId(saved);
+	const catalogModel = await getCatalogModel(providerId, cfg.modelId);
 	const model = {
 		id: cfg.modelId,
 		name: cfg.modelId,
@@ -75,10 +93,12 @@ async function buildModelsAndModel(cfg) {
 		baseUrl: cfg.baseUrl,
 		input: ["text"],
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-		reasoning: false,
+		reasoning: catalogModel ? Boolean(catalogModel.reasoning) : true,
+		...(catalogModel?.thinkingLevelMap ? { thinkingLevelMap: catalogModel.thinkingLevelMap } : {}),
 		contextWindow: 128000,
 		maxTokens: 8192,
 	};
+	const thinkingLevel = catalogModel ? ai.clampThinkingLevel(catalogModel, cfg.thinkingLevel) : cfg.thinkingLevel;
 	// 自定义 ApiKeyAuth：直接解析 modelConfig() 已合并好的 Key（设置文件优先、环境变量兜底），
 	// 不再走 envApiKeyAuth——否则设置页保存的 Key 喂不进 provider。
 	const keyAuth = {
@@ -95,7 +115,7 @@ async function buildModelsAndModel(cfg) {
 	});
 	const models = ai.createModels();
 	models.setProvider(provider);
-	return { models, model };
+	return { models, model, thinkingLevel };
 }
 
 function toPiMessages(history, cfg) {
@@ -220,7 +240,12 @@ export function webToolsForBot(bot) {
 	return tools;
 }
 
-// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"tool",phase,name,toolCallId,detail}。
+// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"thinking",text,level} /
+// {type:"tool",phase,name,toolCallId,detail}。thinking 是思考链增量：pi-ai 的
+// openai-completions 已把服务商回的 reasoning_content / reasoning /
+// reasoning_text 解析成 thinking 内容，pi-agent-core 以 message_update 的
+// thinking_delta 往外送，这里原样转发并带上生效挡位 level（已 clamp 的值，
+// 供前端思考区头部与服务端按段落盘标注；挡位为 off 或服务商不回推理时不出现）。
 // tool 事件的 call/start/end 三段带同一个 toolCallId（前端按它把一次调用合并成一张卡、
 // 服务端按它收集落盘）；end 的 detail 除 isError 外并入工具结果的 details
 // （web_fetch 的 {url,status,truncated}、web_search 的 {count}），出错时再带 error 文本。
@@ -233,7 +258,7 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent,
 		});
 	}
 	const { agentCore } = await loadRuntime();
-	const { models, model } = await buildModelsAndModel(cfg);
+	const { models, model, thinkingLevel } = await buildModelsAndModel(cfg);
 	const toolNote = tools.length
 		? `\n\n你可以使用这些只读工具：${tools.map((t) => t.name).join("、")}。工具被拒绝或失败时，把原因如实告诉用户，不要编造网页内容。`
 		: "";
@@ -243,7 +268,7 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent,
 			model,
 			messages: toPiMessages(history, cfg),
 			tools,
-			thinkingLevel: "off",
+			thinkingLevel,
 		},
 		streamFn: (m, context, options) => models.streamSimple(m, context, options),
 	});
@@ -252,6 +277,7 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent,
 		if (event.type === "message_update") {
 			const ame = event.assistantMessageEvent;
 			if (ame?.type === "text_delta" && ame.delta) onEvent({ type: "delta", text: ame.delta });
+			if (ame?.type === "thinking_delta" && ame.delta) onEvent({ type: "thinking", text: ame.delta, level: thinkingLevel });
 			if (ame?.type === "toolcall_end" && ame.toolCall) {
 				onEvent({ type: "tool", phase: "call", name: ame.toolCall.name, toolCallId: ame.toolCall.id, detail: ame.toolCall.arguments ?? null });
 			}

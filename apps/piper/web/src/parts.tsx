@@ -3,8 +3,8 @@
 // 草案/系统/错误卡用 shadcn Card/Badge/Button 与设计系统色调实现。
 import type { DataMessagePartComponent, TextMessagePartComponent, ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import { BotIcon, CheckIcon, InfoIcon, TriangleAlertIcon, XIcon } from "lucide-react";
-import { createContext, useContext, useState } from "react";
+import { BotIcon, BrainIcon, CheckIcon, ChevronDownIcon, InfoIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { createContext, useContext, useEffect, useState } from "react";
 import remarkGfm from "remark-gfm";
 import { Tool, ToolContent, ToolHeader, ToolInput, ToolOutput } from "@/components/ai-elements/tool";
 import type { ToolPart } from "@/components/ai-elements/tool";
@@ -79,6 +79,62 @@ export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, arg
 				) : null}
 			</ToolContent>
 		</Tool>
+	);
+};
+
+// ---- 思考过程（reasoning part：一段思考的弱权重呈现，与正文、工具卡分开） ----
+// 内容是服务商回传的推理文本（SSE thinking 事件按 seg 流式拼入，或历史流水
+// 按段还原）。呈现规格（定稿）：不用边框卡片，左侧 2px 弱化色竖条 + 弱化色
+// 文字，视觉次序明确低于正文与工具卡；流式中展开（头部：思考中… + 已用秒数
+// + 生效挡位），段关闭/回合结束自动折叠为一行摘要「已思考 Ns · 约 M 字」，
+// 点击展开全文；历史还原永远初始折叠。段是否已关闭看 durationMs（直播在段
+// 关闭时由 ChatPane 补记，历史来自落盘条目）；旧落盘无 durationMs 时摘要
+// 不带秒数。空段不渲染。
+
+export type ReasoningPartData = { text: string; truncated?: boolean; level?: string; durationMs?: number; startedAt?: number };
+
+export const ReasoningCard: DataMessagePartComponent<ReasoningPartData> = ({ data, status }) => {
+	const [override, setOverride] = useState<boolean | null>(null);
+	const [, setTick] = useState(0);
+	const streaming = status?.type === "running" && data.durationMs === undefined;
+	useEffect(() => {
+		if (!streaming) return;
+		const t = setInterval(() => setTick((v) => v + 1), 1000);
+		return () => clearInterval(t);
+	}, [streaming]);
+	if (!streaming && !(data.text ?? "").trim()) return null;
+	const open = override ?? streaming;
+	const chars = (data.text ?? "").length;
+	const elapsedSec = data.startedAt !== undefined ? Math.max(0, Math.floor((Date.now() - data.startedAt) / 1000)) : null;
+	const summary =
+		data.durationMs !== undefined ? `已思考 ${Math.ceil(data.durationMs / 1000)} 秒 · 约 ${chars} 字` : `思考过程 · 约 ${chars} 字`;
+	return (
+		<div className="border-l-2 border-muted-foreground/25 pl-3">
+			<button
+				type="button"
+				className="flex w-full items-center gap-2 py-0.5 text-left text-sm text-muted-foreground"
+				onClick={() => setOverride(!open)}
+				aria-expanded={open}
+			>
+				<BrainIcon className="size-4 shrink-0" />
+				{streaming ? (
+					<>
+						<span className="font-medium">思考中…</span>
+						{elapsedSec !== null ? <span className="text-xs">{elapsedSec} 秒</span> : null}
+						{data.level ? <span className="text-xs">挡位 {data.level}</span> : null}
+					</>
+				) : (
+					<span className="font-medium">{summary}</span>
+				)}
+				<ChevronDownIcon className={`ml-auto size-4 shrink-0 transition-transform ${open ? "" : "-rotate-90"}`} />
+			</button>
+			{open ? (
+				<div className="pt-1 pb-1.5">
+					<p className="text-sm break-words whitespace-pre-wrap text-muted-foreground">{data.text}</p>
+					{data.truncated ? <p className="mt-2 text-xs text-muted-foreground">（内容过长，历史中仅保留前一部分）</p> : null}
+				</div>
+			) : null}
+		</div>
 	);
 };
 

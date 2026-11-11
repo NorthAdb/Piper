@@ -9,6 +9,9 @@
 // （provider 存 custom），让读回的归属与实际端点一致。保存即热生效（后端
 // 设置文件优先于环境变量）；Key 只在输入框出现，读回只有末四位掩码。
 // 输入框留空保存 = 不修改 Key；「清除 Key」单独发送空串清除。
+// 思考挡位照 Pi 自带 /thinking 选择器的链：选项来自目录下发的
+// supportedThinkingLevels（pi-ai 按每款模型元数据现算），不自造挡位表；
+// 已选挡位不被当前模型支持时不改存量，页面提示内核 clamp 后的实际生效值。
 import { CheckCircle2Icon, Loader2Icon, PlugZapIcon, RefreshCwIcon, SaveIcon, Trash2Icon, XCircleIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
@@ -19,6 +22,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { ALL_THINKING_LEVELS, clampThinkingLevel } from "./model";
 import type { ModelProvider, ModelSettings } from "./model";
 
 type TestState = { kind: "idle" } | { kind: "testing" } | { kind: "ok" } | { kind: "fail"; error: string };
@@ -36,6 +40,7 @@ export function ModelSettingsForm({ onSaved, onUnauthorized }: { onSaved: () => 
 	const [baseUrl, setBaseUrl] = useState("");
 	const [modelId, setModelId] = useState("");
 	const [modelCustom, setModelCustom] = useState(true);
+	const [thinkingLevel, setThinkingLevel] = useState("off");
 	const [apiKey, setApiKey] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [notice, setNotice] = useState("");
@@ -51,12 +56,13 @@ export function ModelSettingsForm({ onSaved, onUnauthorized }: { onSaved: () => 
 		setProvider(v.provider);
 		setBaseUrl(v.baseUrl);
 		setModelId(v.modelId);
+		setThinkingLevel(v.thinkingLevel || "off");
 		setApiKey("");
 		setFetchedModels(null);
 		setFetchState({ kind: "idle" });
 		autoFetchKeyRef.current = "";
 		const entry = catalog.find((p) => p.id === v.provider);
-		setModelCustom(!(entry && entry.models.includes(v.modelId)));
+		setModelCustom(!(entry && entry.models.some((m) => m.id === v.modelId)));
 		onSaved();
 	};
 
@@ -84,7 +90,17 @@ export function ModelSettingsForm({ onSaved, onUnauthorized }: { onSaved: () => 
 	const diverged = provider !== "custom" && normalizeUrl(baseUrl) !== normalizeUrl(currentProvider.baseUrl);
 	const effectiveProvider = diverged ? "custom" : provider;
 	// 下拉可选模型：拉取成功过就用端点返回的名单，否则用目录名单。
-	const modelOptions = fetchedModels ?? currentProvider.models;
+	const modelOptions = fetchedModels ?? currentProvider.models.map((m) => m.id);
+	// 思考挡位选项：当前模型名命中所选服务商的目录条目就用其
+	// supportedThinkingLevels（与端点拉取与否无关，挡位是模型元数据）；
+	// 命中不了（自定义模型名、custom 服务商）回落完整七挡词表。
+	const catalogThinkingLevels = currentProvider.models.find((m) => m.id === modelId)?.supportedThinkingLevels;
+	const thinkingOptions = catalogThinkingLevels ?? ALL_THINKING_LEVELS;
+	const storedLevelUnsupported = !thinkingOptions.includes(thinkingLevel);
+	const effectiveThinkingLevel = clampThinkingLevel(thinkingOptions, thinkingLevel);
+	// 已选挡位不在选项里时，把它作为额外一项渲染出来（标注当前值），否则
+	// Select 找不到对应项会显示空白；保存仍按原值提交，不静默改存量。
+	const thinkingSelectOptions = storedLevelUnsupported ? [...thinkingOptions, thinkingLevel] : thinkingOptions;
 
 	const doFetchModels = async (manual: boolean) => {
 		const target = baseUrl.trim();
@@ -133,7 +149,7 @@ export function ModelSettingsForm({ onSaved, onUnauthorized }: { onSaved: () => 
 		if (entry && id !== "custom") {
 			setBaseUrl(entry.baseUrl);
 			if (entry.models.length) {
-				setModelId(entry.models[0]);
+				setModelId(entry.models[0].id);
 				setModelCustom(false);
 			}
 		} else {
@@ -166,6 +182,7 @@ export function ModelSettingsForm({ onSaved, onUnauthorized }: { onSaved: () => 
 				provider: effectiveProvider,
 				baseUrl: baseUrl.trim(),
 				modelId: modelId.trim(),
+				thinkingLevel,
 				...(apiKey ? { apiKey } : {}),
 			});
 			applyView(v, providers);
@@ -301,6 +318,30 @@ export function ModelSettingsForm({ onSaved, onUnauthorized }: { onSaved: () => 
 								<span className="text-xs text-muted-foreground">当前显示的是目录名单；填入 Key 后会自动从端点拉取。</span>
 							) : null}
 						</div>
+					</div>
+					<div className="flex flex-col gap-2">
+						<Label htmlFor="model-thinking-level">思考挡位（thinkingLevel）</Label>
+						<Select value={thinkingLevel} onValueChange={setThinkingLevel}>
+							<SelectTrigger id="model-thinking-level" className="w-full">
+								<SelectValue placeholder="选择思考挡位" />
+							</SelectTrigger>
+							<SelectContent>
+								{thinkingSelectOptions.map((l) => (
+									<SelectItem key={l} value={l}>
+										{l}
+										{storedLevelUnsupported && l === thinkingLevel ? "（当前值，该模型不支持）" : ""}
+									</SelectItem>
+								))}
+							</SelectContent>
+						</Select>
+						{storedLevelUnsupported ? (
+							<p className="text-xs text-muted-foreground">
+								当前挡位「{thinkingLevel}」不被该模型支持，保存值不变，实际生效为「{effectiveThinkingLevel}」（内核按 pi-ai
+								规则吸附）。
+							</p>
+						) : (
+							<p className="text-xs text-muted-foreground">可选项来自 pi-ai 目录中该模型的支持集；off 表示不发送思考参数。</p>
+						)}
 					</div>
 					<div className="flex flex-col gap-2">
 						<Label htmlFor="model-api-key">API Key</Label>

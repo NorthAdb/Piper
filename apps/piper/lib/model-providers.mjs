@@ -16,6 +16,11 @@
 // 仍可走「自定义端点」手填 baseUrl + Key。
 // 基座 dist 不存在或加载失败时目录回落为只有 custom——设置页仍可手填接入。
 //
+// 目录里每个模型条目带 supportedThinkingLevels：用 pi-ai 的
+// getSupportedThinkingLevels 对该模型现算（reasoning 为假只有 off；否则按
+// thinkingLevelMap 过滤，xhigh/max 须显式映射）——与 Pi 自带 /thinking
+// 选择器的同一条链，Piper 不另维护挡位表。原始 Model 另存索引供内核取用。
+//
 // 本模块还提供 fetchUpstreamModels：设置页填了端点与 Key 后从端点
 // GET {baseUrl}/models 拉取真实模型名单。Key 的使用守卫在 server 路由层
 // （缺省 Key 只许复用到与已保存配置完全一致的端点，见 server.mjs 的
@@ -25,6 +30,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { APP_DIR } from "./store.mjs";
+import { THINKING_LEVELS } from "./settings.mjs";
 import { redact, REDACTED } from "./redact.mjs";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
@@ -34,20 +40,36 @@ export const COMPATIBLE_MODEL_API = "openai-completions";
 export const CUSTOM_PROVIDER = { id: "custom", name: "自定义端点", baseUrl: "", models: [] };
 
 let catalogPromise = null;
+// 目录原始模型索引（providerId -> Map(modelId -> pi-ai Model)）：只含兼容子集，
+// 供内核按 (provider, modelId) 取回原始 Model（reasoning / thinkingLevelMap 是
+// pi-ai 做挡位吸附与厂商参数翻译的依据，见 lib/kernel.mjs）。
+let catalogModelIndex = new Map();
 
 async function buildCatalog() {
 	const allPath = join(REPO_ROOT, "packages", "ai", "dist", "providers", "all.js");
-	if (!existsSync(allPath)) return [{ ...CUSTOM_PROVIDER }];
+	const indexPath = join(REPO_ROOT, "packages", "ai", "dist", "index.js");
+	if (!existsSync(allPath) || !existsSync(indexPath)) return [{ ...CUSTOM_PROVIDER }];
 	try {
 		const all = await import(pathToFileURL(allPath).href);
+		// getSupportedThinkingLevels 在 pi-ai 主入口（models.ts）：挡位支持集一律
+		// 用它对每个目录模型现算，不在 Piper 侧另维护挡位表。
+		const ai = await import(pathToFileURL(indexPath).href);
 		const providers = [];
+		const index = new Map();
 		for (const provider of all.builtinProviders()) {
 			const compat = all.getBuiltinModels(provider.id).filter((m) => m.api === COMPATIBLE_MODEL_API);
 			if (!compat.length) continue;
 			const baseUrl = compat.find((m) => m.baseUrl)?.baseUrl ?? "";
 			if (!baseUrl) continue;
-			providers.push({ id: provider.id, name: provider.name, baseUrl, models: compat.map((m) => m.id) });
+			index.set(provider.id, new Map(compat.map((m) => [m.id, m])));
+			providers.push({
+				id: provider.id,
+				name: provider.name,
+				baseUrl,
+				models: compat.map((m) => ({ id: m.id, supportedThinkingLevels: ai.getSupportedThinkingLevels(m) })),
+			});
 		}
+		catalogModelIndex = index;
 		return [...providers, { ...CUSTOM_PROVIDER }];
 	} catch {
 		return [{ ...CUSTOM_PROVIDER }];
@@ -75,6 +97,23 @@ export async function isKnownModelProvider(id) {
 export async function resolveModelProviderId(saved) {
 	const id = saved && typeof saved.provider === "string" ? saved.provider : "";
 	return (await isKnownModelProvider(id)) ? id : "custom";
+}
+
+// 按 (providerId, modelId) 取目录里的 pi-ai 原始 Model（仅兼容子集）；
+// 查不到（自定义端点、目录外模型名）回 null。
+export async function getCatalogModel(providerId, modelId) {
+	await loadModelProviders();
+	return catalogModelIndex.get(providerId)?.get(modelId) ?? null;
+}
+
+// 某 (provider, modelId) 的可选思考挡位：命中目录模型时用 pi-ai
+// getSupportedThinkingLevels 现算的结果（与目录接口下发的同一份）；目录里
+// 查不到的自定义模型无元数据可依，回落完整七挡词表（内核对这类模型把挡位
+// 原样传给 Agent，服务商不认时错误走既有脱敏出口）。
+export async function thinkingLevelsFor(providerId, modelId) {
+	const providers = await loadModelProviders();
+	const entry = providers.find((p) => p.id === providerId)?.models.find((m) => m.id === modelId);
+	return entry ? [...entry.supportedThinkingLevels] : [...THINKING_LEVELS];
 }
 
 // ---------- 从端点拉取模型名单（GET {baseUrl}/models） ----------

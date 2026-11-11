@@ -32,8 +32,10 @@
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
 // GET /api/model-providers 模型服务商目录只读（派生自 pi-ai 内置目录，只含内核兼容的 openai-completions 服务商 + custom）
 // GET /api/settings/model 模型设置读回（configured/provider/baseUrl/modelId/apiKeyHint，绝无 Key 全文；
-//   旧文件无 provider、或 provider 已不在目录中，按 custom 读回）
-// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除；provider 须为目录 id，未知回 400），保存即热生效
+//   旧文件无 provider、或 provider 已不在目录中，按 custom 读回；另带 thinkingLevel 已存挡位
+//   与 thinkingLevels 当前模型可选挡位，派生自 pi-ai 目录，目录外模型回落全词表）
+// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除；provider 须为目录 id、
+//   thinkingLevel 须为七挡词表内的值，未知均回 400 且文件不变），保存即热生效
 // POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
 // POST /api/settings/model/fetch-models 用表单端点与 Key 拉取端点 /models 的模型名单；缺省 Key 时只许端点
 //   与已保存配置完全一致时复用已保存 Key（R7 守卫），回 {ok:true,models} 或 {ok:false,status,error}
@@ -51,7 +53,10 @@
 // POST /api/chat 的 SSE 事件（event 名 + JSON data）：
 // session {botId, sessionId} 本轮开始
 // delta {text} 模型流式增量文本
-// tool {phase, name, detail} 工具/内核事件（前端折叠卡渲染）
+// thinking {text, level, seg, segStart?} 思考链增量（刻意扩展的新事件；思考挡位非 off 且
+//   服务商回传推理时才有，与正文 delta 分开，前端按 seg 拼成独立的思考段渲染；
+//   level 是生效挡位，seg 是本轮段号，segStart 只在每段首个增量上出现）
+// tool {phase, name, toolCallId, detail} 工具/内核事件（前端折叠卡渲染）
 // system {kind, text} 系统提示（如草案已生成、兜底说明）
 // draft {draft} Bot 草案卡：{name, systemPrompt, tools, repos, memoryScope, source}
 // error {code, message} code=MODEL_NOT_CONFIGURED 时 message 明确写「未配置模型」
@@ -82,8 +87,8 @@ readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.mjs";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
-import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId} from "./lib/model-providers.mjs";
+import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
+import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.mjs";
 import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
@@ -208,15 +213,20 @@ return raw? JSON.parse(raw): {};
 }
 
 // 模型设置对外视图：只暴露是否已配置、端点、模型名与 Key 末四位掩码，绝不含 Key 全文。
-// provider 归属要查 pi-ai 派生目录（异步加载），所以本函数是 async。
+// provider 归属与思考挡位支持集要查 pi-ai 派生目录（异步加载），所以本函数是 async。
+// thinkingLevel 是已存的选择（存量不因模型支持集而改写，生效值由内核 clamp）；
+// thinkingLevels 是当前 (provider, modelId) 可选的挡位（目录外模型回落全词表）。
 async function modelSettingsView() {
 const cfg = modelConfig();
+const provider = await resolveModelProviderId(readModelSettingsFile());
 return {
 configured: cfg.configured,
-provider: await resolveModelProviderId(readModelSettingsFile()),
+provider,
 baseUrl: cfg.baseUrl,
 modelId: cfg.modelId,
 apiKeyHint: secretHint(cfg.apiKey),
+thinkingLevel: cfg.thinkingLevel,
+thinkingLevels: await thinkingLevelsFor(provider, cfg.modelId),
 };
 }
 
@@ -254,24 +264,65 @@ if (value && typeof value === "object") return Object.fromEntries(Object.entries
 return value;
 }
 
+// 本轮的思考段与工具条目共用一个递增 seq：条目定型时按事件发生顺序领号，
+// 回合结束按 seq 排序一并落盘，前端刷新回来据此还原与直播一致的交错顺序。
+let leadSeq = 0;
+const leadThinkingEntries = [];
+
 // 本轮工具调用按 toolCallId 收集：直播事件只透传不落盘，回合结束时把最终态逐条写进
 // 会话流水、排在 assistant（或 error）条目之前，前端刷新/切 bot 回来据此还原工具卡。
+// end 事件到达时领 seq（与思考段的定型顺序共用一本账），决定它在流水中的位置。
 const toolCalls = new Map();
 const collectTool = (e) => {
 const id = e.toolCallId || `${e.name}:${toolCalls.size}`;
-const rec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null };
+const rec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined };
 if (e.name) rec.name = e.name;
 if (e.phase === "end") {
 rec.status = e.detail?.isError ? "error" : "complete";
 rec.result = e.detail ?? null;
+if (rec.seq === undefined) rec.seq = leadSeq++;
 } else if (e.detail != null) {
 rec.args = e.detail;
 }
 toolCalls.set(id, rec);
 };
-const persistToolCalls = () => {
+
+// 思考链落盘（按段定型）：直播时逐段透传 SSE thinking 事件（带生效挡位 level
+// 与段号 seg），服务端按事件流切段——段在工具事件、正文 delta 或回合结束时
+// 关闭；关闭时定型为一条 role:"thinking" 条目，带 seq（与 tool 条目共用）、
+// durationMs（段首个 thinking 事件到段关闭）与 level（生效挡位）。空段（只有
+// 空白）不落盘。单段文本落盘上限 THINKING_PERSIST_MAX_CHARS，超出截断并以
+// truncated 标明；text 字段由 appendSession 统一过 redact（与 tool 条目同一
+// 秘密禁入面）。思考不回喂模型（kernel 的 toPiMessages 只取 user/assistant
+// 条目）。旧落盘形状（整轮一条、无 seq/durationMs/level）由前端读回兼容。
+const THINKING_PERSIST_MAX_CHARS = 16_000;
+let openSeg = null;
+let segIndex = 0;
+const closeThinkingSeg = () => {
+if (!openSeg) return;
+const seg = openSeg;
+openSeg = null;
+if (!seg.text.trim()) return;
+const truncated = seg.text.length > THINKING_PERSIST_MAX_CHARS;
+leadThinkingEntries.push({
+role: "thinking",
+text: truncated ? seg.text.slice(0, THINKING_PERSIST_MAX_CHARS) : seg.text,
+truncated,
+seq: leadSeq++,
+durationMs: Math.max(0, Date.now() - seg.startedAt),
+level: seg.level,
+sessionId,
+});
+};
+
+// 回合收尾落盘：先关掉仍开着的思考段，再把思考段与工具条目按 seq 合并排序
+// 逐条写进会话流水（排在 assistant 或 error 条目之前）。
+const persistLead = () => {
+closeThinkingSeg();
+const toolEntries = [];
 for (const rec of toolCalls.values()) {
-appendSession(bot.id, {
+if (rec.seq === undefined) rec.seq = leadSeq++;
+toolEntries.push({
 role: "tool",
 toolCallId: rec.toolCallId,
 name: rec.name,
@@ -279,8 +330,12 @@ args: redactDeep(rec.args),
 // 回合已结束仍无 end 事件的调用视为中断，落盘为 error 而不是永远 running
 status: rec.status === "running" ? "error" : rec.status,
 result: redactDeep(rec.result),
+seq: rec.seq,
 sessionId,
 });
+}
+for (const entry of [...leadThinkingEntries, ...toolEntries].sort((a, b) => a.seq - b.seq)) {
+appendSession(bot.id, entry);
 }
 };
 
@@ -292,17 +347,29 @@ history,
 message,
 tools: webToolsForBot(bot),
 onEvent: (e) => {
-if (e.type === "delta") emit("delta", { text: e.text});
+if (e.type === "delta") {
+// 正文出现即关闭当前思考段（思考→正文→思考是两段，不是一段）
+closeThinkingSeg();
+emit("delta", { text: e.text});
+}
+else if (e.type === "thinking") {
+if (!openSeg) openSeg = { text: "", startedAt: Date.now(), level: e.level ?? "off", index: segIndex++ };
+const segStart = openSeg.text.length === 0;
+openSeg.text += e.text;
+emit("thinking", { text: e.text, level: openSeg.level, seg: openSeg.index, ...(segStart ? { segStart: true } : {}) });
+}
 else if (e.type === "tool") {
+// 工具调用打断思考段：先关段，工具条目在 end 时领到更大的 seq，顺序不乱
+closeThinkingSeg();
 collectTool(e);
 emit("tool", { phase: e.phase, name: e.name, toolCallId: e.toolCallId, detail: e.detail});
 }
 },
 });
-persistToolCalls();
+persistLead();
 appendSession(bot.id, { role: "assistant", text, sessionId});
 } catch (err) {
-persistToolCalls();
+persistLead();
 // 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
 // 这里是其余错误路径的兜底出口。
 const safeMessage = redact(String(err?.message?? err)).slice(0, 300);
@@ -436,6 +503,10 @@ patch.provider = body.provider;
 if (typeof body.baseUrl === "string") patch.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string") patch.modelId = body.modelId;
 if (typeof body.apiKey === "string") patch.apiKey = body.apiKey;
+if (body.thinkingLevel !== undefined) {
+if (!isThinkingLevel(body.thinkingLevel)) return sendJson(res, 400, { error: `未知思考挡位：${String(body.thinkingLevel)}（须为 off/minimal/low/medium/high/xhigh/max 之一）`});
+patch.thinkingLevel = body.thinkingLevel;
+}
 saveModelSettingsFile(patch);
 return sendJson(res, 200, await modelSettingsView());
 }
