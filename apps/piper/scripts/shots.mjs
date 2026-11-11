@@ -116,9 +116,9 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 			const toolText = typeof last.content === "string" ? last.content : JSON.stringify(last.content ?? "");
 			resHttp.write(chunk({ content: `页面要点：${toolText.slice(0, 220)}` }));
 			resHttp.write(chunk({}, "stop"));
-		} else if (toolNames.includes("web.fetch") && /https?:\/\//.test(userText)) {
+		} else if (toolNames.includes("web_fetch") && /https?:\/\//.test(userText)) {
 			const url = /https?:\/\/[^\s"']+/.exec(userText)[0];
-			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots", type: "function", function: { name: "web.fetch", arguments: "" } }] }));
+			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots", type: "function", function: { name: "web_fetch", arguments: "" } }] }));
 			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
 			resHttp.write(chunk({}, "tool_calls"));
 		} else {
@@ -442,14 +442,14 @@ console.log("种子（待批 Finding）已写入");
 	await waitFor(bodyHas("批准后将执行的写操作"), "待批详情出现写操作参数");
 	await shot("09-inbox-detail.png");
 
-	// L0-6：一次 web.fetch 工具卡——刷新回主界面（默认选中主 bot）、让它打开夹具页
+	// L0-6：一次 web_fetch 工具卡——刷新回主界面（默认选中主 bot）、让它打开夹具页
 	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
 	await waitFor(bodyHas("待批收件箱"), "刷新后主界面出现");
 	await waitFor(`document.querySelector('textarea') !== null`, "主 bot 对话输入框出现");
 	await evaluate(`document.querySelector('textarea').focus()`);
 	await cdp("Input.insertText", { text: `打开 http://127.0.0.1:${FIXTURE_PORT}/page 看看里面写了什么` }, sessionId);
 	await clickText("发送");
-	await waitFor(bodyHas("web.fetch"), "对话里出现 web.fetch 工具卡", 30000);
+	await waitFor(bodyHas("web_fetch"), "对话里出现 web_fetch 工具卡", 30000);
 	await waitFor(bodyHas("紫水晶海豹"), "助手回答引用到夹具特征句", 30000);
 	await new Promise((r) => setTimeout(r, 800));
 	await shot("11-chat-web-fetch-tool.png");

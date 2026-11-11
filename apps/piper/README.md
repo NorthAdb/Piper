@@ -1505,3 +1505,40 @@ provider 的选择了吗」）。**改版后目录不再手写**：
 - 明确不做：OAuth / 账号登录、不兼容 api 类型服务商的接入（不列也不
   接）、多服务商多 Key 并存与运行时切换（仍是单个当前配置）、改
   `packages/`（只读 pi-ai 导出）、改 SSE 事件名、加新依赖。
+
+### 网页工具名修复实测（2026-11-11，分支 fix/web-tool-names）
+
+真机 bug：用户在本地开启「网页查询」后，主 bot 对话直接报
+MODEL_ERROR（HTTP 400）——`Invalid tools[0].function.name: string does
+not match pattern ^[a-zA-Z0-9_-]+$`。根因：内核把工具以 `web.fetch` /
+`web.search` 为名注册给模型，名字里的点不符合 OpenAI 兼容服务商对
+function name 的模式（DeepSeek 等严格校验），只要启用网页工具、请求里
+带上工具，整轮就被 400 拒绝；没启用时请求里没工具，反而不报错。此前
+测试没抓到，是因为替身模型不校验工具名、还按点名触发 tool_call。
+
+命名口径（两套并存，不要改混）：
+
+- **模型侧 function name 用下划线名** `web_fetch` / `web_search`：
+  `lib/kernel.mjs` 以常量 `WEB_FETCH_TOOL_NAME` / `WEB_SEARCH_TOOL_NAME`
+  定义，工具 description 里互相提及也用模型侧名；SSE `tool` 事件的类型
+  名不变，事件里带的工具名就是模型侧名（实际被调用的函数名），不做
+  假映射，前端工具卡直接显示它。
+- **能力声明不迁**：bot.tools 里的 `web.fetch` / `web.search` 是 Piper
+  内部的能力/范围标识（`webToolBots()` 判定、连接器可用范围），不发给
+  模型，保持不变，已有用户数据零迁移。`lib/webfetch.mjs` 的实现与抓取
+  安全口径（SSRF / 限额 / 框定）一律未动。
+
+测试补牙：`scripts/test-webfetch.mjs` 的替身模型改成严格服务商——收到
+请求先校验每个 `tools[].function.name` 是否匹配 `^[a-zA-Z0-9_-]+$`，
+不匹配回与真机同形状的 HTTP 400；触发条件与断言随模型侧新名更新；另
+加一条直断言直接调用 `webToolsForBot` 检查返回的每个工具名。先红后
+绿：只改测试、旧实现跑 **37/44**（红在工具事件、特征句回喂、搜索事件
+与直断言，直断言打出 `names=["web.fetch","web.search"]`），改实现后
+**44/44**（基线 43，新增直断言 1 项，只增不减）。`npm run test` 聚合
+退出码 0：findings 27、scan 10、pr-review 16、schedule 14、gateway
+27、recovery 7、listen 9、badtz 4、secrets 21、model-stub 10、
+model-providers 34、r10 22、webfetch 44、eval:scan 21、regression 72。
+截图 `docs/screens/11-chat-web-fetch-tool.png` 已重截：工具卡显示
+`web_fetch`、回答引用夹具特征句，已目检；其余截图同轮字节抖动已还原。
+明确不做：未改 `packages/`、未改 SSE 事件类型名、未加新依赖、未动
+抓取安全口径。
