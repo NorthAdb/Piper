@@ -205,6 +205,46 @@ export type HistoryEntry = {
 	level?: string;
 };
 
+// 轨迹（GET /api/bots/:id/trace 的线格式，PR-D 出数、PR-E 消费）：会话流水
+// 经服务端 lib/trace.mjs 的 buildTrace 按轮归一化。时间口径：ts / startedAt /
+// endedAt / durationMs 均为 epoch 毫秒；无证据一律 null（界面显示「—」，不
+// 编造）。textPreview 是脱敏后截断 200 字的预览（textChars 是全文长度）；
+// tool 的 args/result 是落盘的已脱敏版本。kind 取会话条目 role 原值（user /
+// thinking / tool / assistant / system，未知 role 原样透传）；system 的子类
+// 在 subKind（draft / bot-created / error / routine）。
+export type TraceEvent = {
+	kind: string;
+	subKind: string | null;
+	ts: number | null;
+	durationMs: number | null;
+	seq: number | null;
+	textChars: number | null;
+	textPreview: string | null;
+	// thinking 专属
+	level?: string;
+	truncated?: boolean;
+	// tool 专属
+	name?: string;
+	status?: string;
+	toolCallId?: string;
+	startedAt?: number;
+	endedAt?: number;
+	args?: JsonValue;
+	result?: JsonValue;
+};
+
+export type TraceTurn = {
+	index: number;
+	startedAt: number | null;
+	endedAt: number | null;
+	durationMs: number | null;
+	events: TraceEvent[];
+};
+
+export type TraceData = {
+	turns: TraceTurn[];
+};
+
 // POST /api/chat 的 SSE 事件（event 名 -> data 形状）
 export type ChatEvent =
 	| { event: "session"; data: { botId: string; sessionId: string } }
