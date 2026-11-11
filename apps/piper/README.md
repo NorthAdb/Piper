@@ -76,7 +76,7 @@ Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体�
 
 | 件 | 落点 | 用处 | 相对官方源码的适配 |
 |---|---|---|---|
-| Tool | `components/ai-elements/tool.tsx` | 中栏工具卡（状态徽标 + 折叠详情） | 仅导入路径 `@repo/shadcn-ui/*` → `@/` 别名 |
+| Tool | `components/ai-elements/tool.tsx` | 中栏工具卡（状态点 + 文字 + 折叠详情） | 导入路径 `@repo/shadcn-ui/*` → `@/` 别名；呈现与设计基线对齐（feat/ui-chat-polish）：状态改点 + 文字、圆角/内边距按行卡节奏、展开区发丝分隔与代码限高内滚，逐项见该文件头适配 3 |
 | Artifact | `components/ai-elements/artifact.tsx` | 右栏产物详情卡（标题栏/描述/关闭/内容区） | 仅导入路径同上 |
 | CodeBlock | `components/ai-elements/code-block.tsx` | Tool 的传递依赖：参数/结果的 JSON 高亮渲染 | 导入路径同上；Tailwind v4 important 改后缀语法（`dark:bg-[...]!`）；高亮器改 shiki/core + JS 正则引擎、仅注册 json 文法与 github-light/dark 主题——官方全量 `createHighlighter` 会让构建产物约 11MB/310 个文法 chunk，收窄后 1.1MB/2 文件（本项目实际只高亮 json） |
 
@@ -1780,3 +1780,55 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
 - 明确不做：未改任何 API、SSE、数据结构与业务逻辑；未改 ui/tabs.tsx
   等共用组件；未改 `packages/`；未加新依赖；除上述标注的一句占位文案
   外未动文案。
+
+### 对话区视觉收尾实测（2026-11-11，分支 feat/ui-chat-polish）
+
+呈现层，站在视觉基线（feat/ui-foundation）与右栏行卡语言
+（feat/ui-desktop-panel）之上，只动中栏对话区：
+
+- 消息节奏：消息列与 Composer 列同宽（max-w-3xl）同内边距对齐
+  （Viewport 不再另加 px-3，列边与输入框卡边齐平）；轮次间距改
+  轮内紧、轮间松（用户消息 pt-4 / 助手消息 pb-4，轮内合计 12px、
+  轮间 32px）；用户气泡圆角 rounded-3xl → rounded-2xl（与基线
+  radius 阶梯对齐）、字号统一 text-sm；助手正文 .aui-md 行高
+  1.65 → 1.7、引用竖线 3px → 2px（与思考竖条同语言），代码块维持
+  既有发丝边框弱化形态。
+- 工具卡：与右栏行卡同一语言——卡面 bg-card/60 → bg-card 实底、
+  圆角 rounded-lg；状态由 AI Elements 原生的彩色图标徽章改为
+  「状态点 + 文字」（运行中 amber 脉冲点、完成 emerald 点、出错
+  destructive 点、待处理弱化灰点，文字 Running/Completed/Error
+  不变）；标题行内边距 px-4 py-3，展开区与标题行之间加发丝分隔
+  线，参数/结果代码区限高 20rem 内滚（全局细滚动条）、字号收紧
+  text-xs、去掉 CodeBlock 外的重复弱化底衬。以上对
+  `components/ai-elements/tool.tsx` 的改动已在该文件头记为适配 3。
+- 思考区：维持 PR #20 定稿规格（竖条、摘要、折叠/分段/计时行为
+  零改动），仅细节对齐——标题行与正文字号降一档为 13px、正文补
+  leading-relaxed、箭头过渡补 duration-150、流式秒数补 tabular-nums。
+- 状态行与输入框：状态行文字弱化一档（muted/80）、已用秒数
+  tabular-nums；Composer 去 shadow-sm，聚焦态改边框 ring 色 +
+  2px ring-ring/30（150ms 过渡），发送钮仍为唯一绿色实心元素。
+- 空状态：与右栏同一构图——星光装饰图标（Sparkles）换为弱化
+  MessageSquare 图标 + 描边圆（size-10），文案「暂无消息，和
+  「{bot}」打个招呼吧。」一字未动。
+- 草案卡：与工具卡同一卡片语言——去掉绿色描边与绿色标题带
+  （border-primary/40、bg-primary/10），改发丝边框 + bg-muted/40
+  标题行；「已创建」徽章与确认后文案的 emerald 色阶收敛为唯一
+  强调色 primary；确认钮仍为绿色主钮、放弃仍为 ghost 弱化钮。
+- 构建与回归：`npm run test` 聚合退出码 0（build:web、check 过）：
+  findings 27、scan 10、pr-review 16、schedule 14、gateway 27、
+  recovery 7、listen 9、badtz 4、secrets 21、model-stub 10、
+  model-providers 57、r10 22、webfetch 48、eval:scan 21、
+  regression 72，与基线逐项一致（纯视觉改动）。shots 的等待条件
+  全部沿用既有文本断言（工具卡状态文字、思考摘要文案未变），
+  无一处因 DOM 调整失效。
+- 截图：全套 18 张复跑；对话相关 01（空状态新构图）、02/03
+  （中栏同为空状态，随同更新）、11（工具卡展开新形态）、13
+  （刷新还原同形态）、15（思考区字号对齐）、16（全景）更新，
+  新增 `18-chat-turn-closeup.png`（中栏裁剪特写：一轮完整回合
+  收尾形态——用户气泡 + 思考摘要 + 工具卡 + 思考摘要 + 正文 +
+  输入框；shots.mjs 在 15 号流程后折叠第二段思考并裁中栏全高）。
+  设置/收件箱/右栏特写图（04/07/09/12/14/17）的字节变化为种子
+  随机端口/时间戳抖动，已还原不入本轮。逐张目检无真实秘密。
+- 明确不做：未改任何 API、SSE 事件、消息组装（model.ts /
+  historyToMessages）、折叠展开与发送等交互语义；未动文案；
+  未动左栏与右栏组件；未改 `packages/`；未加新依赖。

@@ -3,6 +3,9 @@
 // draft/system/error 走 data-* part（by_name 分发到对应卡片）。
 // 视觉按 assistant-ui 官方 registry thread 的实现方式：消息列居中定宽、用户气泡、
 // 助手整幅无气泡、Composer 为悬浮圆角卡片（输入区 + 底部工具行）。
+// 对话区收尾（feat/ui-chat-polish）：轮次节奏为轮内紧、轮间松（用户 pt-4 /
+// 助手 pb-4），消息列与 Composer 列同宽同内边距对齐（Viewport 不再另加 px），
+// 空状态与右栏同一构图（弱化描边圆 + lucide 图标 + 一句文案）。
 import {
 	AssistantRuntimeProvider,
 	ComposerPrimitive,
@@ -11,7 +14,7 @@ import {
 	useExternalStoreRuntime,
 } from "@assistant-ui/react";
 import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
-import { ArrowUpIcon, Loader2Icon, SparklesIcon } from "lucide-react";
+import { ArrowUpIcon, Loader2Icon, MessageSquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
 import { confirmDraft, listMessages, streamChat, UnauthorizedError } from "./api";
@@ -73,8 +76,8 @@ function TypingDots() {
 
 function UserMessage() {
 	return (
-		<MessagePrimitive.Root className="animate-in fade-in slide-in-from-bottom-1 mx-auto flex w-full max-w-3xl justify-end px-2 py-1.5 duration-150">
-			<div className="max-w-[85%] rounded-3xl bg-secondary px-4 py-2.5 break-words text-secondary-foreground">
+		<MessagePrimitive.Root className="animate-in fade-in slide-in-from-bottom-1 mx-auto flex w-full max-w-3xl justify-end px-2 pt-4 pb-1.5 duration-150">
+			<div className="max-w-[85%] rounded-2xl bg-secondary px-4 py-2.5 text-sm leading-relaxed break-words text-secondary-foreground">
 				<MessagePrimitive.Parts components={{ Text: PlainText }} />
 			</div>
 		</MessagePrimitive.Root>
@@ -83,7 +86,7 @@ function UserMessage() {
 
 function AssistantMessage() {
 	return (
-		<MessagePrimitive.Root className="animate-in fade-in mx-auto w-full max-w-3xl px-2 py-1.5 duration-150">
+		<MessagePrimitive.Root className="animate-in fade-in mx-auto w-full max-w-3xl px-2 pt-1.5 pb-4 duration-150">
 			<div className="flex flex-col gap-3 leading-relaxed break-words">
 				<MessagePrimitive.Parts
 					components={{
@@ -343,11 +346,11 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		<AssistantRuntimeProvider runtime={runtime}>
 			<DraftActionsContext.Provider value={draftActions}>
 				<ThreadPrimitive.Root className="flex h-full flex-col">
-					<ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth px-3 pt-6">
+					<ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth px-0 pt-6">
 						<ThreadPrimitive.Empty>
 							<div className="mx-auto flex w-full max-w-3xl flex-col items-center gap-3 px-2 py-16 text-center">
-								<span className="flex size-11 items-center justify-center rounded-full border bg-card">
-									<SparklesIcon className="size-5 text-primary" />
+								<span className="flex size-10 items-center justify-center rounded-full border bg-card text-muted-foreground">
+									<MessageSquareIcon className="size-4" />
 								</span>
 								<p className="text-sm text-muted-foreground">暂无消息，和「{bot.name}」打个招呼吧。</p>
 							</div>
@@ -356,16 +359,16 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 					</ThreadPrimitive.Viewport>
 					{running && runStartedAt !== null && statusLabel !== null ? (
 						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
-							<div className="flex items-center gap-2 text-xs text-muted-foreground">
+							<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
 								<Loader2Icon className="size-3.5 animate-spin" />
 								<span>{statusLabel}</span>
-								<span>· 已用 {elapsedSec} 秒</span>
+								<span className="tabular-nums">· 已用 {elapsedSec} 秒</span>
 							</div>
 						</div>
 					) : null}
 					<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
 						<ComposerPrimitive.Root
-							className="flex w-full flex-col rounded-2xl border bg-card shadow-sm transition-shadow focus-within:ring-2 focus-within:ring-ring/40"
+							className="flex w-full flex-col rounded-2xl border bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring/60 focus-within:ring-2 focus-within:ring-ring/30"
 							onSubmit={(e: FormEvent) => e.preventDefault()}
 						>
 							<ComposerPrimitive.Input

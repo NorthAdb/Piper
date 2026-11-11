@@ -30,7 +30,9 @@ export const MarkdownText: TextMessagePartComponent = ({ text, status }) => {
 
 export const PlainText: TextMessagePartComponent = ({ text }) => <span className="whitespace-pre-wrap">{text}</span>;
 
-// ---- 工具卡（AI Elements Tool：Collapsible + 状态徽标 + CodeBlock 详情） ----
+// ---- 工具卡（AI Elements Tool：Collapsible + 状态点与文字 + CodeBlock 详情） ----
+// 卡面与右栏行卡同一语言（feat/ui-chat-polish）：发丝边框 + bg-card 实底，
+// 状态在 Tool 组件内以「点 + 文字」呈现，不用彩色徽章。
 // 一次调用一张卡（ChatPane 按 toolCallId 合并 call/start/end 三段事件）：
 // phase 非 end 映射 input-available（Running），end 映射 output-available
 //（Completed），end 且 result.isError 为真映射 output-error（Error）。
@@ -67,7 +69,7 @@ export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, arg
 	const state = toolState(phase, result);
 	const summary = phase === "end" ? toolSummary(result) : null;
 	return (
-		<Tool className="mb-0 border-border bg-card/60">
+		<Tool className="mb-0 bg-card">
 			<ToolHeader type={`tool-${toolName}` as `tool-${string}`} state={state} title={toolName} />
 			<ToolContent>
 				{input !== null ? <ToolInput input={input} /> : null}
@@ -112,7 +114,7 @@ export const ReasoningCard: DataMessagePartComponent<ReasoningPartData> = ({ dat
 		<div className="border-l-2 border-muted-foreground/25 pl-3">
 			<button
 				type="button"
-				className="flex w-full items-center gap-2 py-0.5 text-left text-sm text-muted-foreground"
+				className="flex w-full items-center gap-2 py-0.5 text-left text-[13px] text-muted-foreground"
 				onClick={() => setOverride(!open)}
 				aria-expanded={open}
 			>
@@ -120,17 +122,17 @@ export const ReasoningCard: DataMessagePartComponent<ReasoningPartData> = ({ dat
 				{streaming ? (
 					<>
 						<span className="font-medium">思考中…</span>
-						{elapsedSec !== null ? <span className="text-xs">{elapsedSec} 秒</span> : null}
+						{elapsedSec !== null ? <span className="text-xs tabular-nums">{elapsedSec} 秒</span> : null}
 						{data.level ? <span className="text-xs">挡位 {data.level}</span> : null}
 					</>
 				) : (
 					<span className="font-medium">{summary}</span>
 				)}
-				<ChevronDownIcon className={`ml-auto size-4 shrink-0 transition-transform ${open ? "" : "-rotate-90"}`} />
+				<ChevronDownIcon className={`ml-auto size-4 shrink-0 transition-transform duration-150 ${open ? "" : "-rotate-90"}`} />
 			</button>
 			{open ? (
 				<div className="pt-1 pb-1.5">
-					<p className="text-sm break-words whitespace-pre-wrap text-muted-foreground">{data.text}</p>
+					<p className="text-[13px] leading-relaxed break-words whitespace-pre-wrap text-muted-foreground">{data.text}</p>
 					{data.truncated ? <p className="mt-2 text-xs text-muted-foreground">（内容过长，历史中仅保留前一部分）</p> : null}
 				</div>
 			) : null}
@@ -204,13 +206,13 @@ export const DraftCard: DataMessagePartComponent<DraftPartData> = ({ data }) => 
 		}
 	};
 	return (
-		<Card className="gap-0 overflow-hidden border-primary/40 py-0 shadow-none">
-			<CardHeader className="flex flex-row items-center gap-2 border-b bg-primary/10 px-4 py-3">
+		<Card className="gap-0 overflow-hidden py-0 shadow-none">
+			<CardHeader className="flex flex-row items-center gap-2 border-b bg-muted/40 px-4 py-3">
 				<BotIcon className="size-4 text-primary" />
 				<CardTitle className="text-sm">Bot 草案卡</CardTitle>
 				<Badge variant="secondary">{draft.source === "model" ? "模型抽取" : "规则兜底"}</Badge>
 				{data.confirmedBotName ? (
-					<Badge className="border-transparent bg-emerald-500/15 text-emerald-400">
+					<Badge className="border-transparent bg-primary/15 text-primary">
 						<CheckIcon className="size-3" />
 						已创建
 					</Badge>
@@ -226,7 +228,7 @@ export const DraftCard: DataMessagePartComponent<DraftPartData> = ({ data }) => 
 					))}
 				</dl>
 				{data.confirmedBotName ? (
-					<p className="mt-3 text-sm text-emerald-400">已创建 bot「{data.confirmedBotName}」，未确认前不会落库的约定已满足。</p>
+					<p className="mt-3 text-sm text-primary">已创建 bot「{data.confirmedBotName}」，未确认前不会落库的约定已满足。</p>
 				) : settled ? (
 					<p className="mt-3 text-sm text-muted-foreground">历史草案（只读）。</p>
 				) : (

@@ -567,6 +567,23 @@ console.log("种子（待批 Finding）已写入");
 	await new Promise((r) => setTimeout(r, 800));
 	await shot("15-chat-thinking.png");
 
+	// 对话区特写（18，feat/ui-chat-polish）：把第二段思考重新折叠回摘要行，
+	// 将本轮用户消息滚到视口顶部，裁中栏全高——一轮完整回合的收尾形态：
+	// 用户气泡 + 思考摘要 + 工具卡（折叠）+ 思考摘要 + 正文 + 输入框。
+	await evaluate(
+		`(() => { const btns = [...document.querySelectorAll('button')].filter((b) => b.textContent.includes('已思考')); const b = btns[btns.length - 1]; b?.click(); return btns.length; })()`,
+	);
+	await new Promise((r) => setTimeout(r, 500));
+	await evaluate(
+		`(() => { const el = [...document.querySelectorAll('span')].find((e) => (e.textContent || '').includes('先想一想：打开')); el?.scrollIntoView({ block: 'start' }); return Boolean(el); })()`,
+	);
+	await new Promise((r) => setTimeout(r, 600));
+	const chatClip = await evaluate(
+		`(() => { const asides = document.querySelectorAll('aside'); if (asides.length < 2) return null; const l = asides[0].getBoundingClientRect(); const r = asides[1].getBoundingClientRect(); return { x: l.right, y: 0, width: r.left - l.right, height: 1000 }; })()`,
+	);
+	if (!chatClip) throw new Error("找不到左右栏元素，无法截 18 号特写");
+	await shotClip("18-chat-turn-closeup.png", chatClip);
+
 	console.log(`\n截图完成：${shots.length} 张，目录 ${SCREENS_DIR}`);
 	console.log("注意：脚本不做内容断言，请逐张目检 Key 区为掩码、无真实秘密。");
 } finally {
