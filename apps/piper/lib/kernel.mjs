@@ -240,11 +240,12 @@ export function webToolsForBot(bot) {
 	return tools;
 }
 
-// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"thinking",text} /
+// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"thinking",text,level} /
 // {type:"tool",phase,name,toolCallId,detail}。thinking 是思考链增量：pi-ai 的
 // openai-completions 已把服务商回的 reasoning_content / reasoning /
 // reasoning_text 解析成 thinking 内容，pi-agent-core 以 message_update 的
-// thinking_delta 往外送，这里原样转发（挡位为 off 或服务商不回推理时不出现）。
+// thinking_delta 往外送，这里原样转发并带上生效挡位 level（已 clamp 的值，
+// 供前端思考区头部与服务端按段落盘标注；挡位为 off 或服务商不回推理时不出现）。
 // tool 事件的 call/start/end 三段带同一个 toolCallId（前端按它把一次调用合并成一张卡、
 // 服务端按它收集落盘）；end 的 detail 除 isError 外并入工具结果的 details
 // （web_fetch 的 {url,status,truncated}、web_search 的 {count}），出错时再带 error 文本。
@@ -276,7 +277,7 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent,
 		if (event.type === "message_update") {
 			const ame = event.assistantMessageEvent;
 			if (ame?.type === "text_delta" && ame.delta) onEvent({ type: "delta", text: ame.delta });
-			if (ame?.type === "thinking_delta" && ame.delta) onEvent({ type: "thinking", text: ame.delta });
+			if (ame?.type === "thinking_delta" && ame.delta) onEvent({ type: "thinking", text: ame.delta, level: thinkingLevel });
 			if (ame?.type === "toolcall_end" && ame.toolCall) {
 				onEvent({ type: "tool", phase: "call", name: ame.toolCall.name, toolCallId: ame.toolCall.id, detail: ame.toolCall.arguments ?? null });
 			}

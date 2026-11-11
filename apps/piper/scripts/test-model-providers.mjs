@@ -660,11 +660,197 @@ async function thinkingPart() {
 	}
 }
 
+// ---------- 思考分段部分：两段 reasoning 中间夹一次 web_fetch 工具调用 ----------
+// 展示对齐口径：思考按段切分落盘——段在工具调用/正文出现时关闭，每段带 seq
+//（与同轮 tool 条目共用递增序号）、durationMs 与生效挡位 level；SSE thinking
+// 事件带 level 与 seg 段号；空思考回合不落 thinking 条目。
+const SEG_A_PARTS = ["第一段思考：", "先抓页面再判断。"];
+const SEG_B_PARTS = ["第二段思考：", "结合页面内容作答。"];
+const SEG_A = SEG_A_PARTS.join("");
+const SEG_B = SEG_B_PARTS.join("");
+
+async function segmentPart() {
+	// 夹具页（web_fetch 的抓取目标，经测试缝放行回环地址）
+	const fixture = createServer((reqHttp, resHttp) => {
+		resHttp.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+		resHttp.end("<html><head><title>分段夹具</title></head><body><p>分段夹具特征句：松鼠把橡果藏进树洞。</p></body></html>");
+	});
+	await new Promise((r) => fixture.listen(0, "127.0.0.1", r));
+	const FIX_URL = `http://127.0.0.1:${fixture.address().port}/page`;
+
+	const segStub = createServer((reqHttp, resHttp) => {
+		if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
+			resHttp.statusCode = 404;
+			resHttp.end("{}");
+			return;
+		}
+		let raw = "";
+		reqHttp.on("data", (c) => (raw += c));
+		reqHttp.on("end", () => {
+			let body = {};
+			try {
+				body = JSON.parse(raw || "{}");
+			} catch {
+				/* 忽略 */
+			}
+			const model = body.model || "stub";
+			const messages = body.messages ?? [];
+			const last = messages[messages.length - 1] ?? {};
+			const lastUser = [...messages].reverse().find((m) => m.role === "user");
+			const userText = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
+			const toolNames = (body.tools ?? []).map((t) => t?.function?.name ?? t?.name);
+			if (!body.stream) {
+				resHttp.writeHead(200, { "Content-Type": "application/json" });
+				resHttp.end(JSON.stringify({ id: "x", object: "chat.completion", created: 1762732800, model, choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
+				return;
+			}
+			resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+			const chunk = (delta, finishReason = null) =>
+				`data: ${JSON.stringify({ id: "chatcmpl-seg", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+			resHttp.write(chunk({ role: "assistant" }));
+			const finish = (reason) => {
+				resHttp.write(chunk({}, reason));
+				resHttp.end("data: [DONE]\n\n");
+			};
+			if (last.role === "tool") {
+				// 工具结果回来后的第二轮：第二段思考 + 正文收尾
+				for (const part of SEG_B_PARTS) resHttp.write(chunk({ reasoning_content: part }));
+				resHttp.write(chunk({ content: "分段答案。" }));
+				finish("stop");
+				return;
+			}
+			if (userText.includes("分段") && toolNames.includes("web_fetch") && typeof body.reasoning_effort === "string") {
+				// 第一段思考后发起 web_fetch 工具调用（思考段被工具打断）
+				for (const part of SEG_A_PARTS) resHttp.write(chunk({ reasoning_content: part }));
+				const args = JSON.stringify({ url: FIX_URL });
+				resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_seg_fetch", type: "function", function: { name: "web_fetch", arguments: "" } }] }));
+				resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: args } }] }));
+				finish("tool_calls");
+				return;
+			}
+			if (userText.includes("空思考")) {
+				// 只回一个空 reasoning_content（等于没思考）+ 正文：不应留下任何思考段
+				resHttp.write(chunk({ reasoning_content: "" }));
+				resHttp.write(chunk({ content: "空思考答案。" }));
+				finish("stop");
+				return;
+			}
+			for (const part of REASONING_PARTS) resHttp.write(chunk({ reasoning_content: part }));
+			resHttp.write(chunk({ content: ANSWER_TEXT }));
+			finish("stop");
+		});
+	});
+	await new Promise((r) => segStub.listen(0, "127.0.0.1", r));
+	const SEG_V1 = `http://127.0.0.1:${segStub.address().port}/v1`;
+
+	const PORT = 4427;
+	const dataDir = join(TMP_ROOT, "data-segments");
+	process.env.PIPER_TEST_MODE = "1";
+	process.env.PIPER_WEB_FETCH_TEST_ALLOW = `127.0.0.1:${fixture.address().port}`;
+	const { proc, getLog } = startServer(PORT, dataDir);
+	const api = apiFor(PORT, "providers-test-token");
+	const chat = async (message) => {
+		const res = await fetch(`http://127.0.0.1:${PORT}/api/chat`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json", Authorization: "Bearer providers-test-token" },
+			body: JSON.stringify({ botId: "piper-main", message }),
+			signal: AbortSignal.timeout(60000),
+		});
+		const rawText = await res.text();
+		const events = [];
+		for (const block of rawText.split("\n\n")) {
+			const ev = /event: (.*)/.exec(block)?.[1];
+			const data = /data: (.*)/s.exec(block)?.[1];
+			if (ev && data) events.push({ event: ev, data: JSON.parse(data) });
+		}
+		return events;
+	};
+	const allMessages = async () => (await api("/api/bots/piper-main/messages")).json?.messages ?? [];
+	try {
+		const ready = await waitReady(proc, PORT);
+		check("思考分段 server 启动成功", ready, getLog().slice(-400));
+		if (!ready) return;
+
+		await api("/api/settings/model", {
+			method: "PUT",
+			body: JSON.stringify({ provider: "deepseek", baseUrl: SEG_V1, modelId: "deepseek-flash", apiKey: CHAT_KEY, thinkingLevel: "high" }),
+		});
+		const webSave = await api("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ fetchEnabled: true }) });
+		check("分段测试前置：启用网页查询（web_fetch 进主 bot 工具集）", webSave.status === 200 && webSave.json?.connector?.fetchEnabled === true, `status=${webSave.status} body=${webSave.text.slice(0, 200)}`);
+
+		const beforeCount = (await allMessages()).length;
+		const ev = await chat(`分段测试：打开 ${FIX_URL} 看看里面写了什么`);
+		const firstToolIdx = ev.findIndex((e) => e.event === "tool");
+		const lastToolIdx = ev.map((e) => e.event).lastIndexOf("tool");
+		const thinkBefore = ev.slice(0, firstToolIdx < 0 ? ev.length : firstToolIdx).filter((e) => e.event === "thinking");
+		const thinkAfter = lastToolIdx < 0 ? [] : ev.slice(lastToolIdx + 1).filter((e) => e.event === "thinking");
+		check(
+			"分段 SSE：工具调用前后各有一组 thinking，拼合分别为第一段/第二段全文，无 error",
+			firstToolIdx > 0 &&
+				thinkBefore.map((e) => e.data?.text ?? "").join("") === SEG_A &&
+				thinkAfter.map((e) => e.data?.text ?? "").join("") === SEG_B &&
+				!ev.some((e) => e.event === "error"),
+			`before=${JSON.stringify(thinkBefore.map((e) => e.data?.text))} after=${JSON.stringify(thinkAfter.map((e) => e.data?.text))}`,
+		);
+		const segRuns = [];
+		for (const e of ev.filter((x) => x.event === "thinking")) {
+			if (segRuns[segRuns.length - 1] !== e.data?.seg) segRuns.push(e.data?.seg);
+		}
+		check(
+			"分段 SSE：thinking 事件带生效挡位 level=high 与段号 seg（两段依次为 0、1）",
+			ev.filter((e) => e.event === "thinking").every((e) => e.data?.level === "high") && JSON.stringify(segRuns) === JSON.stringify([0, 1]),
+			`levels=${JSON.stringify(ev.filter((e) => e.event === "thinking").map((e) => e.data?.level))} segs=${JSON.stringify(segRuns)}`,
+		);
+
+		const turnEntries = (await allMessages()).slice(beforeCount);
+		const lead = turnEntries.filter((e) => e.role === "thinking" || e.role === "tool");
+		const thinkEntries = turnEntries.filter((e) => e.role === "thinking");
+		const toolEntry = turnEntries.find((e) => e.role === "tool");
+		check(
+			"分段落盘：本轮恰有两条 thinking 条目，文本分别为第一段/第二段，中间夹一条 tool 条目（顺序 thinking→tool→thinking）",
+			thinkEntries.length === 2 &&
+				thinkEntries[0]?.text === SEG_A &&
+				thinkEntries[1]?.text === SEG_B &&
+				lead.map((e) => e.role).join(",") === "thinking,tool,thinking",
+			`lead=${JSON.stringify(lead.map((e) => ({ role: e.role, text: String(e.text ?? "").slice(0, 12) })))}`,
+		);
+		check(
+			"分段落盘：thinking 与 tool 条目共用递增 seq（thinking1 < tool < thinking2），每段带 durationMs 与 level=high",
+			thinkEntries.length === 2 &&
+				typeof thinkEntries[0]?.seq === "number" &&
+				typeof toolEntry?.seq === "number" &&
+				typeof thinkEntries[1]?.seq === "number" &&
+				thinkEntries[0].seq < toolEntry.seq &&
+				toolEntry.seq < thinkEntries[1].seq &&
+				thinkEntries.every((e) => typeof e.durationMs === "number" && e.durationMs >= 0 && e.level === "high"),
+			`entries=${JSON.stringify(thinkEntries.map((e) => ({ seq: e.seq, durationMs: e.durationMs, level: e.level })))} toolSeq=${toolEntry?.seq}`,
+		);
+
+		// 空思考：stub 只回空 reasoning_content，本轮不应新增任何 thinking 条目。
+		const thinkCountBefore = (await allMessages()).filter((e) => e.role === "thinking").length;
+		const evEmpty = await chat("空思考：直接回答");
+		const thinkCountAfter = (await allMessages()).filter((e) => e.role === "thinking").length;
+		check(
+			"空思考不落盘：空 reasoning 回合 SSE 无非空 thinking、历史 thinking 条目数不变",
+			thinkCountAfter === thinkCountBefore &&
+				!evEmpty.some((e) => e.event === "thinking" && (e.data?.text ?? "").length > 0),
+			`before=${thinkCountBefore} after=${thinkCountAfter}`,
+		);
+	} finally {
+		proc.kill("SIGTERM");
+		segStub.close();
+		fixture.close();
+		delete process.env.PIPER_TEST_MODE;
+		delete process.env.PIPER_WEB_FETCH_TEST_ALLOW;
+	}
+}
+
 try {
 	await unitPart();
 	await serverPart();
 	await legacyServerPart();
 	await thinkingPart();
+	await segmentPart();
 } finally {
 	stub.close();
 	rmSync(TMP_ROOT, { recursive: true, force: true });

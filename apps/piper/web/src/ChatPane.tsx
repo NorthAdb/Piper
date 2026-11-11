@@ -29,7 +29,10 @@ function partToLike(part: ChatPart): LikePart {
 		case "text":
 			return { type: "text", text: part.text };
 		case "reasoning":
-			return { type: "data-reasoning", data: { text: part.text, truncated: part.truncated ?? false } };
+			return {
+				type: "data-reasoning",
+				data: { text: part.text, truncated: part.truncated ?? false, level: part.level, durationMs: part.durationMs, startedAt: part.startedAt },
+			};
 		case "tool":
 			return {
 				type: "tool-call",
@@ -128,6 +131,15 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 	const patchParts = (id: string, fn: (parts: ChatPart[]) => ChatPart[]) => {
 		patchMessage(id, (m) => ({ ...m, parts: fn(m.parts) }));
 	};
+	// 思考段关闭时补记 durationMs（段首个增量到此刻）：ReasoningCard 据此从
+	// 「思考中」切到折叠摘要；历史还原的段落盘自带 durationMs，不走这里。
+	const stampLastReasoning = (parts: ChatPart[]): ChatPart[] => {
+		const last = parts[parts.length - 1];
+		if (last?.type === "reasoning" && last.durationMs === undefined && last.startedAt !== undefined) {
+			return [...parts.slice(0, -1), { ...last, durationMs: Math.max(0, Date.now() - last.startedAt) }];
+		}
+		return parts;
+	};
 	const patchDraftPart = (partId: string, fn: (part: Extract<ChatPart, { type: "draft" }>) => ChatPart) => {
 		setMessages(
 			messagesRef.current.map((m) => ({
@@ -177,7 +189,9 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 			await streamChat(bot.id, text, (e) => {
 				switch (e.event) {
 					case "delta":
-						patchParts(asstId, (parts) => {
+						patchParts(asstId, (parts0) => {
+							// 正文出现即关闭当前思考段（先补记它的 durationMs）
+							const parts = stampLastReasoning(parts0);
 							const last = parts[parts.length - 1];
 							if (last?.type === "text") {
 								return [...parts.slice(0, -1), { type: "text", text: last.text + e.data.text }];
@@ -185,17 +199,23 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 							return [...parts, { type: "text", text: e.data.text }];
 						});
 						break;
-					case "thinking":
-						// 思考增量拼进同一个 reasoning part（与正文分开的折叠区）；
-						// 中间隔了工具卡等其他 part 时另起一段，按到达顺序排列。
+					case "thinking": {
+						// 思考增量按 seg 拼成段：同段拼进同一个 reasoning part，被
+						// 工具卡/正文打断（或 seg 变化）后另起一段，按到达顺序排列。
 						patchParts(asstId, (parts) => {
 							const last = parts[parts.length - 1];
-							if (last?.type === "reasoning") {
-								return [...parts.slice(0, -1), { type: "reasoning", text: last.text + e.data.text }];
+							const sameSeg =
+								last?.type === "reasoning" && (e.data.seg === undefined || last.seg === undefined || e.data.seg === last.seg);
+							if (last?.type === "reasoning" && sameSeg) {
+								return [...parts.slice(0, -1), { ...last, text: last.text + e.data.text }];
 							}
-							return [...parts, { type: "reasoning", text: e.data.text }];
+							return [
+								...stampLastReasoning(parts),
+								{ type: "reasoning", text: e.data.text, level: e.data.level, seg: e.data.seg, startedAt: Date.now() } as ChatPart,
+							];
 						});
 						break;
+					}
 					case "tool": {
 						// 一次调用一张卡：call/start/end 按 toolCallId 合并到同一个 part，
 						// phase 推进状态，call/start 的 detail 是参数、end 的 detail 是结果摘要。
@@ -204,7 +224,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 							const idx = parts.findIndex((p) => p.type === "tool" && p.id === toolId);
 							if (idx < 0) {
 								return [
-									...parts,
+									...stampLastReasoning(parts),
 									{
 										type: "tool",
 										id: toolId,
@@ -254,7 +274,19 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 				]);
 			}
 		} finally {
-			patchMessage(asstId, (m) => ({ ...m, running: false }));
+			// 回合结束：仍开着的思考段补记时长；空思考段（只有空白）不留痕，
+			// 流式中出现过的头部随回合结束一并消失。
+			patchMessage(asstId, (m) => ({
+				...m,
+				running: false,
+				parts: m.parts
+					.map((p) =>
+						p.type === "reasoning" && p.durationMs === undefined && p.startedAt !== undefined
+							? { ...p, durationMs: Math.max(0, Date.now() - p.startedAt) }
+							: p,
+					)
+					.filter((p) => p.type !== "reasoning" || p.text.trim().length > 0),
+			}));
 			setRunning(false);
 			setRunStartedAt(null);
 			onRunningChange(bot.id, false);
@@ -273,19 +305,20 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 	};
 
 	// 进行时状态行口径（由现有 SSE 事件与本地状态推导）：
-	// 有未 end 的工具 → 正在调用该工具；最后一个 part 是思考区（推理正在流出）
-	// 或尚无任何产出 → 正在思考；已有文本在流出 → 正在生成回答。
+	// 有未 end 的工具 → 正在调用该工具；已有文本在流出 → 正在生成回答；思考
+	// 已经开始（有 reasoning part）→ 状态行让位给思考区头部，不再重复「正在
+	// 思考…」（statusLabel 为 null 时整行不渲染）；尚无任何产出（等首字）→
+	// 正在思考。
 	const activeMessage = running ? messages[messages.length - 1] : undefined;
 	const runningToolPart = activeMessage?.parts
 		.filter((p): p is Extract<ChatPart, { type: "tool" }> => p.type === "tool" && p.phase !== "end")
 		.at(-1);
-	const lastPart = activeMessage?.parts[activeMessage.parts.length - 1];
-	const statusLabel = runningToolPart
+	const statusLabel: string | null = runningToolPart
 		? `正在调用 ${runningToolPart.name}…`
-		: lastPart?.type === "reasoning"
-			? "正在思考…"
-			: activeMessage?.parts.some((p) => p.type === "text" && p.text.length > 0)
-				? "正在生成回答…"
+		: activeMessage?.parts.some((p) => p.type === "text" && p.text.length > 0)
+			? "正在生成回答…"
+			: activeMessage?.parts.some((p) => p.type === "reasoning")
+				? null
 				: "正在思考…";
 	const elapsedSec = runStartedAt ? Math.max(0, Math.floor((tickNow - runStartedAt) / 1000)) : 0;
 
@@ -321,7 +354,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 						</ThreadPrimitive.Empty>
 						<ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
 					</ThreadPrimitive.Viewport>
-					{running && runStartedAt !== null ? (
+					{running && runStartedAt !== null && statusLabel !== null ? (
 						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
 							<div className="flex items-center gap-2 text-xs text-muted-foreground">
 								<Loader2Icon className="size-3.5 animate-spin" />
