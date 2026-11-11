@@ -67,6 +67,16 @@ export function redact(text) {
 	return out;
 }
 
+// 结构化字段的深脱敏：逐个字符串过 redact()，非字符串原样保留。会话 tool
+// 条目的 args/result 落盘前在 server.mjs 里有一份同口径的本地实现；轨迹接口
+// 出参（lib/trace.mjs）用这一份，对老文件里未脱敏的结构化字段兜底。
+export function redactDeep(value) {
+	if (typeof value === "string") return redact(value);
+	if (Array.isArray(value)) return value.map(redactDeep);
+	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
+	return value;
+}
+
 // 文本是否含秘密（精确值或前缀模式）——网关发送前检查用。
 export function containsSecret(text) {
 	if (typeof text !== "string" || !text) return false;

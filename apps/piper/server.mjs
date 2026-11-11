@@ -12,6 +12,9 @@
 // DELETE /api/bots/:id 删除 bot（主 bot 不可删）
 // POST /api/bots/draft-confirm {draft} 草案卡确认落库（未确认不落库）
 // GET /api/bots/:id/messages 该 bot 的会话流水（JSONL 读出）
+// GET /api/bots/:id/trace 轨迹数据（PR-D，lib/trace.mjs）：会话流水按轮归一化为
+//   {turns:[{index,startedAt,endedAt,durationMs,events}]}，时间统一 epoch 毫秒、
+//   无证据为 null；bot 不存在回 404（与 /api/memory/:botId 同口径）
 // GET /api/about-me 账号级「关于我」全文
 // POST /api/chat {botId, message} SSE 流式对话（事件见下方 sse 注释）
 // GET /api/routines routine 列表（含上次运行；morning-scan 附带 nextRunAt）
@@ -90,6 +93,7 @@ import { addNotification, countUnread, listNotifications, markNotificationsRead}
 import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
 import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.mjs";
 import { redact } from "./lib/redact.mjs";
+import { buildTrace} from "./lib/trace.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.mjs";
@@ -272,14 +276,21 @@ const leadThinkingEntries = [];
 // 本轮工具调用按 toolCallId 收集：直播事件只透传不落盘，回合结束时把最终态逐条写进
 // 会话流水、排在 assistant（或 error）条目之前，前端刷新/切 bot 回来据此还原工具卡。
 // end 事件到达时领 seq（与思考段的定型顺序共用一本账），决定它在流水中的位置。
+// 轨迹时间（PR-D）：同时记事件时刻——firstSeenAt 是服务端首次观察到该调用
+// （call 阶段）的时刻，startedAt 是 start 阶段（工具开始执行）的时刻，
+// endedAt 是 end 阶段的时刻；落盘时在 persistLead 里定型为
+// startedAt/endedAt/durationMs（缺失回落口径见那里）。
 const toolCalls = new Map();
 const collectTool = (e) => {
 const id = e.toolCallId || `${e.name}:${toolCalls.size}`;
-const rec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined };
+const rec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined, firstSeenAt: undefined, startedAt: undefined, endedAt: undefined };
+if (rec.firstSeenAt === undefined) rec.firstSeenAt = Date.now();
 if (e.name) rec.name = e.name;
+if (e.phase === "start" && rec.startedAt === undefined) rec.startedAt = Date.now();
 if (e.phase === "end") {
 rec.status = e.detail?.isError ? "error" : "complete";
 rec.result = e.detail ?? null;
+rec.endedAt = Date.now();
 if (rec.seq === undefined) rec.seq = leadSeq++;
 } else if (e.detail != null) {
 rec.args = e.detail;
@@ -290,7 +301,8 @@ toolCalls.set(id, rec);
 // 思考链落盘（按段定型）：直播时逐段透传 SSE thinking 事件（带生效挡位 level
 // 与段号 seg），服务端按事件流切段——段在工具事件、正文 delta 或回合结束时
 // 关闭；关闭时定型为一条 role:"thinking" 条目，带 seq（与 tool 条目共用）、
-// durationMs（段首个 thinking 事件到段关闭）与 level（生效挡位）。空段（只有
+// durationMs（段首个 thinking 事件到段关闭）、startedAt（段首个 thinking
+// 事件的时刻，轨迹时间用，PR-D）与 level（生效挡位）。空段（只有
 // 空白）不落盘。单段文本落盘上限 THINKING_PERSIST_MAX_CHARS，超出截断并以
 // truncated 标明；text 字段由 appendSession 统一过 redact（与 tool 条目同一
 // 秘密禁入面）。思考不回喂模型（kernel 的 toPiMessages 只取 user/assistant
@@ -310,6 +322,7 @@ text: truncated ? seg.text.slice(0, THINKING_PERSIST_MAX_CHARS) : seg.text,
 truncated,
 seq: leadSeq++,
 durationMs: Math.max(0, Date.now() - seg.startedAt),
+startedAt: seg.startedAt,
 level: seg.level,
 sessionId,
 });
@@ -322,6 +335,12 @@ closeThinkingSeg();
 const toolEntries = [];
 for (const rec of toolCalls.values()) {
 if (rec.seq === undefined) rec.seq = leadSeq++;
+// 轨迹时间定型（PR-D）：endedAt 取 end 事件时刻；回合结束仍无 end 的中断
+// 调用以收尾落盘时刻为 endedAt（口径：至少持续到回合结束）。startedAt 取
+// start 阶段时刻，缺失回落首次观察时刻（call 阶段），再缺失回落 endedAt
+// （durationMs=0）。durationMs 恒为 endedAt - startedAt（不为负）。
+const endedAt = rec.endedAt ?? Date.now();
+const startedAt = rec.startedAt ?? rec.firstSeenAt ?? endedAt;
 toolEntries.push({
 role: "tool",
 toolCallId: rec.toolCallId,
@@ -331,6 +350,9 @@ args: redactDeep(rec.args),
 status: rec.status === "running" ? "error" : rec.status,
 result: redactDeep(rec.result),
 seq: rec.seq,
+startedAt,
+endedAt,
+durationMs: Math.max(0, endedAt - startedAt),
 sessionId,
 });
 }
@@ -584,6 +606,11 @@ return deleteBot(botMatch[1])? sendJson(res, 200, { ok: true}): sendJson(res, 40
 }
 const msgMatch = path.match(/^\/api\/bots\/([\w-]+)\/messages$/);
 if (msgMatch && req.method === "GET") return sendJson(res, 200, { messages: readSession(msgMatch[1])});
+const traceMatch = path.match(/^\/api\/bots\/([\w-]+)\/trace$/);
+if (traceMatch && req.method === "GET") {
+if (!getBot(traceMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});
+return sendJson(res, 200, buildTrace(readSession(traceMatch[1])));
+}
 if (path === "/api/about-me" && req.method === "GET") return sendJson(res, 200, { markdown: readAboutMe()});
 if (path === "/api/about-me" && req.method === "PUT") {
 const body = await readBody(req);
