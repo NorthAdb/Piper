@@ -1,16 +1,20 @@
 // AI Elements 真引入：源自 vercel/ai-elements（packages/elements/src/tool.tsx，
 // https://github.com/vercel/ai-elements ），按 shadcn copy-in 方式落入本项目。
 // 相对官方源码的适配（逐项记录，另见 README）：
-//  1. 导入路径 @repo/shadcn-ui/* 改为本项目的 @/ 别名（ui/badge、ui/collapsible、lib/utils）。
+//  1. 导入路径 @repo/shadcn-ui/* 改为本项目的 @/ 别名（ui/collapsible、lib/utils）。
 //  2. 其 CodeBlock 依赖随同引入至同目录 ./code-block（适配点见该文件头）。
-// 除以上两点外与官方源码一致。
+//  3. 呈现与 Piper 设计基线对齐（feat/ui-chat-polish）：状态由彩色图标徽章改为
+//     与右栏行卡相同的「状态点 + 文字」（点色只用运行中 amber、成功 emerald、
+//     失败 destructive、待处理弱化灰）；卡片圆角 rounded-lg；标题行与展开区
+//     内边距按行卡节奏（px-4）；展开区与标题行之间加发丝分隔线；参数/结果
+//     代码区限高 20rem 内滚（全局细滚动条），字号收紧为 text-xs。
+// 除以上三点外与官方源码一致。
 "use client";
 
-import { Badge } from "@/components/ui/badge";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { cn } from "@/lib/utils";
 import type { DynamicToolUIPart, ToolUIPart } from "ai";
-import { CheckCircleIcon, ChevronDownIcon, CircleIcon, ClockIcon, WrenchIcon, XCircleIcon } from "lucide-react";
+import { ChevronDownIcon, WrenchIcon } from "lucide-react";
 import type { ComponentProps, ReactNode } from "react";
 import { isValidElement } from "react";
 import { CodeBlock } from "./code-block";
@@ -18,7 +22,7 @@ import { CodeBlock } from "./code-block";
 export type ToolProps = ComponentProps<typeof Collapsible>;
 
 export const Tool = ({ className, ...props }: ToolProps) => (
-	<Collapsible className={cn("group not-prose mb-4 w-full rounded-md border", className)} {...props} />
+	<Collapsible className={cn("group not-prose mb-4 w-full rounded-lg border", className)} {...props} />
 );
 
 export type ToolPart = ToolUIPart | DynamicToolUIPart;
@@ -45,34 +49,34 @@ const statusLabels: Record<ToolPart["state"], string> = {
 	"output-error": "Error",
 };
 
-const statusIcons: Record<ToolPart["state"], ReactNode> = {
-	"approval-requested": <ClockIcon className="size-4 text-yellow-600" />,
-	"approval-responded": <CheckCircleIcon className="size-4 text-blue-600" />,
-	"input-available": <ClockIcon className="size-4 animate-pulse" />,
-	"input-streaming": <CircleIcon className="size-4" />,
-	"output-available": <CheckCircleIcon className="size-4 text-green-600" />,
-	"output-denied": <XCircleIcon className="size-4 text-orange-600" />,
-	"output-error": <XCircleIcon className="size-4 text-red-600" />,
+const statusDots: Record<ToolPart["state"], string> = {
+	"approval-requested": "bg-amber-400",
+	"approval-responded": "bg-primary",
+	"input-available": "bg-amber-400 animate-pulse",
+	"input-streaming": "bg-muted-foreground/50",
+	"output-available": "bg-emerald-400",
+	"output-denied": "bg-amber-400",
+	"output-error": "bg-destructive",
 };
 
 export const getStatusBadge = (status: ToolPart["state"]) => (
-	<Badge className="gap-1.5 rounded-full text-xs" variant="secondary">
-		{statusIcons[status]}
+	<span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+		<span className={cn("size-1.5 shrink-0 rounded-full", statusDots[status])} />
 		{statusLabels[status]}
-	</Badge>
+	</span>
 );
 
 export const ToolHeader = ({ className, title, type, state, toolName, ...props }: ToolHeaderProps) => {
 	const derivedName = type === "dynamic-tool" ? toolName : type.split("-").slice(1).join("-");
 
 	return (
-		<CollapsibleTrigger className={cn("flex w-full items-center justify-between gap-4 p-3", className)} {...props}>
+		<CollapsibleTrigger className={cn("flex w-full items-center justify-between gap-4 px-4 py-3", className)} {...props}>
 			<div className="flex items-center gap-2">
 				<WrenchIcon className="size-4 text-muted-foreground" />
 				<span className="font-medium text-sm">{title ?? derivedName}</span>
 				{getStatusBadge(state)}
 			</div>
-			<ChevronDownIcon className="size-4 text-muted-foreground transition-transform group-data-[state=open]:rotate-180" />
+			<ChevronDownIcon className="size-4 text-muted-foreground transition-transform duration-150 group-data-[state=open]:rotate-180" />
 		</CollapsibleTrigger>
 	);
 };
@@ -82,7 +86,7 @@ export type ToolContentProps = ComponentProps<typeof CollapsibleContent>;
 export const ToolContent = ({ className, ...props }: ToolContentProps) => (
 	<CollapsibleContent
 		className={cn(
-			"data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 space-y-4 p-4 text-popover-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
+			"data-[state=closed]:fade-out-0 data-[state=closed]:slide-out-to-top-2 data-[state=open]:slide-in-from-top-2 space-y-3 border-t px-4 pt-3 pb-4 text-popover-foreground outline-none data-[state=closed]:animate-out data-[state=open]:animate-in",
 			className,
 		)}
 		{...props}
@@ -96,7 +100,7 @@ export type ToolInputProps = ComponentProps<"div"> & {
 export const ToolInput = ({ className, input, ...props }: ToolInputProps) => (
 	<div className={cn("space-y-2 overflow-hidden", className)} {...props}>
 		<h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">Parameters</h4>
-		<div className="rounded-md bg-muted/50">
+		<div className="max-h-80 overflow-y-auto rounded-md [&_code]:text-xs [&_pre]:p-3 [&_pre]:text-xs">
 			<CodeBlock code={JSON.stringify(input, null, 2)} language="json" />
 		</div>
 	</div>
@@ -125,11 +129,11 @@ export const ToolOutput = ({ className, output, errorText, ...props }: ToolOutpu
 			<h4 className="font-medium text-muted-foreground text-xs uppercase tracking-wide">{errorText ? "Error" : "Result"}</h4>
 			<div
 				className={cn(
-					"overflow-x-auto rounded-md text-xs [&_table]:w-full",
-					errorText ? "bg-destructive/10 text-destructive" : "bg-muted/50 text-foreground",
+					"max-h-80 overflow-y-auto rounded-md text-xs [&_code]:text-xs [&_pre]:p-3 [&_pre]:text-xs [&_table]:w-full",
+					errorText ? "bg-destructive/10 text-destructive" : "text-foreground",
 				)}
 			>
-				{errorText && <div>{errorText}</div>}
+				{errorText && <div className="px-3 pt-2.5">{errorText}</div>}
 				{Output}
 			</div>
 		</div>

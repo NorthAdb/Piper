@@ -142,7 +142,7 @@
 @layer components {
 	.aui-md {
 		font-size: 0.875rem;
-		line-height: 1.65;
+		line-height: 1.7;
 		word-break: break-word;
 	}
 	.aui-md > :first-child {
@@ -192,7 +192,7 @@
 	}
 	.aui-md blockquote {
 		margin: 0.6em 0;
-		border-left: 3px solid var(--border);
+		border-left: 2px solid var(--border);
 		padding-left: 0.9em;
 		color: var(--muted-foreground);
 	}
