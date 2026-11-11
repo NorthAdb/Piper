@@ -220,7 +220,10 @@ export function webToolsForBot(bot) {
 	return tools;
 }
 
-// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"tool",phase,name,detail}。
+// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"tool",phase,name,toolCallId,detail}。
+// tool 事件的 call/start/end 三段带同一个 toolCallId（前端按它把一次调用合并成一张卡、
+// 服务端按它收集落盘）；end 的 detail 除 isError 外并入工具结果的 details
+// （web_fetch 的 {url,status,truncated}、web_search 的 {count}），出错时再带 error 文本。
 // 返回最终助手文本。失败抛错（err.code 区分 BASE_NOT_BUILT / MODEL_ERROR 等），由路由层转 SSE error 事件。
 export async function streamChat({ systemPrompt, history = [], message, onEvent, tools = [] }) {
 	const cfg = modelConfig();
@@ -250,12 +253,21 @@ export async function streamChat({ systemPrompt, history = [], message, onEvent,
 			const ame = event.assistantMessageEvent;
 			if (ame?.type === "text_delta" && ame.delta) onEvent({ type: "delta", text: ame.delta });
 			if (ame?.type === "toolcall_end" && ame.toolCall) {
-				onEvent({ type: "tool", phase: "call", name: ame.toolCall.name, detail: ame.toolCall.arguments ?? null });
+				onEvent({ type: "tool", phase: "call", name: ame.toolCall.name, toolCallId: ame.toolCall.id, detail: ame.toolCall.arguments ?? null });
 			}
 		} else if (event.type === "tool_execution_start") {
-			onEvent({ type: "tool", phase: "start", name: event.toolName, detail: event.args ?? null });
+			onEvent({ type: "tool", phase: "start", name: event.toolName, toolCallId: event.toolCallId, detail: event.args ?? null });
 		} else if (event.type === "tool_execution_end") {
-			onEvent({ type: "tool", phase: "end", name: event.toolName, detail: { isError: event.isError } });
+			const details =
+				event.result?.details && typeof event.result.details === "object" && !Array.isArray(event.result.details) ? event.result.details : {};
+			const detail = { isError: event.isError, ...details };
+			if (event.isError && typeof detail.error !== "string") {
+				const errText = Array.isArray(event.result?.content)
+					? event.result.content.find((c) => c?.type === "text" && typeof c.text === "string")?.text
+					: undefined;
+				if (errText) detail.error = errText.slice(0, 300);
+			}
+			onEvent({ type: "tool", phase: "end", name: event.toolName, toolCallId: event.toolCallId, detail });
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			finalText = textOf(event.message) || finalText;
 		}

@@ -451,8 +451,30 @@ console.log("种子（待批 Finding）已写入");
 	await clickText("发送");
 	await waitFor(bodyHas("web_fetch"), "对话里出现 web_fetch 工具卡", 30000);
 	await waitFor(bodyHas("紫水晶海豹"), "助手回答引用到夹具特征句", 30000);
+	// 三合一：一轮调用在页面上只能有一张工具卡（标题 span 恰好一个），且已是 Completed 终态；
+	// 展开卡片能看到结果摘要行「HTTP 200」。
+	await waitFor(
+		`[...document.querySelectorAll('span.font-medium')].filter((el) => el.textContent === 'web_fetch').length === 1 && document.body.innerText.includes('Completed')`,
+		"工具卡合并为一张且状态 Completed",
+		30000,
+	);
+	await clickText("web_fetch");
+	await waitFor(bodyHas("HTTP 200"), "展开工具卡看到结果摘要 HTTP 200", 30000);
 	await new Promise((r) => setTimeout(r, 800));
 	await shot("11-chat-web-fetch-tool.png");
+
+	// 持久化：刷新页面后工具卡从会话历史还原（仍是一张、仍可展开看摘要）
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "刷新后主界面出现");
+	await waitFor(
+		`[...document.querySelectorAll('span.font-medium')].filter((el) => el.textContent === 'web_fetch').length === 1 && document.body.innerText.includes('Completed')`,
+		"刷新后工具卡从历史还原为一张 Completed 卡",
+		30000,
+	);
+	await clickText("web_fetch");
+	await waitFor(bodyHas("HTTP 200"), "刷新后展开工具卡仍看到结果摘要 HTTP 200", 30000);
+	await new Promise((r) => setTimeout(r, 800));
+	await shot("13-chat-tool-card-after-reload.png");
 
 	console.log(`\n截图完成：${shots.length} 张，目录 ${SCREENS_DIR}`);
 	console.log("注意：脚本不做内容断言，请逐张目检 Key 区为掩码、无真实秘密。");

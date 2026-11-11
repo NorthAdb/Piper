@@ -552,6 +552,32 @@ try {
 		`toolText=${(fetchToolText ?? "").slice(0, 140)}`,
 	);
 
+	// 工具卡三合一：同一轮 web_fetch 的 call/start/end 三段事件带同一个 toolCallId
+	//（前端据此合并成一张卡），end 的 detail 带工具结果摘要 details。
+	const fetchEvents = toolEvents.filter((e) => e.data?.name === "web_fetch");
+	const fetchIds = [...new Set(fetchEvents.map((e) => e.data?.toolCallId))];
+	check(
+		"web_fetch 的 call/start/end 三段齐全且 toolCallId 一致（非空）",
+		["call", "start", "end"].every((p) => fetchEvents.some((e) => e.data?.phase === p)) && fetchIds.length === 1 && Boolean(fetchIds[0]),
+		`phases=${JSON.stringify(fetchEvents.map((e) => e.data?.phase))} ids=${JSON.stringify(fetchIds)}`,
+	);
+	check(
+		"web_fetch 的 end 事件 detail 带结果摘要（status=200、url 为夹具页）",
+		fetchEvents.find((e) => e.data?.phase === "end")?.data?.detail?.status === 200 &&
+			String(fetchEvents.find((e) => e.data?.phase === "end")?.data?.detail?.url ?? "").includes("/page"),
+		`end=${JSON.stringify(fetchEvents.find((e) => e.data?.phase === "end")?.data?.detail)}`,
+	);
+
+	// 工具调用持久化：回合结束后历史接口能看到最终态条目，形状可被前端还原成单卡
+	const hist1 = await req("/api/bots/piper-main/messages");
+	const toolEntries1 = (hist1.json?.messages ?? []).filter((m) => m.role === "tool");
+	const fetchEntry = toolEntries1.find((m) => m.name === "web_fetch");
+	check(
+		"工具调用已落盘：历史里有 web_fetch 条目（status=complete、args.url 在、result.status=200）",
+		Boolean(fetchEntry) && fetchEntry.status === "complete" && String(fetchEntry.args?.url ?? "").includes("/page") && fetchEntry.result?.status === 200,
+		`entries=${JSON.stringify(toolEntries1).slice(0, 300)}`,
+	);
+
 	// 其他 bot：工具根本不在请求里（调不到），无 tool 事件
 	const ev2 = await chatEvents("repo-keeper", `打开 ${FIX_BASE}/page 看看里面写了什么`);
 	check(
@@ -569,6 +595,15 @@ try {
 		"对话里抓回环地址：工具结果只说「不允许访问该地址」，不摊内部地址细节",
 		toolText.includes("不允许访问该地址"),
 		`toolText=${toolText.slice(0, 160)}`,
+	);
+
+	// 被拦截的调用同样落盘，最终态为 error、结果摘要带通用拒绝口径（前端还原为 error 卡）
+	const hist2 = await req("/api/bots/piper-main/messages");
+	const errEntry = (hist2.json?.messages ?? []).filter((m) => m.role === "tool").find((m) => m.status === "error");
+	check(
+		"被拦截的工具调用落盘为 error（result 带「不允许访问该地址」）",
+		Boolean(errEntry) && String(errEntry.result?.error ?? "").includes("不允许访问该地址"),
+		`errEntry=${JSON.stringify(errEntry ?? null).slice(0, 300)}`,
 	);
 
 	// 搜索：未配置端点时没有 web_search 工具
