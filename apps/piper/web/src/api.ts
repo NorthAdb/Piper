@@ -9,6 +9,7 @@ import type {
 	ChatEvent,
 	Connector,
 	HistoryEntry,
+	ModelProvider,
 	ModelSettings,
 	NotificationEntry,
 	ModelSettingsInput,
@@ -100,6 +101,10 @@ export async function rejectApproval(id: string): Promise<Approval> {
 
 export function getMemory(botId: string): Promise<{ botId: string; markdown: string; aboutMe: string }> {
 	return api(`/api/memory/${botId}`);
+}
+
+export function getModelProviders(): Promise<{ providers: ModelProvider[] }> {
+	return api("/api/model-providers");
 }
 
 export function getModelSettings(): Promise<ModelSettings> {

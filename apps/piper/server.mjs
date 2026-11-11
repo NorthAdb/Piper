@@ -30,8 +30,10 @@
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
-// GET /api/settings/model 模型设置读回（configured/baseUrl/modelId/apiKeyHint，绝无 Key 全文）
-// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除），保存即热生效
+// GET /api/model-providers 模型服务商目录只读（id/name/baseUrl/models 预置；选服务商 + API Key 接入）
+// GET /api/settings/model 模型设置读回（configured/provider/baseUrl/modelId/apiKeyHint，绝无 Key 全文；
+//   旧文件无 provider 按 custom 读回）
+// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除；provider 须为目录 id，未知回 400），保存即热生效
 // POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
 // GET /api/settings/profile 基础资料读回（displayName/timezone，时区缺省 Asia/Hong_Kong；
 //   存量文件里的非法时区回落缺省并在日志提示一次，不把坏值交给调度层）
@@ -78,7 +80,8 @@ readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.mjs";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { listConnectors, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
+import { listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
+import { isKnownModelProvider, MODEL_PROVIDERS, resolveModelProviderId} from "./lib/model-providers.mjs";
 import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
@@ -207,6 +210,7 @@ function modelSettingsView() {
 const cfg = modelConfig();
 return {
 configured: cfg.configured,
+provider: resolveModelProviderId(readModelSettingsFile()),
 baseUrl: cfg.baseUrl,
 modelId: cfg.modelId,
 apiKeyHint: secretHint(cfg.apiKey),
@@ -373,10 +377,15 @@ return res.end(JSON.stringify({ ok: true}));
 if (path.startsWith("/api/")) {
 if (!isAuthed(req)) return sendJson(res, 401, { error: "未登录"});
 if (path === "/api/session") return sendJson(res, 200, { authenticated: true, modelConfigured: modelConfig().configured});
+if (path === "/api/model-providers" && req.method === "GET") return sendJson(res, 200, { providers: MODEL_PROVIDERS});
 if (path === "/api/settings/model" && req.method === "GET") return sendJson(res, 200, modelSettingsView());
 if (path === "/api/settings/model" && req.method === "PUT") {
 const body = await readBody(req);
 const patch = {};
+if (body.provider !== undefined) {
+if (typeof body.provider !== "string" || !isKnownModelProvider(body.provider)) return sendJson(res, 400, { error: `未知服务商：${String(body.provider)}（须为服务商目录中的 id）`});
+patch.provider = body.provider;
+}
 if (typeof body.baseUrl === "string") patch.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string") patch.modelId = body.modelId;
 if (typeof body.apiKey === "string") patch.apiKey = body.apiKey;

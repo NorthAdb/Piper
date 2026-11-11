@@ -36,8 +36,11 @@ export function readModelSettingsFile() {
 }
 
 // 部分更新：字段出现才改；apiKey 传空字符串表示清除已保存的 Key。
+// provider 是服务商归属标记（目录 id，见 lib/model-providers.mjs）；合法性由
+// server 路由校验，本函数只落盘字符串。旧文件没有该字段，读回按 custom 处理。
 export function saveModelSettingsFile(patch) {
 	const next = { ...readModelSettingsFile() };
+	if (patch.provider !== undefined) next.provider = String(patch.provider).trim();
 	if (patch.baseUrl !== undefined) next.baseUrl = String(patch.baseUrl).trim();
 	if (patch.modelId !== undefined) next.modelId = String(patch.modelId).trim();
 	if (patch.apiKey !== undefined) {

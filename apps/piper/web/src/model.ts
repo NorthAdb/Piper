@@ -49,15 +49,25 @@ export type ArtifactMeta = {
 
 export type Artifact = ArtifactMeta & { body: string };
 
+// 模型服务商目录（GET /api/model-providers）：预置 baseUrl 与模型名，都允许改填，不是白名单
+export type ModelProvider = {
+	id: string;
+	name: string;
+	baseUrl: string;
+	models: string[];
+};
+
 // 模型设置（GET/PUT /api/settings/model 的线格式）：apiKeyHint 只有末四位掩码，绝无全文
 export type ModelSettings = {
 	configured: boolean;
+	provider: string;
 	baseUrl: string;
 	modelId: string;
 	apiKeyHint: string;
 };
 
 export type ModelSettingsInput = {
+	provider?: string;
 	baseUrl?: string;
 	modelId?: string;
 	apiKey?: string;

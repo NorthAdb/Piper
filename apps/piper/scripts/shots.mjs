@@ -290,6 +290,27 @@ async function clickText(text, { maxX = Infinity, minX = 0 } = {}) {
 	await new Promise((r) => setTimeout(r, 700));
 }
 
+// 按表达式求出的坐标点做一次真实鼠标点击（Radix Select 的 trigger/option 靠
+// 指针事件开关，合成 .click() 不可靠，须走 CDP Input）。
+async function clickPoint(expression, description) {
+	const point = await evaluate(expression);
+	if (!point) throw new Error(`找不到可点击元素：${description}`);
+	await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 }, sessionId);
+	await cdp("Input.dispatchMouseEvent", { type: "mouseReleased", x: point.x, y: point.y, button: "left", clickCount: 1 }, sessionId);
+	await new Promise((r) => setTimeout(r, 500));
+}
+
+const centerOf = (selector) => `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`;
+
+async function selectRadixOption(triggerSelector, optionText) {
+	await clickPoint(centerOf(triggerSelector), `下拉触发器 ${triggerSelector}`);
+	await waitFor(`[...document.querySelectorAll('[role="option"]')].some((el) => (el.textContent || '').includes(${JSON.stringify(optionText)}))`, `下拉选项出现：${optionText}`);
+	await clickPoint(
+		`(() => { const el = [...document.querySelectorAll('[role="option"]')].find((e) => (e.textContent || '').includes(${JSON.stringify(optionText)})); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`,
+		`下拉选项：${optionText}`,
+	);
+}
+
 const shots = [];
 async function shot(fileName) {
 	const { data } = await cdp("Page.captureScreenshot", { format: "png" }, sessionId);
@@ -325,8 +346,16 @@ try {
 
 	// 设置四组
 	await clickText("设置", { maxX: 264 });
-	await waitFor(bodyHas("只接一个 OpenAI 兼容端点"), "设置-模型组出现");
+	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "设置-模型组出现");
 	await shot("04-settings-model-configured.png"); // 模型已配置态：Key 只显示末四位掩码
+	// 服务商选择截图：在表单里选 DeepSeek（不保存，种子里的 stub 配置不被改动），
+	// baseUrl 应自动预填 api.deepseek.com、模型预填 deepseek-chat；假 Key 打进
+	// password 输入框只显示圆点。截完这张，后续流程离开设置页即丢弃未保存改动。
+	await selectRadixOption("#model-provider", "DeepSeek");
+	await waitFor(`document.querySelector('#model-base-url')?.value === 'https://api.deepseek.com/v1'`, "选 DeepSeek 后 baseUrl 自动预填");
+	await evaluate(`document.querySelector('#model-api-key').focus()`);
+	await cdp("Input.insertText", { text: "sk-deepseek-fake-00000000wxyz" }, sessionId);
+	await shot("12-settings-model-deepseek.png");
 	await clickText("基础资料");
 	await waitFor(bodyHas("关于我"), "设置-基础资料组出现");
 	await shot("05-settings-profile.png");
@@ -345,7 +374,7 @@ try {
 	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
 	await waitFor(bodyHas("待批收件箱"), "启用后刷新主界面出现");
 	await clickText("设置", { maxX: 264 });
-	await waitFor(bodyHas("只接一个 OpenAI 兼容端点"), "启用后设置-模型组出现");
+	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "启用后设置-模型组出现");
 	await clickText("连接器");
 	await waitFor(bodyHas("GitHub"), "启用后设置-连接器组出现");
 	await evaluate(`(() => { const el = [...document.querySelectorAll('*')].find((e) => e.children.length === 0 && (e.textContent || '').trim() === '网页查询'); el?.scrollIntoView({ block: 'center' }); return Boolean(el); })()`);

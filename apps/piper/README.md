@@ -1436,3 +1436,43 @@ PA—design 第二轮返工中归 R11 的三项：F6（MAJOR，补齐被变异�
 可选的把 ci.yml 的 `pull_request.branches` 放宽到堆叠分支本轮未做：
 堆叠 PR 的检查由整合 PR 与本地全套覆盖，放宽会让上游 job 在每个堆叠
 PR 上重复跑、引入无关噪声。
+
+### 模型服务商选择实测（2026-11-11，分支 feat/model-provider-picker）
+
+设置页「模型」组从自由填 baseUrl/modelId 改成参照 Pi 的 provider 选择：
+先选服务商、再用该服务商的 API Key 接入。**只实现 API Key 方式**——Pi
+登录页里的「Sign in with an account」（账号 / OAuth）不在本轮，表单里没有
+账号入口。自定义端点保留为兜底。
+
+- 服务商目录单一数据源：新 `lib/model-providers.mjs` 导出 8 条（deepseek /
+  openai / moonshot / zhipu / dashscope / siliconflow / openrouter /
+  custom），server 提供只读接口 `GET /api/model-providers`（未登录 401）。
+  目录只是预置便利：baseUrl 与模型名都可改填任意值，不是白名单。
+- 存储向后兼容：`settings-model.json` 在原 {baseUrl, modelId, apiKey} 上
+  增加 `provider` 字段；旧文件无 provider 一律按 custom 读回、原值不丢；
+  PUT 带未知 provider 回 400 且文件不变；无 provider 字段的部分更新不
+  清空已存归属。读回仍只有掩码（`apiKeyHint`），Key 的保存、0600、热
+  生效与 redact 覆盖维持现状。
+- 前端：服务商下拉（当前归属且已配置时标「已配置」）；选中后 baseUrl
+  自动预填预置地址、模型名预填首个预置模型；baseUrl 对所有服务商都可
+  编辑——**改动了预置地址，保存时按自定义端点归属**（provider 存 custom，
+  表单上有提示行），使读回归属与实际端点一致；模型名是预置下拉 +「自
+  定义模型名…」手输切换。内核零改动，仍按 baseUrl+modelId+apiKey 建
+  OpenAI 兼容 provider，DeepSeek 等靠预置地址即可连。
+- 测试：新 `scripts/test-model-providers.mjs` 18/18（目录形状与归属判
+  定、目录接口 401/200、保存 deepseek 后读回 provider 与预置 baseUrl 且
+  响应无 Key 全文、落盘含 provider 且 0600、未知 provider 400、custom
+  任意端点、旧客户端形状部分更新、旧格式文件起服读回 custom 原值不
+  丢），已纳入 `npm run test` 聚合；全套聚合退出码 0（findings 27、
+  scan 10、pr-review 16、schedule 14、gateway 27、recovery 7、listen 9、
+  badtz 4、secrets 21、model-stub 10、r10 22、webfetch 43、eval:scan 21、
+  regression 72，均不低于基线）。
+- 截图：`docs/screens/12-settings-model-deepseek.png`（表单里选 DeepSeek、
+  baseUrl 自动预填、模型 deepseek-chat、假 Key 在 password 框内只显示圆
+  点，未保存故种子 stub 配置未动）；04 图同步更新为新表单（种子配置无
+  provider，按「自定义端点（已配置）」读回，Key 末四位掩码）。逐张目检
+  无真实秘密。本轮未用真 DeepSeek Key 实测真连（没有真 Key）；真连路径
+  与既有 OpenAI 兼容链路同一条，由 test-model-stub 以 custom 方式覆盖。
+- 明确不做：OAuth / 账号登录、多服务商多 Key 并存与运行时切换（仍是
+  单个当前配置，只多了 provider 归属与预置）、改 `packages/`、改 SSE
+  事件名、加新依赖。
