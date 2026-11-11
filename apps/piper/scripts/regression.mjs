@@ -1,7 +1,7 @@
 // Piper API 回归脚本（硬门禁）：把历次实测的断言固化成可重复运行的检查。
 // 用法（在 apps/piper 下）：
 //   node scripts/regression.mjs        （或 npm run regression）
-// 行为：以「无模型 Key」的默认环境在本机测试端口启动一份 server.mjs，逐项断言后退出。
+// 行为：以「无模型 Key」的默认环境在本机测试端口启动一份 dist/server.js，逐项断言后退出。
 // 退出码 0 = 全部通过；1 = 有失败。
 // R4 测试隔离（本脚本的立身之本，改动前先想清楚）：
 //   - 数据目录经 PIPER_DATA_DIR 指向临时目录：子进程 server 与本进程内 import 的 lib
@@ -172,7 +172,7 @@ async function main() {
 	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
 	// 默认环境必须是「无模型 Key」：显式剔除可能从外层继承的模型与 GitHub 令牌变量
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	serverProc = proc;
 	let serverLog = "";
 	proc.stdout.on("data", (d) => (serverLog += d));
@@ -525,9 +525,9 @@ async function runConnectorChecks({ req, check }) {
 
 		// scan 的令牌来源只能是 settings.githubToken()：源码断言（无第二套入口）+ 同文件读回断言
 		// + 进程内 fetch 替身实际跑一次扫描，断言出站请求带了刚保存的令牌（不打活网、不打印令牌）。
-		const { githubToken } = await import("../lib/settings.mjs");
-		const scanSrc = readFileSync(join(APP_DIR, "lib", "scan.mjs"), "utf8");
-		const { runMorningScan } = await import("../lib/scan.mjs");
+		const { githubToken } = await import("../dist/lib/settings.js");
+		const scanSrc = readFileSync(join(APP_DIR, "lib", "scan.ts"), "utf8");
+		const { runMorningScan } = await import("../dist/lib/scan.js");
 		const seenAuth = [];
 		const realFetch = globalThis.fetch;
 		globalThis.fetch = async (url, init = {}) => {
@@ -635,7 +635,7 @@ async function runNotificationChecks({ req, check, anon }) {
 	const unreadBefore = list1.json?.unread ?? 0;
 	const marked = completed ? await req("/api/notifications/read", { method: "POST", body: JSON.stringify({ ids: [completed.id] }) }) : { json: null };
 	const inMarked = (marked.json?.notifications ?? []).find((n) => n.id === completed?.id);
-	const { listNotifications } = await import("../lib/notify.mjs");
+	const { listNotifications } = await import("../dist/lib/notify.js");
 	const fromFile = listNotifications().find((n) => n.id === completed?.id);
 	check(
 		"POST /api/notifications/read 标记后 unread 减一且文件落盘（新进程读回为已读）",

@@ -3,7 +3,7 @@
 // 进入拍板清单的规则是程序化的（本批就这两条，不要临时扩种类）：
 //   ci_failed：按工作流分别取各自在默认分支上最新一条已结束（status=completed）的 run，
 //   仅 conclusion 为 failure 才开单（cancelled/timed_out/startup_failure 不报、不回溯）；
-//   pr_needs_review：open、非 draft、且按「已批准」锁定语义（lib/pr-review.mjs：每位审查人
+//   pr_needs_review：open、非 draft、且按「已批准」锁定语义（lib/pr-review.ts：每位审查人
 //   最新一条为准、陈旧批准不算数）仍待审的 PR。
 // 取证完整性（R6）：pulls/reviews/runs 都翻页取尽（各自有上限，触顶时日报写明「仅检查
 // 前 N 条」）；一个仓的全部取证先完成，再统一计算、统一落盘——任一环节失败整仓不开
@@ -17,24 +17,49 @@
 // 或同工作流 CI 已转绿/已被新失败 run 取代的，自动转 expired 并写审计 reconciled:<原因>，
 // 退出待批。建议先用规则模板，不上模型润色，
 // 模型不得发明 GitHub 上不存在的 PR 或 CI（后续步骤若引入模型写建议，同样受此约束）。
-// 令牌经 lib/settings.mjs 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
+// 令牌经 lib/settings.ts 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
 // 本文件不直读令牌环境变量；无令牌走公开限额。API 基址缺省 https://api.github.com，
 // 可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归用本地 GitHub 桩，全程离线、结果确定）。
 // 单仓失败不中断整体，失败原因写进日报；
 // 全部仓库失败时由调用方判定整轮失败（L0-5 语义，本文件只回 failures/total）。
 // 本文件全程只读，绝不调用任何 GitHub 写接口：pr_needs_review 附带的 writeIntent 只是
 // 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
-import { githubToken } from "./settings.mjs";
-import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.mjs";
-import { evaluateReviews, prNeedsReview } from "./pr-review.mjs";
-import { appendAudit } from "./audit.mjs";
+import { githubToken } from "./settings.ts";
+import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.ts";
+import type { Finding, FindingInput } from "./findings.ts";
+import { evaluateReviews, prNeedsReview } from "./pr-review.ts";
+import { appendAudit } from "./audit.ts";
+import type { ArtifactMeta } from "./store.ts";
 
-function ghBase() {
+// 一仓取证的汇总。info / commits / pulls / issues / runs 是 GitHub REST 的原始
+// 响应（外部边界，字段随接口变），消费方逐字段取用，故这几处保留 any——
+// 这是本文件仅有的 any 所在，扫描规则的输入输出（Finding 等）都有真实类型。
+interface RepoData {
+	info: any;
+	branch: string;
+	commits: any[];
+	pulls: any[];
+	issues: any[];
+	runs: any[];
+	ciMissing: string | number | null;
+	notes: string[];
+}
+
+export interface ReconciledItem {
+	id: string;
+	repo: string;
+	type: string;
+	subject: string;
+	cause: string;
+}
+
+function ghBase(): string {
 	return (process.env.PIPER_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
 }
 
-async function gh(path) {
-	const headers = { Accept: "application/vnd.github+json", "User-Agent": "piper-morning-scan" };
+// GitHub API 响应是外部边界：返回 any，由各消费点按接口文档逐字段取用。
+async function gh(path: string): Promise<any> {
+	const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "piper-morning-scan" };
 	const token = githubToken();
 	if (token) headers.Authorization = `Bearer ${token}`;
 	const res = await fetch(`${ghBase()}${path}`, { headers });
@@ -45,17 +70,26 @@ async function gh(path) {
 // 翻页取尽（R6）：按 per_page 逐页拉，直到某页不满 per_page 为止；累计到 maxItems
 // 且最后一页仍满页时记 truncated（调用方在日报写明「仅检查前 N 条」）。
 // extract 把响应体映射成数组（runs 接口是 { workflow_runs: [...] } 包装）。
-// 本函数与上限表同时供 lib/gateway.mjs 复检取 reviews 使用（F2，第二轮返工）：
+// 本函数与上限表同时供 lib/gateway.ts 复检取 reviews 使用（F2，第二轮返工）：
 // 扫描与网关共用同一套翻页口径，不各写一份。
-export const PAGE_CAPS = {
+export interface PageCaps {
+	perPage: number;
+	maxItems: number;
+}
+
+export const PAGE_CAPS: Record<"pulls" | "reviews" | "runs", PageCaps> = {
 	pulls: { perPage: 100, maxItems: 200 },
 	reviews: { perPage: 100, maxItems: 300 },
 	runs: { perPage: 100, maxItems: 100 },
 };
 
-export async function ghPage(path, { perPage, maxItems }, extract = (j) => j) {
+export async function ghPage<T>(
+	path: string,
+	{ perPage, maxItems }: PageCaps,
+	extract: (j: any) => T[] | undefined | null = (j: any) => j as T[],
+): Promise<{ items: T[]; truncated: boolean }> {
 	const sep = path.includes("?") ? "&" : "?";
-	const items = [];
+	const items: T[] = [];
 	let truncated = false;
 	for (let page = 1; ; page += 1) {
 		const batch = extract(await gh(`${path}${sep}per_page=${perPage}&page=${page}`)) ?? [];
@@ -69,27 +103,29 @@ export async function ghPage(path, { perPage, maxItems }, extract = (j) => j) {
 	return { items: items.slice(0, maxItems), truncated };
 }
 
-function fmtDate(iso) {
+function fmtDate(iso: unknown): string {
 	return iso ? String(iso).slice(0, 10) : "-";
 }
 
 // Finding 过期时间：7 天后过期，避免清单腐烂（总图 4.2）。状态迁移（过期清理）在后续切片。
 const FINDING_TTL_DAYS = 7;
 
-function expiresAtFrom(now) {
+function expiresAtFrom(now: Date): string {
 	return new Date(now.getTime() + FINDING_TTL_DAYS * 24 * 3600 * 1000).toISOString();
 }
 
-async function fetchRepoData(repo) {
+async function fetchRepoData(repo: string): Promise<RepoData> {
 	const info = await gh(`/repos/${repo}`);
-	const branch = info.default_branch;
-	const notes = [];
+	const branch: string = info.default_branch;
+	const notes: string[] = [];
 	const pullsPagePromise = ghPage(`/repos/${repo}/pulls?state=open`, PAGE_CAPS.pulls);
 	// runs 接口失败（Actions 未启用、权限不足等）不再静默吞掉：记下状态码，
 	// 日报该仓下写明「CI 数据缺失：<状态码>」；本仓其余取证与 PR 规则照常。
-	const runsPagePromise = ghPage(`/repos/${repo}/actions/runs?branch=${encodeURIComponent(branch)}`, PAGE_CAPS.runs, (j) => j?.workflow_runs).catch(
-		(err) => ({ items: [], truncated: false, ciMissing: err?.status ?? "未知" }),
-	);
+	const runsPagePromise: Promise<{ items: any[]; truncated: boolean; ciMissing?: string | number }> = ghPage(
+		`/repos/${repo}/actions/runs?branch=${encodeURIComponent(branch)}`,
+		PAGE_CAPS.runs,
+		(j) => j?.workflow_runs,
+	).catch((err) => ({ items: [] as any[], truncated: false, ciMissing: (err as { status?: string | number } | undefined)?.status ?? "未知" }));
 	const [commits, pullsPage, issues, runsPage] = await Promise.all([
 		gh(`/repos/${repo}/commits?per_page=5`),
 		pullsPagePromise,
@@ -103,7 +139,7 @@ async function fetchRepoData(repo) {
 		branch,
 		commits: commits ?? [],
 		pulls: pullsPage.items,
-		issues: (issues ?? []).filter((i) => !i.pull_request),
+		issues: (issues ?? []).filter((i: any) => !i.pull_request),
 		runs: runsPage.items,
 		ciMissing: runsPage.ciMissing ?? null,
 		notes,
@@ -112,7 +148,7 @@ async function fetchRepoData(repo) {
 
 // 返回 { reviews, truncated }：审查可能上百条，必须翻页取尽——只看第一页会把
 // 第二页才出现的 APPROVED 漏掉（误报待审），或漏掉 CHANGES_REQUESTED（误判已批准）。
-async function fetchReviews(repo, prNumber) {
+async function fetchReviews(repo: string, prNumber: number): Promise<{ reviews: any[]; truncated: boolean }> {
 	const page = await ghPage(`/repos/${repo}/pulls/${prNumber}/reviews`, PAGE_CAPS.reviews);
 	return { reviews: page.items, truncated: page.truncated };
 }
@@ -122,7 +158,7 @@ async function fetchReviews(repo, prNumber) {
 // CI 类：同工作流最新已结束 run 已转绿（ci_green）或已被一条更新的失败 run 取代
 //（ci_superseded，新 run 由本轮规则另开）→ 退役。取证不足（PR 单查失败、工作流
 // 无法确认）时不退役，宁可多留一轮等人处理。退役一律写审计 reason=reconciled:<原因>。
-function ciRetireCause(f, data) {
+function ciRetireCause(f: Finding, data: RepoData): string | null {
 	const mine = data.runs.find((r) => String(r.id) === f.subject);
 	const workflow = f.workflow ?? mine?.name ?? null;
 	if (!workflow) return null;
@@ -136,7 +172,7 @@ function ciRetireCause(f, data) {
 // 对账退役原因（纯计算，只读已取证数据，不发请求、不落盘）：
 // prDetails 是阶段一为不在 open 列表里的候选 PR 单查的结果（null = 单查失败，取证不足不退役）；
 // reviewsOf(num) 返回阶段一已取齐的审查（未取到返回 undefined，取证不足不退役）。
-function prRetireCause(f, data, prDetails, reviewsOf) {
+function prRetireCause(f: Finding, data: RepoData, prDetails: Map<number, any>, reviewsOf: (num: number) => any): string | null {
 	const num = Number(f.subject);
 	let pr = data.pulls.find((p) => p.number === num) ?? null;
 	if (!pr) {
@@ -157,7 +193,7 @@ function prRetireCause(f, data, prDetails, reviewsOf) {
 //     开单规则互斥——会退役的项本轮必然不会再被规则开出，见各 retire cause 与规则
 //     的对应关系，所以不需假设退役已落盘）。
 //   阶段三 落盘：先落对账退役（转 expired + 审计），再落新开 Finding。
-async function scanRepo(repo, botId, now) {
+async function scanRepo(repo: string, botId: string, now: Date): Promise<{ data: RepoData; created: Finding[]; reconciled: ReconciledItem[] }> {
 	// ---- 阶段一：取证 ----
 	const data = await fetchRepoData(repo);
 	const notes = data.notes;
@@ -169,18 +205,19 @@ async function scanRepo(repo, botId, now) {
 		}
 	}
 	// 审查结果在对账与规则之间共用一轮取证，避免同一 PR 重复拉 reviews。
-	const reviewsCache = new Map();
-	const fetchReviewsCached = async (prNumber) => {
+	const reviewsCache = new Map<number, any[]>();
+	const fetchReviewsCached = async (prNumber: number): Promise<any[]> => {
 		if (!reviewsCache.has(prNumber)) {
 			const { reviews, truncated } = await fetchReviews(repo, prNumber);
 			if (truncated) notes.push(`PR #${prNumber} 的审查超过检查上限，仅检查前 ${PAGE_CAPS.reviews.maxItems} 条`);
 			reviewsCache.set(prNumber, reviews);
 		}
-		return reviewsCache.get(prNumber);
+		// 上面的 has/set 保证此处必有值（单线程顺序执行，无并发写入）。
+		return reviewsCache.get(prNumber) as any[];
 	};
 	const candidates = listFindings({ repo }).filter((f) => f.status === "open" || f.status === "approved");
 	// 对账候选 PR 不在 open 列表时先单查取证（已合并/关闭的 PR 不在 open 列表里）。
-	const prDetails = new Map();
+	const prDetails = new Map<number, any>();
 	for (const f of candidates) {
 		if (f.type !== "pr_needs_review") continue;
 		const num = Number(f.subject);
@@ -204,19 +241,19 @@ async function scanRepo(repo, botId, now) {
 	}
 
 	// ---- 阶段二：计算 ----
-	const retirePlan = [];
+	const retirePlan: Array<{ finding: Finding; cause: string }> = [];
 	for (const f of candidates) {
 		const cause =
 			f.type === "pr_needs_review" ? prRetireCause(f, data, prDetails, (num) => reviewsCache.get(num)) : ciRetireCause(f, data);
 		if (cause) retirePlan.push({ finding: f, cause });
 	}
-	const createPlan = [];
+	const createPlan: FindingInput[] = [];
 
 	// 规则一：ci_failed（R6：按工作流分别取最新）。runs 已按创建时间倒序；除 API 的
 	// branch 参数外，客户端再按 head_branch 与 status=completed 过滤一层；同一工作流
 	// 第一条命中的已结束 run 即该工作流的最新一条。只认 conclusion==="failure"，
 	// cancelled/timed_out/startup_failure 不报，也绝不回溯更早的 failure。
-	const latestByWorkflow = new Map();
+	const latestByWorkflow = new Map<string, any>();
 	for (const r of data.runs) {
 		if (r.head_branch !== data.branch || r.status !== "completed") continue;
 		const workflow = r.name ?? "(未命名工作流)";
@@ -271,7 +308,7 @@ async function scanRepo(repo, botId, now) {
 	}
 
 	// ---- 阶段三：落盘（先对账退役，再开新） ----
-	const reconciled = [];
+	const reconciled: ReconciledItem[] = [];
 	for (const { finding: f, cause } of retirePlan) {
 		updateFinding(f.id, { status: "expired" });
 		appendAudit({
@@ -289,8 +326,8 @@ async function scanRepo(repo, botId, now) {
 }
 
 // 「其余观察」：统计与列表只进这里，不进拍板清单。
-function observationLines(repo, data) {
-	const lines = [];
+function observationLines(repo: string, data: RepoData): string {
+	const lines: string[] = [];
 	lines.push(`### ${repo}`);
 	lines.push("");
 	lines.push(
@@ -329,12 +366,20 @@ function observationLines(repo, data) {
 // 返回 { artifact, report, failures, total, findings, reconciled }：
 // findings 为本轮新开的 Finding（已落盘）；reconciled 为本轮对账退役的失效项
 //（{ id, repo, type, subject, cause }）；failures 是取证失败的仓库数，total 为仓库总数。
-export async function runMorningScan({ repos, botId, saveArtifact }) {
+export async function runMorningScan({
+	repos,
+	botId,
+	saveArtifact,
+}: {
+	repos: string[];
+	botId: string;
+	saveArtifact: (input: { botId: string; kind: string; title?: unknown; body?: unknown }) => ArtifactMeta;
+}): Promise<{ artifact: ArtifactMeta; report: string; failures: number; total: number; findings: Finding[]; reconciled: ReconciledItem[] }> {
 	const now = new Date();
 	const dateStr = now.toISOString().slice(0, 10);
-	const createdAll = [];
-	const reconciledAll = [];
-	const observations = [];
+	const createdAll: Finding[] = [];
+	const reconciledAll: ReconciledItem[] = [];
+	const observations: string[] = [];
 	let failures = 0;
 	for (const repo of repos) {
 		try {
@@ -344,7 +389,7 @@ export async function runMorningScan({ repos, botId, saveArtifact }) {
 			observations.push(observationLines(repo, data));
 		} catch (err) {
 			failures += 1;
-			observations.push(`### ${repo}\n\n- 扫描失败：${err.message}\n`);
+			observations.push(`### ${repo}\n\n- 扫描失败：${(err as Error).message}\n`);
 		}
 	}
 

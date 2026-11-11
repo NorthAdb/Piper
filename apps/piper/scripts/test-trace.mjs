@@ -32,7 +32,7 @@ const FAKE_SECRET = `ghp_${"A".repeat(24)}`;
 async function unitPart() {
 	let buildTrace = null;
 	try {
-		const mod = await import("../lib/trace.mjs");
+		const mod = await import("../dist/lib/trace.js");
 		buildTrace = typeof mod.buildTrace === "function" ? mod.buildTrace : null;
 	} catch {
 		buildTrace = null;
@@ -167,7 +167,7 @@ async function waitReady(proc, port, timeoutMs = 20000) {
 function startServer(port, dataDir) {
 	const env = { ...process.env, PORT: String(port), PIPER_TOKEN: "trace-test-token", PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: "http://127.0.0.1:9" };
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN", "PIPER_HOST"]) delete env[k];
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let log = "";
 	proc.stdout.on("data", (d) => (log += d));
 	proc.stderr.on("data", (d) => (log += d));

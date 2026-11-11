@@ -14,7 +14,7 @@ const SCRIPT = fileURLToPath(import.meta.url);
 const APP_DIR = join(dirname(SCRIPT), "..");
 
 if (process.argv.includes("--read")) {
-	const { listFindings } = await import("../lib/findings.mjs");
+	const { listFindings } = await import("../dist/lib/findings.js");
 	console.log(JSON.stringify(listFindings()));
 	process.exit(0);
 }
@@ -42,7 +42,7 @@ process.env.PIPER_FINDINGS_FILE = file;
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 
 try {
-	const F = await import("../lib/findings.mjs");
+	const F = await import("../dist/lib/findings.js");
 
 	const base = {
 		repo: "NorthAdb/LinkForge",

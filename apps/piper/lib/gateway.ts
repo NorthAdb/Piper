@@ -14,13 +14,13 @@
 //      说明有另一路正在执行，拒绝防并发双发；
 //   6. Finding 未过期（过期则顺手转 expired）；
 //   7. 评论正文不含任何已知秘密或令牌形状（统一 redact 口径：当前/历史令牌、
-//      模型 Key、前缀模式，见 lib/redact.mjs；R7 前只查当前 GitHub 令牌）；
+//      模型 Key、前缀模式，见 lib/redact.ts；R7 前只查当前 GitHub 令牌）；
 //   8. 有令牌（无令牌 failed/no_token，明确失败不假成功）。
 // 领取与执行（领取 = approved→executing 的同步段，单进程内即互斥）：
 //   - 领取后先写一条审计 executing，再做网络调用——进程崩溃后能看到「发到一半」；
 //   - 执行前现查目标 PR 仍为 open，否则 failed/pr_not_open，退回 approved 可重试；
 //   - 再复检触发规则前提（R5）：PR 非 draft、且按与扫描同一套「已批准」判定
-//     （lib/pr-review.mjs）仍待审——批准后 PR 已被批准的，不再发过时催办评论，
+//     （lib/pr-review.ts）仍待审——批准后 PR 已被批准的，不再发过时催办评论，
 //     failed/precondition_changed 退回 approved；复检取证失败同样退回，不误发；
 //   - 发评论前先查该 PR 已有评论里是否带本批准的幂等标记
 //     <!-- piper:approval=<approvalId> -->，有则复用该评论记 executed，不再 POST；
@@ -29,22 +29,42 @@
 //     failed/comments_check_incomplete 退回 approved（宁可不发，不能冒险双发）；
 //   - POST 的正文 = 快照正文 + 幂等标记；成功写审计 executed（带评论 URL）、Finding 转 executed；
 //   - 任一网络步失败：Finding 从 executing 退回 approved、写审计 failed，错误可见可重试。
-// 凭证只经 lib/settings.mjs 的 githubToken() 读取，本文件不直读环境变量与设置文件。
-import { githubToken } from "./settings.mjs";
-import { containsSecret } from "./redact.mjs";
-import { getBot } from "./store.mjs";
-import { getFinding, updateFinding } from "./findings.mjs";
-import { appendAudit } from "./audit.mjs";
-import { evaluateReviews } from "./pr-review.mjs";
-import { ghPage, PAGE_CAPS } from "./scan.mjs";
+// 凭证只经 lib/settings.ts 的 githubToken() 读取，本文件不直读环境变量与设置文件。
+import { githubToken } from "./settings.ts";
+import { containsSecret } from "./redact.ts";
+import { getBot } from "./store.ts";
+import { getFinding, updateFinding } from "./findings.ts";
+import type { Finding } from "./findings.ts";
+import { appendAudit } from "./audit.ts";
+import { evaluateReviews } from "./pr-review.ts";
+import { ghPage, PAGE_CAPS } from "./scan.ts";
+
+// 批准记录里的意图快照形状（属主在 lib/approvals.ts 的 intentSnapshotOf，
+// 网关执行前与 Finding 当前 writeIntent 逐字比对，用的是同一份形状）。
+export interface IntentSnapshot {
+	kind: string;
+	repo: string;
+	prNumber: number;
+	body: string;
+}
+
+export interface GatewayResult {
+	ok: boolean;
+	result: "denied" | "failed" | "executed";
+	reason?: string;
+	commentUrl?: string | null;
+	reused?: boolean;
+	finding?: Finding | null;
+}
 
 // GitHub API 基址：缺省官方；可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归/测试指向本地桩）。
-function ghBase() {
+function ghBase(): string {
 	return (process.env.PIPER_GITHUB_API_BASE || "https://api.github.com").replace(/\/+$/, "");
 }
 
-async function ghJson(path, { method = "GET", token, body } = {}) {
-	const headers = { Accept: "application/vnd.github+json", "User-Agent": "piper-gateway" };
+// GitHub API 响应是外部边界：返回 any，由消费点逐字段取用（同 lib/scan.ts 口径）。
+async function ghJson(path: string, { method = "GET", token, body }: { method?: string; token?: string; body?: unknown } = {}): Promise<any> {
+	const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "piper-gateway" };
 	if (token) headers.Authorization = `Bearer ${token}`;
 	const res = await fetch(`${ghBase()}${path}`, {
 		method,
@@ -61,8 +81,8 @@ async function ghJson(path, { method = "GET", token, body } = {}) {
 const COMMENTS_CHECK_PER_PAGE = 100;
 const COMMENTS_CHECK_MAX_PAGES = 10;
 
-async function fetchCommentsForCheck(repo, prNumber, token) {
-	const comments = [];
+async function fetchCommentsForCheck(repo: string, prNumber: number, token: string): Promise<{ comments: any[]; complete: boolean }> {
+	const comments: any[] = [];
 	for (let page = 1; page <= COMMENTS_CHECK_MAX_PAGES; page += 1) {
 		const batch = await ghJson(`/repos/${repo}/issues/${prNumber}/comments?per_page=${COMMENTS_CHECK_PER_PAGE}&page=${page}`, { token });
 		const list = Array.isArray(batch) ? batch : [];
@@ -72,7 +92,7 @@ async function fetchCommentsForCheck(repo, prNumber, token) {
 	return { comments, complete: false };
 }
 
-function sameIntent(snapshot, finding) {
+function sameIntent(snapshot: IntentSnapshot | null | undefined, finding: Finding | null | undefined): boolean {
 	const current = finding?.writeIntent;
 	if (!snapshot || !current) return false;
 	return (
@@ -83,22 +103,27 @@ function sameIntent(snapshot, finding) {
 	);
 }
 
-export async function gatewayExecuteWrite({ findingId, approvalId = null, snapshot = null } = {}) {
+export async function gatewayExecuteWrite({
+	findingId,
+	approvalId = null,
+	snapshot = null,
+}: { findingId?: string | null; approvalId?: string | null; snapshot?: IntentSnapshot | null } = {}): Promise<GatewayResult> {
 	const finding = findingId ? getFinding(findingId) : null;
 	const auditIntent = { ...(snapshot ?? finding?.writeIntent ?? {}), repo: snapshot?.repo ?? finding?.repo ?? null };
 	const base = { botId: finding?.botId ?? null, findingId: findingId ?? null, approvalId, intent: auditIntent };
-	const denied = (reason) => {
+	const denied = (reason: string): GatewayResult => {
 		appendAudit({ ...base, result: "denied", reason });
 		return { ok: false, result: "denied", reason };
 	};
-	const failed = (reason) => {
+	const failed = (reason: string): GatewayResult => {
 		appendAudit({ ...base, result: "failed", reason });
 		return { ok: false, result: "failed", reason };
 	};
 	// 执行在途的失败退回：executing→approved（迁移表内的合法退回），保持可重试。
-	const rollback = () => {
-		const cur = getFinding(findingId);
-		if (cur?.status === "executing") updateFinding(findingId, { status: "approved" });
+	// rollback 只在 finding 已确认存在后调用，即 findingId 必非空。
+	const rollback = (): void => {
+		const cur = getFinding(findingId as string);
+		if (cur?.status === "executing") updateFinding(findingId as string, { status: "approved" });
 	};
 
 	if (!finding) return denied("finding_not_found");
@@ -128,30 +153,30 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 	updateFinding(finding.id, { status: "executing" });
 	appendAudit({ ...base, result: "executing" });
 
-	let pr;
+	let pr: any;
 	try {
 		pr = await ghJson(`/repos/${finding.repo}/pulls/${snapshot.prNumber}`, { token });
 	} catch (err) {
 		rollback();
-		return failed(`pr_check_failed: ${err.message}`);
+		return failed(`pr_check_failed: ${(err as Error).message}`);
 	}
 	if (pr.state !== "open") {
 		rollback();
 		return failed("pr_not_open");
 	}
-	// 规则前提复检（R5）：与扫描共用 lib/pr-review.mjs 的「已批准」判定。
+	// 规则前提复检（R5）：与扫描共用 lib/pr-review.ts 的「已批准」判定。
 	if (pr.draft) {
 		rollback();
 		return failed("precondition_changed");
 	}
-	let reviews;
+	let reviews: any[];
 	try {
 		// 复检取 reviews 与扫描共用同一翻页函数（F2 顺手项）：一页 100 条装不下时
 		// 只看第一页会漏掉靠后的 APPROVED / CHANGES_REQUESTED，判定会错。
 		reviews = (await ghPage(`/repos/${finding.repo}/pulls/${snapshot.prNumber}/reviews`, PAGE_CAPS.reviews)).items;
 	} catch (err) {
 		rollback();
-		return failed(`precondition_check_failed: ${err.message}`);
+		return failed(`precondition_check_failed: ${(err as Error).message}`);
 	}
 	if (evaluateReviews(reviews, pr.head?.sha).approved) {
 		rollback();
@@ -161,7 +186,7 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 	// 幂等查重：同一批准若已留过评论（例如上次 POST 成功后进程崩溃），直接复用，不再发第二条。
 	// 查重翻页取尽（F2）；到上限仍没取尽且没找到标记 → 无法证明没发过，不发。
 	const marker = `<!-- piper:approval=${approvalId} -->`;
-	let existing = null;
+	let existing: any = null;
 	let commentsComplete = true;
 	try {
 		const checked = await fetchCommentsForCheck(finding.repo, snapshot.prNumber, token);
@@ -169,7 +194,7 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 		existing = checked.comments.find((c) => typeof c?.body === "string" && c.body.includes(marker)) ?? null;
 	} catch (err) {
 		rollback();
-		return failed(`comments_check_failed: ${err.message}`);
+		return failed(`comments_check_failed: ${(err as Error).message}`);
 	}
 	if (!existing && !commentsComplete) {
 		rollback();
@@ -181,7 +206,7 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 		return { ok: true, result: "executed", commentUrl: existing.html_url ?? null, reused: true, finding: updated };
 	}
 
-	let comment;
+	let comment: any;
 	try {
 		comment = await ghJson(`/repos/${finding.repo}/issues/${snapshot.prNumber}/comments`, {
 			method: "POST",
@@ -190,7 +215,7 @@ export async function gatewayExecuteWrite({ findingId, approvalId = null, snapsh
 		});
 	} catch (err) {
 		rollback();
-		return failed(`comment_failed: ${err.message}`);
+		return failed(`comment_failed: ${(err as Error).message}`);
 	}
 
 	appendAudit({ ...base, result: "executed", commentUrl: comment.html_url ?? null });

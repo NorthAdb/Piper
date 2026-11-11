@@ -111,7 +111,7 @@ const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPE
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
 for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
-const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 let serverLog = "";
 proc.stdout.on("data", (d) => (serverLog += d));
 proc.stderr.on("data", (d) => (serverLog += d));

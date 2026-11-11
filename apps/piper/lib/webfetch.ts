@@ -14,11 +14,38 @@
 // 缺一不可；生产环境两个变量都不设，即无任何放行。
 import { lookup as dnsLookupCallback } from "node:dns";
 import { request as httpRequest } from "node:http";
+import type { RequestOptions } from "node:http";
 import { request as httpsRequest } from "node:https";
 import { isIP } from "node:net";
 import { promisify } from "node:util";
 
 const dnsLookup = promisify(dnsLookupCallback);
+
+export interface FetchResult {
+	url: string;
+	status: number;
+	text: string;
+	truncated: boolean;
+	downloadTruncated: boolean;
+}
+
+// 传输层返回形状（默认实现与测试替身共用）：headers 是 Node 风格的
+// 键 -> 字符串（或字符串数组）映射。
+export interface TransportResponse {
+	status: number;
+	headers: Record<string, string | string[] | undefined>;
+	body: string;
+	downloadTruncated?: boolean;
+}
+
+export type LookupAllFn = (hostname: string) => Promise<string[]>;
+export type TransportFn = (url: URL, pinnedAddresses: string[] | null, opts: { signal: AbortSignal }) => Promise<TransportResponse>;
+
+export interface WebFetchDeps {
+	lookupAll?: LookupAllFn;
+	transport?: TransportFn;
+	timeoutMs?: number;
+}
 
 export const WEB_FETCH_TIMEOUT_MS = 10_000;
 export const WEB_FETCH_MAX_DOWNLOAD_BYTES = 1_000_000;
@@ -27,12 +54,12 @@ const MAX_REDIRECTS = 5;
 
 export const BLOCKED_MESSAGE = "不允许访问该地址";
 
-function blockedError() {
+function blockedError(): Error & { code: string } {
 	return Object.assign(new Error(BLOCKED_MESSAGE), { code: "WEB_FETCH_BLOCKED" });
 }
 
 // ---------- 地址判定（纯函数，测试直接钉表） ----------
-export function isBlockedAddress(ip) {
+export function isBlockedAddress(ip: unknown): boolean {
 	if (typeof ip !== "string") return true;
 	const family = isIP(ip);
 	if (family === 4) return isBlockedV4(ip);
@@ -40,7 +67,7 @@ export function isBlockedAddress(ip) {
 	return true; // 不是合法 IP 字面量：一律按不安全处理
 }
 
-function isBlockedV4(ip) {
+function isBlockedV4(ip: string): boolean {
 	const parts = ip.split(".").map((s) => Number(s));
 	if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return true;
 	const [a, b] = parts;
@@ -58,7 +85,7 @@ function isBlockedV4(ip) {
 }
 
 // 把 IPv6 字面量展开成 8 组 16 位整数（处理 :: 压缩与尾部点分 IPv4）；非法返回 null。
-function expandV6Groups(ip) {
+function expandV6Groups(ip: string): number[] | null {
 	let s = ip;
 	const v4 = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
 	if (v4) {
@@ -70,7 +97,7 @@ function expandV6Groups(ip) {
 	if (halves.length > 2) return null;
 	const left = halves[0] ? halves[0].split(":") : [];
 	const right = halves.length === 2 ? (halves[1] ? halves[1].split(":") : []) : null;
-	let parts;
+	let parts: string[];
 	if (right === null) {
 		if (left.length !== 8) return null;
 		parts = left;
@@ -85,13 +112,13 @@ function expandV6Groups(ip) {
 }
 
 // 隧道/映射前缀的判定看内嵌 IPv4：取第 hiIndex、hiIndex+1 组拼成点分地址再走 V4 判定。
-function embeddedV4Blocked(groups, hiIndex) {
+function embeddedV4Blocked(groups: number[], hiIndex: number): boolean {
 	const hi = groups[hiIndex];
 	const lo = groups[hiIndex + 1];
 	return isBlockedV4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
 }
 
-function isBlockedV6(ip) {
+function isBlockedV6(ip: string): boolean {
 	const g = expandV6Groups(ip);
 	if (!g) return true; // 展开不了：一律按不安全处理
 	const [g0, g1, g2, g3, g4, g5] = g;
@@ -107,7 +134,7 @@ function isBlockedV6(ip) {
 }
 
 // ---------- 测试缝（双开关；仅测试进程设置，生产不设即不存在） ----------
-function testAllowSet() {
+function testAllowSet(): Set<string> | null {
 	const raw = process.env.PIPER_WEB_FETCH_TEST_ALLOW;
 	if (!raw) return null;
 	return new Set(
@@ -118,7 +145,7 @@ function testAllowSet() {
 	);
 }
 
-function isTestAllowed(url) {
+function isTestAllowed(url: URL): boolean {
 	if (process.env.PIPER_TEST_MODE !== "1") return false; // 第二道开关（F9）
 	const set = testAllowSet();
 	if (!set) return false;
@@ -127,7 +154,7 @@ function isTestAllowed(url) {
 }
 
 // ---------- 解析与校验 ----------
-async function defaultLookupAll(hostname) {
+async function defaultLookupAll(hostname: string): Promise<string[]> {
 	const records = await dnsLookup(hostname, { all: true, verbatim: true });
 	return records.map((r) => r.address);
 }
@@ -135,12 +162,12 @@ async function defaultLookupAll(hostname) {
 // 校验一个 URL：协议 + 解析全部地址。返回钉住的地址数组（测试缝放行时为 null，
 // 表示走系统解析——只可能发生在测试进程内对夹具地址）。任一地址被拦即抛
 // WEB_FETCH_BLOCKED，错误信息只有通用口径。
-async function assertUrlAllowed(url, lookupAll) {
+async function assertUrlAllowed(url: URL, lookupAll: LookupAllFn): Promise<string[] | null> {
 	if (url.protocol !== "http:" && url.protocol !== "https:") throw blockedError();
 	if (isTestAllowed(url)) return null;
 	// WHATWG URL 对 IPv6 字面量保留方括号（[::1]），判定前先剥掉
 	const hostname = url.hostname.replace(/^\[(.*)\]$/, "$1");
-	let addresses;
+	let addresses: string[];
 	if (isIP(hostname)) {
 		addresses = [hostname];
 	} else {
@@ -161,8 +188,8 @@ async function assertUrlAllowed(url, lookupAll) {
 // 建请求选项（纯函数，导出供测试直接钉住，F6）：pinnedAddresses 非空时带上
 // lookup 钉住回调——socket 只连校验过的地址、连接阶段不再解析，请求时传入什么
 // 主机名都只返回钉住的地址。SNI/证书仍按 URL 主机名（Node 以 hostname 为准）。
-export function buildFetchRequestOptions(url, pinnedAddresses, { signal } = {}) {
-	const options = {
+export function buildFetchRequestOptions(url: URL, pinnedAddresses: string[] | null, { signal }: { signal?: AbortSignal } = {}): RequestOptions {
+	const options: RequestOptions = {
 		method: "GET",
 		headers: {
 			"User-Agent": "Piper web.fetch (read-only)",
@@ -185,14 +212,14 @@ export function buildFetchRequestOptions(url, pinnedAddresses, { signal } = {}) 
 	return options;
 }
 
-function defaultTransport(url, pinnedAddresses, { signal } = {}) {
+function defaultTransport(url: URL, pinnedAddresses: string[] | null, { signal }: { signal?: AbortSignal } = {}): Promise<TransportResponse> {
 	return new Promise((resolvePromise, rejectPromise) => {
 		const isHttps = url.protocol === "https:";
 		const requestFn = isHttps ? httpsRequest : httpRequest;
 		const options = buildFetchRequestOptions(url, pinnedAddresses, { signal });
 		let settled = false;
 		let downloadTruncated = false;
-		const chunks = [];
+		const chunks: Buffer[] = [];
 		const req = requestFn(url, options, (res) => {
 			let received = 0;
 			const finishPartial = () => {
@@ -247,7 +274,7 @@ function defaultTransport(url, pinnedAddresses, { signal } = {}) {
 }
 
 // ---------- 可见文本抽取 ----------
-function extractVisibleText(body, contentType) {
+function extractVisibleText(body: string, contentType: unknown): string {
 	const type = String(contentType ?? "");
 	if (type.includes("application/json") || type.includes("text/plain") || type.includes("text/markdown")) {
 		return body.trim();
@@ -276,10 +303,13 @@ function extractVisibleText(body, contentType) {
 // 每项取 title/name、url/link、snippet/description/content 中先出现的字段。
 // 搜索端点是用户自己配置的可信服务（和模型端点同类），不走 web.fetch 的
 // SSRF 校验；但响应大小与条数仍设上限，错误文本不回显密钥。
-export async function webSearch(query, { endpoint, apiKey }) {
+export async function webSearch(
+	query: unknown,
+	{ endpoint, apiKey }: { endpoint: string; apiKey: string },
+): Promise<Array<{ title: string; url: string; snippet: string }>> {
 	const url = new URL(endpoint);
 	url.searchParams.set("q", String(query));
-	let res;
+	let res: Response;
 	try {
 		res = await fetch(url, {
 			headers: { Authorization: `Bearer ${apiKey}`, Accept: "application/json" },
@@ -291,7 +321,8 @@ export async function webSearch(query, { endpoint, apiKey }) {
 	if (!res.ok) throw Object.assign(new Error(`搜索失败：服务返回 HTTP ${res.status}`), { code: "WEB_SEARCH_FAILED" });
 	const raw = await res.text();
 	if (raw.length > WEB_FETCH_MAX_DOWNLOAD_BYTES) throw Object.assign(new Error("搜索失败：服务返回内容过大"), { code: "WEB_SEARCH_FAILED" });
-	let parsed;
+	// 搜索端点是用户配置的可信服务，其 JSON 形状按上方契约逐字段取用（any 边界）。
+	let parsed: any;
 	try {
 		parsed = JSON.parse(raw);
 	} catch {
@@ -313,10 +344,10 @@ export async function webSearch(query, { endpoint, apiKey }) {
 // 返回 { url（最终地址）, status, text（≤8000）, truncated, downloadTruncated }。
 // deps 可注入 lookupAll / transport（测试替身用，生产不传）；deps.timeoutMs 仅供
 // 测试注入更短的超时，生产不传、恒用 WEB_FETCH_TIMEOUT_MS（常量另有测试钉住 ≤10s）。
-export async function webFetch(rawUrl, deps = {}) {
+export async function webFetch(rawUrl: unknown, deps: WebFetchDeps = {}): Promise<FetchResult> {
 	const lookupAll = deps.lookupAll ?? defaultLookupAll;
 	const transport = deps.transport ?? defaultTransport;
-	let current;
+	let current: URL;
 	try {
 		current = new URL(String(rawUrl));
 	} catch {
@@ -325,17 +356,20 @@ export async function webFetch(rawUrl, deps = {}) {
 	const deadline = AbortSignal.timeout(deps.timeoutMs ?? WEB_FETCH_TIMEOUT_MS);
 	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
 		const pinned = await assertUrlAllowed(current, lookupAll);
-		let res;
+		let res: TransportResponse;
 		try {
 			res = await transport(current, pinned, { signal: deadline });
 		} catch (err) {
-			if (err?.code === "WEB_FETCH_BLOCKED") throw err;
-			if (err?.name === "TimeoutError" || err?.name === "AbortError" || err?.code === "ABORT_ERR") {
+			const e = err as { code?: string; name?: string } | null | undefined;
+			if (e?.code === "WEB_FETCH_BLOCKED") throw err;
+			if (e?.name === "TimeoutError" || e?.name === "AbortError" || e?.code === "ABORT_ERR") {
 				throw Object.assign(new Error("抓取超时"), { code: "WEB_FETCH_FAILED" });
 			}
 			throw Object.assign(new Error("抓取失败：网络错误"), { code: "WEB_FETCH_FAILED" });
 		}
-		const location = res.headers?.location ?? res.headers?.Location;
+		// Location 在真实响应里恒为单个字符串；替身若给数组，取第一个（与 HTTP 语义一致）。
+		const locationRaw = res.headers?.location ?? res.headers?.Location;
+		const location = Array.isArray(locationRaw) ? locationRaw[0] : locationRaw;
 		if ([301, 302, 303, 307, 308].includes(res.status) && location) {
 			if (hop === MAX_REDIRECTS) throw Object.assign(new Error("抓取失败：重定向次数过多"), { code: "WEB_FETCH_FAILED" });
 			try {

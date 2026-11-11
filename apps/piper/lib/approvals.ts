@@ -1,8 +1,8 @@
 // 待批收件箱（P1-5 读模型 + P1-6 批准执行 + R1 返工）：待批项不是另一份存储——它就是带
-// writeIntent 的 Finding 的审批视图。Finding 是唯一事实源（lib/findings.mjs），本模块
+// writeIntent 的 Finding 的审批视图。Finding 是唯一事实源（lib/findings.ts），本模块
 // 负责读模型整形、批准/驳回的状态迁移；过期清理由显式步骤触发（见 sweepExpiredFindings）；
-// 批准后经 lib/gateway.mjs 执行写入
-//（本模块不直接调用任何 GitHub 写接口）。审计（lib/audit.mjs）记录 approved /
+// 批准后经 lib/gateway.ts 执行写入
+//（本模块不直接调用任何 GitHub 写接口）。审计（lib/audit.ts）记录 approved /
 // rejected / 以及网关的 denied / executing / executed / failed，收件箱据审计展示最近失败原因。
 // 执行失败时 Finding 保持 approved：错误经 lastError 展示，再次点批准即重试。
 // R1：批准动作先落一条 append-only 批准记录（data/approvals.jsonl）——批准时刻的意图
@@ -12,23 +12,55 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getFinding, listFindings, updateFinding } from "./findings.mjs";
-import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.mjs";
-import { gatewayExecuteWrite } from "./gateway.mjs";
-import { addNotification } from "./notify.mjs";
-import { DATA_DIR, ensureData, saveArtifact } from "./store.mjs";
+import { getFinding, listFindings, updateFinding } from "./findings.ts";
+import type { Finding, FindingStatus, FindingType, WriteIntent } from "./findings.ts";
+import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.ts";
+import { gatewayExecuteWrite } from "./gateway.ts";
+import type { GatewayResult, IntentSnapshot } from "./gateway.ts";
+import { addNotification } from "./notify.ts";
+import { DATA_DIR, ensureData, saveArtifact } from "./store.ts";
+import type { ArtifactMeta } from "./store.ts";
 
-function conflict(message) {
+export interface ApprovalRecord {
+	approvalId: string;
+	findingId: string;
+	intentSnapshot: IntentSnapshot | null;
+	intentHash: string | null;
+	approvedAt: string;
+}
+
+export interface ApprovalView {
+	id: string;
+	findingId: string;
+	botId: string;
+	repo: string;
+	type: FindingType;
+	title: string;
+	summary: string;
+	evidenceUrl: string;
+	suggestedAction: string;
+	writeIntent: WriteIntent | null;
+	status: FindingStatus;
+	expiresAt: string | null;
+	createdAt: string;
+	updatedAt: string;
+	approvalId: string | null;
+	intentHash: string | null;
+	lastError: string | null;
+	commentUrl: string | null;
+}
+
+function conflict(message: string): Error & { status: number } {
 	return Object.assign(new Error(message), { status: 409 });
 }
 
 // ---- 批准记录（append-only）：批准时刻的意图快照与哈希 ----
-function approvalsFile() {
+function approvalsFile(): string {
 	return process.env.PIPER_APPROVALS_FILE || join(DATA_DIR, "approvals.jsonl");
 }
 
 // 意图快照：网关执行的唯一内容来源。repo 取 Finding.repo（取证事实，不可改）。
-export function intentSnapshotOf(finding) {
+export function intentSnapshotOf(finding: Finding | null | undefined): IntentSnapshot | null {
 	if (!finding?.writeIntent) return null;
 	return {
 		kind: finding.writeIntent.kind,
@@ -38,14 +70,14 @@ export function intentSnapshotOf(finding) {
 	};
 }
 
-export function intentHashOf(snapshot) {
+export function intentHashOf(snapshot: IntentSnapshot | null | undefined): string | null {
 	if (!snapshot) return null;
 	return createHash("sha256")
 		.update(JSON.stringify({ kind: snapshot.kind, repo: snapshot.repo, prNumber: snapshot.prNumber, body: snapshot.body }))
 		.digest("hex");
 }
 
-function readApprovalRecords() {
+function readApprovalRecords(): ApprovalRecord[] {
 	const file = approvalsFile();
 	if (!existsSync(file)) return [];
 	return readFileSync(file, "utf8")
@@ -58,21 +90,21 @@ function readApprovalRecords() {
 				return null;
 			}
 		})
-		.filter(Boolean);
+		.filter((r): r is ApprovalRecord => Boolean(r));
 }
 
-export function listApprovalRecords(findingId) {
+export function listApprovalRecords(findingId?: string): ApprovalRecord[] {
 	return readApprovalRecords().filter((r) => findingId === undefined || r.findingId === findingId);
 }
 
-export function latestApprovalRecord(findingId) {
+export function latestApprovalRecord(findingId: string): ApprovalRecord | null {
 	const recs = listApprovalRecords(findingId);
 	return recs.length ? recs[recs.length - 1] : null;
 }
 
-function createApprovalRecord(finding) {
+function createApprovalRecord(finding: Finding): ApprovalRecord {
 	const intentSnapshot = intentSnapshotOf(finding);
-	const record = {
+	const record: ApprovalRecord = {
 		approvalId: `ap-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 		findingId: finding.id,
 		intentSnapshot,
@@ -84,7 +116,7 @@ function createApprovalRecord(finding) {
 	return record;
 }
 
-function badRequest(message) {
+function badRequest(message: string): Error & { status: number } {
 	return Object.assign(new Error(message), { status: 400 });
 }
 
@@ -97,7 +129,7 @@ function badRequest(message) {
 // 第二个活进程，任何 executing 必然是上一进程的残留）；调度周期 tick 用缺省阈值。
 export const EXECUTING_RECOVERY_MS = 5 * 60 * 1000;
 
-export function recoverInterruptedExecutions({ now = new Date(), olderThanMs = EXECUTING_RECOVERY_MS } = {}) {
+export function recoverInterruptedExecutions({ now = new Date(), olderThanMs = EXECUTING_RECOVERY_MS }: { now?: Date; olderThanMs?: number } = {}): number {
 	let recovered = 0;
 	for (const f of listFindings({ status: "executing" })) {
 		if (now.getTime() - Date.parse(f.updatedAt) < olderThanMs) continue;
@@ -117,9 +149,9 @@ export function recoverInterruptedExecutions({ now = new Date(), olderThanMs = E
 
 // 过期清理：open 且 expiresAt 已过的 Finding 转 expired。R10 起 GET 读路径不再顺带
 // 做这件事（读接口无写副作用）——只由显式步骤调用：晨间扫描开始前、调度周期 tick
-// （server.mjs 每 30 秒）、以及批准/驳回的写路径（requireApprovable）。approved 的
+// （server.ts 每 30 秒）、以及批准/驳回的写路径（requireApprovable）。approved 的
 // 过期由网关执行前复检处理，不在这里悄悄改状态。
-export function sweepExpiredFindings(now = new Date()) {
+export function sweepExpiredFindings(now: Date = new Date()): number {
 	let swept = 0;
 	for (const f of listFindings({ status: "open" })) {
 		if (f.expiresAt && Date.parse(f.expiresAt) <= now.getTime()) {
@@ -130,7 +162,7 @@ export function sweepExpiredFindings(now = new Date()) {
 	return swept;
 }
 
-export function toApproval(f) {
+export function toApproval(f: Finding): ApprovalView {
 	const record = latestApprovalRecord(f.id);
 	return {
 		id: f.id,
@@ -159,18 +191,18 @@ export function toApproval(f) {
 
 // 待批列表：带 writeIntent 且状态为 open / approved / executing 的 Finding，新在前。
 // 纯读：不做过期清理（R10）——清理的显式触发点见 sweepExpiredFindings 的注释。
-export function listApprovals() {
+export function listApprovals(): ApprovalView[] {
 	return listFindings()
 		.filter((f) => f.writeIntent && (f.status === "open" || f.status === "approved" || f.status === "executing"))
 		.map(toApproval);
 }
 
-export function getApproval(id) {
+export function getApproval(id: string): ApprovalView | null {
 	const f = getFinding(id);
 	return f && f.writeIntent ? toApproval(f) : null;
 }
 
-function requireApprovable(id) {
+function requireApprovable(id: string): Finding | null {
 	sweepExpiredFindings();
 	const f = getFinding(id);
 	if (!f) return null;
@@ -185,7 +217,16 @@ function requireApprovable(id) {
 //（在途互斥：本函数的校验、落记录、改状态与网关的领取都在同步段内完成，单进程里
 // 第二个并发批准必然看到 executing）；不存在 → null（路由转 404）。
 // saveArtifactFn 可注入（测试用替身，避免在真实产物目录留下替身执行记录）。
-export async function approveApproval(id, { intentHash, saveArtifactFn = saveArtifact } = {}) {
+export async function approveApproval(
+	id: string,
+	{
+		intentHash,
+		saveArtifactFn = saveArtifact,
+	}: {
+		intentHash?: string | null;
+		saveArtifactFn?: (input: { botId: string; kind: string; title?: unknown; body?: unknown }) => ArtifactMeta;
+	} = {},
+): Promise<{ approval: ApprovalView; execution: GatewayResult & { artifactId?: string } } | null> {
 	const f = requireApprovable(id);
 	if (!f) return null;
 	if (f.status === "rejected" || f.status === "expired" || f.status === "executed") {
@@ -209,32 +250,35 @@ export async function approveApproval(id, { intentHash, saveArtifactFn = saveArt
 		if (!record) record = createApprovalRecord(f);
 		else if (intentHash && intentHash !== record.intentHash) throw conflict("内容已变，请重新查看");
 	}
+	// requireApprovable 已保证 f.writeIntent 非空，批准记录的快照必然非空；
+	// fresh 是刚执行完的同一条 Finding，也必然存在。这两处是已定不变量。
+	const snapshot = record.intentSnapshot as IntentSnapshot;
 	const execution = await gatewayExecuteWrite({ findingId: id, approvalId: record.approvalId, snapshot: record.intentSnapshot });
-	const fresh = getFinding(id);
+	const fresh = getFinding(id) as Finding;
 	if (execution.ok) {
 		const artifact = saveArtifactFn({
 			botId: f.botId,
 			kind: "gateway-execution",
-			title: `网关执行记录：${f.repo} PR #${record.intentSnapshot.prNumber} 评论`,
+			title: `网关执行记录：${f.repo} PR #${snapshot.prNumber} 评论`,
 			body: [
 				`# 网关执行记录`,
 				``,
 				`- 时间：${new Date().toISOString()}`,
 				`- Finding：${f.id}（${f.title}）`,
 				`- 批准记录：${record.approvalId}`,
-				`- 写入： 在 ${f.repo} 的 PR #${record.intentSnapshot.prNumber} 下发表评论`,
+				`- 写入： 在 ${f.repo} 的 PR #${snapshot.prNumber} 下发表评论`,
 				`- 评论链接：${execution.commentUrl ?? "（GitHub 未返回链接）"}`,
 				`- 证据：${f.evidenceUrl}`,
 				``,
 				`评论正文（批准快照）：`,
 				``,
-				record.intentSnapshot.body,
+				snapshot.body,
 			].join("\n"),
 		});
 		addNotification({
 			type: "approval.executed",
 			title: "待批写操作已执行",
-			body: `已在 ${f.repo} 的 PR #${record.intentSnapshot.prNumber} 发表评论：${execution.commentUrl ?? ""}`,
+			body: `已在 ${f.repo} 的 PR #${snapshot.prNumber} 发表评论：${execution.commentUrl ?? ""}`,
 			findingId: id,
 			artifactId: artifact.id,
 		});
@@ -250,12 +294,13 @@ export async function approveApproval(id, { intentHash, saveArtifactFn = saveArt
 }
 
 // 驳回：open / approved → rejected，写审计，不调用任何写 API。
-export function rejectApproval(id) {
+export function rejectApproval(id: string): ApprovalView | null {
 	const f = requireApprovable(id);
 	if (!f) return null;
 	if (f.status === "executing") throw conflict("该待批项正在执行，不能驳回");
 	if (f.status !== "open" && f.status !== "approved") throw conflict(`该待批项已关闭（当前状态 ${f.status}），不能再驳回`);
-	const next = updateFinding(id, { status: "rejected" });
+	// f 刚由 requireApprovable 取到，updateFinding 必然命中同一条。
+	const next = updateFinding(id, { status: "rejected" }) as Finding;
 	appendAudit({
 		botId: f.botId,
 		intent: { ...f.writeIntent, repo: f.repo },

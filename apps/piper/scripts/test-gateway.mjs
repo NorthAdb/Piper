@@ -95,14 +95,14 @@ const saveArtifactStub = (input) => {
 };
 
 try {
-	const { ensureData } = await import("../lib/store.mjs");
+	const { ensureData } = await import("../dist/lib/store.js");
 	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
-	const { createFinding, getFinding, updateFinding } = await import("../lib/findings.mjs");
-	const { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.mjs");
-	const { gatewayExecuteWrite } = await import("../lib/gateway.mjs");
-	const { listAudit } = await import("../lib/audit.mjs");
-	const { listNotifications } = await import("../lib/notify.mjs");
-	const { githubToken } = await import("../lib/settings.mjs");
+	const { createFinding, getFinding, updateFinding } = await import("../dist/lib/findings.js");
+	const { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../dist/lib/approvals.js");
+	const { gatewayExecuteWrite } = await import("../dist/lib/gateway.js");
+	const { listAudit } = await import("../dist/lib/audit.js");
+	const { listNotifications } = await import("../dist/lib/notify.js");
+	const { githubToken } = await import("../dist/lib/settings.js");
 	const token = githubToken();
 
 	const BODY = "晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。";
@@ -564,20 +564,20 @@ try {
 		);
 	}
 
-	// 19. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
+	// 19. 绕过断言：除 gateway.ts 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
 	//     扫描与对话层文件不得同时出现 api.github.com 与 POST 写调用。
 	{
-		const libFiles = readdirSync(join(APP_DIR, "lib")).filter((f) => f.endsWith(".mjs"));
+		const libFiles = readdirSync(join(APP_DIR, "lib")).filter((f) => f.endsWith(".ts"));
 		const sources = Object.fromEntries(libFiles.map((f) => [f, readFileSync(join(APP_DIR, "lib", f), "utf8")]));
-		sources["server.mjs"] = readFileSync(join(APP_DIR, "server.mjs"), "utf8");
+		sources["server.ts"] = readFileSync(join(APP_DIR, "server.ts"), "utf8");
 		const withComments = Object.entries(sources)
 			.filter(([, src]) => src.includes("/comments"))
 			.map(([name]) => name);
-		const readLayers = ["scan.mjs", "kernel.mjs", "approvals.mjs", "findings.mjs"];
+		const readLayers = ["scan.ts", "kernel.ts", "approvals.ts", "findings.ts"];
 		const readLayerClean = readLayers.every((name) => !(sources[name].includes("api.github.com") && sources[name].includes('"POST"')));
 		check(
-			"无绕过：只有 gateway.mjs 构造 /comments 写端点；scan/kernel/approvals/findings 无 GitHub POST 写调用",
-			JSON.stringify(withComments) === JSON.stringify(["gateway.mjs"]) && readLayerClean,
+			"无绕过：只有 gateway.ts 构造 /comments 写端点；scan/kernel/approvals/findings 无 GitHub POST 写调用",
+			JSON.stringify(withComments) === JSON.stringify(["gateway.ts"]) && readLayerClean,
 			`withComments=${withComments.join(",")}`,
 		);
 	}

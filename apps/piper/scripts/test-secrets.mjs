@@ -33,12 +33,12 @@ function modeOf(file) {
 }
 
 async function unitPart() {
-	const settings = await import("../lib/settings.mjs");
+	const settings = await import("../dist/lib/settings.js");
 	let redact = null;
 	let containsSecret = null;
 	let redactLoadError = "";
 	try {
-		({ redact, containsSecret } = await import("../lib/redact.mjs"));
+		({ redact, containsSecret } = await import("../dist/lib/redact.js"));
 	} catch (err) {
 		redactLoadError = err.message;
 	}
@@ -192,7 +192,7 @@ async function serverPart() {
 	const dataDir = join(TMP_ROOT, "data-server");
 	const env = { ...process.env, PORT: String(SRV_PORT), PIPER_TOKEN: SRV_TOKEN, PIPER_DATA_DIR: dataDir, PIPER_GITHUB_API_BASE: `http://127.0.0.1:${STUB_PORT}` };
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN", "PIPER_HOST"]) delete env[k];
-	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let serverLog = "";
 	proc.stdout.on("data", (d) => (serverLog += d));
 	proc.stderr.on("data", (d) => (serverLog += d));
