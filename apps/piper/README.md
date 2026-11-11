@@ -54,12 +54,14 @@ npm start            # 先构建前端（vite build -> public/）再启动 node 
 Tailwind CSS **4.3.5**（`@tailwindcss/vite` 插件）+ shadcn 主题变量体系，入口 `web/src/index.css`：
 
 - **主题**：单主题深色（bot 控制台气质）。变量定义在 `:root`（html 带 `.dark` 类，
-  使 `dark:` 变体与 Radix 组件按深色工作），颜色用 oklch：zinc 系深灰面
-  （`--background` oklch(0.135) / `--card` / `--sidebar` 等）、信号靛蓝主色
-  （`--primary` oklch(0.655 0.165 276)，用于按钮、选中态、焦点环）、规范 `--destructive` 红；
-  成功/运行中状态在组件层用 emerald/amber 色阶。圆角基准 `--radius: 0.625rem`，
-  字体走系统栈（含 CJK）+ ui-monospace 等宽栈。全局规范：边框 `--border` 白 9% 透明、
-  输入面 `--input`、`--ring` 与主色同色相。
+  使 `dark:` 变体与 Radix 组件按深色工作），颜色用 oklch：中性 zinc 灰阶面
+  （`--background` oklch(0.141) / `--card` oklch(0.21) / `--sidebar` oklch(0.165) 等，
+  与 Tailwind zinc 色阶同值）、唯一强调色 Pied Piper 绿
+  （`--primary` oklch(0.6 0.115 162)，emerald 色相降饱和哑光，用于主按钮、激活态、
+  链接、焦点环）、规范 `--destructive` 红；成功/运行中状态在组件层用 emerald/amber 色阶。
+  圆角基准 `--radius: 0.5rem`，字体走系统栈（含 CJK）+ ui-monospace 等宽栈。
+  全局规范：边框 `--border` 白 8% 发丝级、输入面 `--input` 白 12%、
+  `--ring` 与主色同色相；层级靠明度与留白，不靠彩色（视觉基线 feat/ui-foundation）。
 - **shadcn 基础组件**（copy-in 官方形态，落在 `web/src/components/ui/`）：
   button、badge、card、tabs、dialog、input、textarea、label、scroll-area、separator、
   tooltip、collapsible、select（select 是 AI Elements CodeBlock 的传递依赖）。工具函数
@@ -1694,3 +1696,40 @@ eval:scan 21、regression 72（全部不低于工具卡分支基线）。
 明确不做：未改 `packages/` 源码（只用 pi-ai / pi-agent-core 的既有导
 出）、未改现有 SSE 事件名（只新增 `thinking`）、未加新依赖、未动
 web 抓取与工具卡口径、未动挡位词表/clamp 口径。
+
+### 视觉基线实测（2026-11-11，分支 feat/ui-foundation）
+
+视觉优化轮第一个 PR：只立基线（设计变量 + 全局 + 左栏/顶栏），右栏、对话区、
+轨迹视图留给后续 PR。视觉口径一句版：**禁**紫蓝渐变、玻璃拟态、发光阴影、
+霓虹强调色、emoji 图标、大圆角气泡与彩色徽章堆砌；**取**中性 zinc 灰阶 +
+白 8% 发丝边框 + 唯一 Pied Piper 绿强调（oklch(0.6 0.115 162)）+ 明度/留白
+分层 + 4/8 间距节奏 + 数字 tabular-nums + 150ms 只动颜色/透明度的过渡。
+
+- 变量层（`web/src/index.css`）：全套变量从蓝灰色相（264）中性化为 zinc 同值
+  灰阶；`--primary`/`--ring`/`--sidebar-primary`/`--sidebar-ring` 由信号靛蓝
+  （oklch(0.655 0.165 276)）统一为 Pied Piper 绿，全仓不再有第二个强调色；
+  `--chart-1..5` 彩虹色阶收敛为强调绿 + zinc 灰阶；`--radius` 0.625rem → 0.5rem；
+  选区色改绿 35%；新增全局细滚动条（透明轨道、白 12% 滑块、hover 22%，
+  Firefox 与 WebKit 两套）。字体保持系统栈（含 CJK），不引外部字体、不加依赖。
+- 全局控件态（shadcn class 层，不改组件逻辑）：Button 过渡收敛为
+  color/background/border/box-shadow/opacity 150ms ease-out + 按压 scale 0.98；
+  Badge 改小圆角矩形并带 tabular-nums；Input/Textarea/Select 补 150ms
+  border-color 过渡，Input 补 hover 边框微亮。
+- 左栏（`web/src/BotList.tsx`）：BOTS 标签改 11px 微型大写（tracking 0.08em），
+  计数由描边徽章改纯数字（tabular-nums）；bot 条目右侧状态点与编辑钮改为
+  同位叠放——悬停时状态点淡出、编辑钮淡入（focus-visible 同样可见），不再
+  并排占位；「新建 Bot」改虚线描边弱化按钮；底部导航改纵向 flex gap 节奏，
+  计数徽章收紧为 h-5 紧凑形。
+- 顶栏与骨架（`web/src/App.tsx`）：中栏标题栏 h-13 → h-12、px-5 → px-4，
+  与左栏内边距节奏统一；右栏与对话区本 PR 只随变量自动对齐，未改结构与组件。
+- 构建与回归：`npm run test` 聚合退出码 0（build:web、check 过）：findings 27、
+  scan 10、pr-review 16、schedule 14、gateway 27、recovery 7、listen 9、
+  badtz 4、secrets 21、model-stub 10、model-providers 57、r10 22、webfetch 48、
+  eval:scan 21、regression 72，全部与基线一致（纯视觉改动，数字不增不减）。
+- 截图：`docs/screens` 全套 01–15 复跑刷新，新增
+  `16-main-overview.png`（主界面全景：左栏绿色品牌块、BOTS 微标签、虚线
+  新建钮与顶栏新貌），逐张目检无真实秘密（Key 仅末四位掩码，余为种子数据）。
+  shots 脚本只在 01 后同态多拍一张 16，无等待条件变化（脚本断言全为文本存在性，
+  本轮未改任何文案与语义）。
+- 明确不做：未改任何 API、SSE 事件、路由与数据逻辑；未动右栏结构与
+  对话区组件；未改 `packages/`；未加新依赖；未引入浅色模式。

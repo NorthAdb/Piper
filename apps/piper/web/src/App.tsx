@@ -165,7 +165,7 @@ export function App() {
 			</aside>
 
 			<main className="flex min-h-0 min-w-0 flex-col bg-background">
-				<header className="flex h-13 shrink-0 items-center gap-3 border-b px-5">
+				<header className="flex h-12 shrink-0 items-center gap-3 border-b px-4">
 					{currentBot ? (
 						<>
 							<span className="flex size-7 items-center justify-center rounded-full bg-secondary text-[11px] font-semibold text-secondary-foreground">

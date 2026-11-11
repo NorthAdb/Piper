@@ -1,55 +1,59 @@
 /* Piper 设计系统入口（Tailwind v4 + shadcn 主题变量）。
    单主题应用：深色 bot 控制台。主题变量直接定义在 :root（html 带 .dark 类，
-   以便 dark: 变体与 Radix 组件按深色工作），颜色用 oklch，规范见 README「设计系统」节。 */
+   以便 dark: 变体与 Radix 组件按深色工作），颜色用 oklch，规范见 README「设计系统」节。
+   视觉基线（feat/ui-foundation）：中性 zinc 灰阶 + 发丝边框 + 唯一强调色
+   Pied Piper 绿（哑光降饱和）；层级靠明度与留白，不靠彩色。 */
 @import "tailwindcss";
 @import "tw-animate-css";
 
 @custom-variant dark (&:is(.dark *));
 
 :root {
-	--radius: 0.625rem;
+	--radius: 0.5rem;
 
-	/* 基础面与文字（zinc 系深灰，带极轻蓝灰色相） */
-	--background: oklch(0.135 0.006 264);
-	--foreground: oklch(0.955 0.004 264);
-	--card: oklch(0.178 0.007 264);
-	--card-foreground: oklch(0.955 0.004 264);
-	--popover: oklch(0.195 0.008 264);
-	--popover-foreground: oklch(0.955 0.004 264);
+	/* 基础面与文字（中性 zinc 灰阶，与 Tailwind zinc 色阶同值） */
+	--background: oklch(0.141 0.005 285.823);
+	--foreground: oklch(0.985 0 0);
+	--card: oklch(0.21 0.006 285.885);
+	--card-foreground: oklch(0.985 0 0);
+	--popover: oklch(0.21 0.006 285.885);
+	--popover-foreground: oklch(0.985 0 0);
 
-	/* 主色：信号靛蓝（按钮、选中态、焦点环） */
-	--primary: oklch(0.655 0.165 276);
-	--primary-foreground: oklch(0.985 0.004 276);
+	/* 唯一强调色：Pied Piper 绿（emerald 色相、降饱和哑光），用于主按钮、激活态、链接、焦点环 */
+	--primary: oklch(0.6 0.115 162);
+	--primary-foreground: oklch(0.985 0 0);
 
-	--secondary: oklch(0.245 0.008 264);
-	--secondary-foreground: oklch(0.955 0.004 264);
-	--muted: oklch(0.225 0.007 264);
-	--muted-foreground: oklch(0.685 0.012 264);
-	--accent: oklch(0.265 0.01 264);
-	--accent-foreground: oklch(0.97 0.004 264);
+	--secondary: oklch(0.274 0.006 286.033);
+	--secondary-foreground: oklch(0.985 0 0);
+	--muted: oklch(0.274 0.006 286.033);
+	--muted-foreground: oklch(0.705 0.015 286.067);
+	--accent: oklch(0.274 0.006 286.033);
+	--accent-foreground: oklch(0.985 0 0);
 
 	/* 语义色：destructive 用规范红，成功/运行中在组件里用 emerald/amber 色阶 */
-	--destructive: oklch(0.63 0.21 25);
+	--destructive: oklch(0.65 0.19 25);
 
-	--border: oklch(1 0 0 / 9%);
-	--input: oklch(1 0 0 / 13%);
-	--ring: oklch(0.56 0.14 276);
+	/* 发丝级边框：白 8% 一类，层级主要靠明度差 */
+	--border: oklch(1 0 0 / 8%);
+	--input: oklch(1 0 0 / 12%);
+	--ring: oklch(0.65 0.12 162);
 
-	--chart-1: oklch(0.655 0.165 276);
-	--chart-2: oklch(0.7 0.14 185);
-	--chart-3: oklch(0.75 0.13 85);
-	--chart-4: oklch(0.65 0.18 330);
-	--chart-5: oklch(0.68 0.16 40);
+	/* 图表色收敛为强调绿 + zinc 灰阶（不用彩虹色阶） */
+	--chart-1: oklch(0.6 0.115 162);
+	--chart-2: oklch(0.705 0.015 286.067);
+	--chart-3: oklch(0.552 0.016 285.938);
+	--chart-4: oklch(0.442 0.017 285.786);
+	--chart-5: oklch(0.37 0.013 285.805);
 
-	/* 侧栏（左 bot 列表 / 右桌面） */
-	--sidebar: oklch(0.158 0.006 264);
-	--sidebar-foreground: oklch(0.955 0.004 264);
-	--sidebar-primary: oklch(0.655 0.165 276);
-	--sidebar-primary-foreground: oklch(0.985 0.004 276);
-	--sidebar-accent: oklch(0.235 0.008 264);
-	--sidebar-accent-foreground: oklch(0.97 0.004 264);
+	/* 侧栏（左 bot 列表 / 右桌面）：比主面略亮一档，与主面靠明度分层 */
+	--sidebar: oklch(0.165 0.005 285.823);
+	--sidebar-foreground: oklch(0.985 0 0);
+	--sidebar-primary: oklch(0.6 0.115 162);
+	--sidebar-primary-foreground: oklch(0.985 0 0);
+	--sidebar-accent: oklch(0.235 0.006 286);
+	--sidebar-accent-foreground: oklch(0.985 0 0);
 	--sidebar-border: oklch(1 0 0 / 8%);
-	--sidebar-ring: oklch(0.56 0.14 276);
+	--sidebar-ring: oklch(0.65 0.12 162);
 }
 
 @theme inline {
@@ -109,7 +113,28 @@
 		@apply bg-background font-sans text-foreground antialiased;
 	}
 	::selection {
-		background: oklch(0.655 0.165 276 / 40%);
+		background: oklch(0.6 0.115 162 / 35%);
+	}
+	/* 全局细滚动条：透明轨道、弱化滑块（Firefox 的 scrollbar-* 与 WebKit 伪元素两套） */
+	* {
+		scrollbar-width: thin;
+		scrollbar-color: oklch(1 0 0 / 14%) transparent;
+	}
+	::-webkit-scrollbar {
+		width: 10px;
+		height: 10px;
+	}
+	::-webkit-scrollbar-track {
+		background: transparent;
+	}
+	::-webkit-scrollbar-thumb {
+		background: oklch(1 0 0 / 12%);
+		border: 3px solid transparent;
+		border-radius: 999px;
+		background-clip: padding-box;
+	}
+	::-webkit-scrollbar-thumb:hover {
+		background-color: oklch(1 0 0 / 22%);
 	}
 }
 
@@ -195,7 +220,7 @@
 		overflow-x: auto;
 		border: 1px solid var(--border);
 		border-radius: var(--radius-md);
-		background: oklch(0.105 0.005 264);
+		background: oklch(0.115 0.005 286);
 		padding: 0.75rem 0.9rem;
 	}
 	.aui-md code {

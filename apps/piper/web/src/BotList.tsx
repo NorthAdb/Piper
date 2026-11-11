@@ -54,10 +54,8 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 			</div>
 
 			<div className="flex items-center justify-between px-4 pt-1 pb-2">
-				<span className="text-xs font-medium tracking-wider text-muted-foreground uppercase">Bots</span>
-				<Badge variant="outline" className="text-[11px]">
-					{bots.length}
-				</Badge>
+				<span className="text-[11px] font-medium tracking-[0.08em] text-muted-foreground uppercase">Bots</span>
+				<span className="text-[11px] text-muted-foreground tabular-nums">{bots.length}</span>
 			</div>
 
 			<ScrollArea className="min-h-0 flex-1 px-2">
@@ -69,7 +67,7 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 							<div
 								key={b.id}
 								className={cn(
-									"group flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors",
+									"group flex w-full cursor-pointer items-center gap-2.5 rounded-lg px-2.5 py-2 text-sm transition-colors duration-150",
 									active ? "bg-sidebar-accent text-sidebar-accent-foreground" : "hover:bg-sidebar-accent/60",
 								)}
 								onClick={() => onSelect(b.id)}
@@ -92,24 +90,29 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 										{b.isMain ? "主 bot" : b.repos.length ? `绑定 ${b.repos.length} 个仓库` : "未绑定仓库"}
 									</span>
 								</span>
-								<span
-									className={cn("size-2 shrink-0 rounded-full", busy ? "animate-pulse bg-amber-400" : "bg-muted-foreground/40")}
-									title={busy ? "干活中" : "空闲"}
-								/>
-								<Button
-									type="button"
-									size="icon-sm"
-									variant="ghost"
-									title="编辑"
-									className={cn("shrink-0", active ? "opacity-70 hover:opacity-100" : "opacity-0 group-hover:opacity-100")}
-									onClick={(e) => {
-										e.stopPropagation();
-										onEdit(b);
-									}}
-								>
-									<PencilIcon />
-									<span className="sr-only">编辑</span>
-								</Button>
+								<span className="relative flex size-8 shrink-0 items-center justify-center">
+									<span
+										className={cn(
+											"size-2 rounded-full transition-opacity duration-150 group-hover:opacity-0",
+											busy ? "animate-pulse bg-amber-400" : "bg-muted-foreground/40",
+										)}
+										title={busy ? "干活中" : "空闲"}
+									/>
+									<Button
+										type="button"
+										size="icon-sm"
+										variant="ghost"
+										title="编辑"
+										className="absolute inset-0 opacity-0 transition-opacity duration-150 group-hover:opacity-100 focus-visible:opacity-100"
+										onClick={(e) => {
+											e.stopPropagation();
+											onEdit(b);
+										}}
+									>
+										<PencilIcon />
+										<span className="sr-only">编辑</span>
+									</Button>
+								</span>
 							</div>
 						);
 					})}
@@ -117,33 +120,33 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 			</ScrollArea>
 
 			<div className="px-3 pt-1 pb-2">
-				<Button type="button" variant="outline" className="w-full" onClick={onNew}>
+				<Button type="button" variant="outline" className="w-full border-dashed text-muted-foreground hover:text-foreground" onClick={onNew}>
 					<PlusIcon />
 					新建 Bot
 				</Button>
 			</div>
 
 			<Separator />
-			<div className="p-3">
-				<Button type="button" variant="ghost" className="w-full justify-start" onClick={onOpenInbox}>
+			<div className="flex flex-col gap-0.5 p-3">
+				<Button type="button" variant="ghost" className="w-full justify-start px-2.5" onClick={onOpenInbox}>
 					<InboxIcon />
 					待批收件箱
 					{approvals.length ? (
-						<Badge className="ml-auto" variant="secondary">
+						<Badge className="ml-auto h-5 min-w-5 px-1.5 text-[11px]" variant="secondary">
 							{approvals.length}
 						</Badge>
 					) : null}
 				</Button>
-				<Button type="button" variant="ghost" className="mt-1 w-full justify-start" onClick={onOpenNotifications}>
+				<Button type="button" variant="ghost" className="w-full justify-start px-2.5" onClick={onOpenNotifications}>
 					<BellIcon />
 					通知
 					{notifUnread ? (
-						<Badge className="ml-auto" variant="secondary">
+						<Badge className="ml-auto h-5 min-w-5 px-1.5 text-[11px]" variant="secondary">
 							{notifUnread}
 						</Badge>
 					) : null}
 				</Button>
-				<Button type="button" variant="ghost" className="mt-1 w-full justify-start" onClick={onOpenSettings}>
+				<Button type="button" variant="ghost" className="w-full justify-start px-2.5" onClick={onOpenSettings}>
 					<SettingsIcon />
 					设置
 				</Button>
