@@ -376,6 +376,7 @@ try {
 	await new Promise((r) => setTimeout(r, 800));
 
 	await shot("01-main-piper-desktop.png"); // 主界面：选中 Piper，其右栏无仓库管家的例程（隔离）
+	await shot("16-main-overview.png"); // 视觉基线全景（feat/ui-foundation）：同态复拍，展示左栏 + 顶栏新貌
 
 	await clickText("仓库管家", { maxX: 264 });
 	await waitFor(bodyHas("晨间仓库扫描"), "仓库管家右栏出现晨间扫描例程");
