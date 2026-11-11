@@ -1,15 +1,21 @@
-// 模型服务商选择单测：目录形状与归属判定（单元）、目录接口未登录 401、
-// 选 deepseek 保存→读回（provider/baseUrl 预置/Key 只掩码）、未知 provider 400、
-// custom 保存任意端点、旧格式文件（无 provider）读回 custom 且原值不丢。
-// 用临时 PIPER_DATA_DIR 起真 server，全程离线。
+// 模型服务商选择单测（改版口径）：目录派生自 Pi 基座 pi-ai 的内置目录
+// （dist/providers/all 的 builtinProviders + getBuiltinModels），只保留与内核
+// 兼容的服务商——内核只建 api="openai-completions" 的 provider，所以某服务商
+// 至少要有一个该 api 的 chat 模型、且该模型 baseUrl 非空才进目录；目录内模型
+// 名单只含该 api 的模型。外加 POST /api/settings/model/fetch-models：填了 Key
+// 即可从端点 GET /models 拉取模型名单；缺省 Key 时只有端点与已保存配置完全
+// 一致才许复用已保存 Key（R7 守卫）。用临时 PIPER_DATA_DIR 起真 server +
+// 本地 stub 上游，全程离线。
 // 用法（在 apps/piper 下）：node scripts/test-model-providers.mjs（或 npm run test:model-providers）
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
+const REPO_ROOT = join(APP_DIR, "..", "..");
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-providers-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 process.env.PIPER_DATA_DIR = TMP_DATA;
@@ -26,39 +32,125 @@ function check(name, ok, detail = "") {
 const DEEPSEEK_KEY = "sk-deepseek-test-key-abcdef123456";
 const CUSTOM_KEY = "sk-custom-test-key-654321fedcba";
 const LEGACY_KEY = "sk-legacy-test-key-zzzz9999aaaa";
+const STUB_KEY = "sk-stub-fetch-key-0123456789abcdef";
+const TYPED_WRONG_KEY = "sk-wrong-typed-key-0000000000";
+
+// ---------- 本地 stub 上游：/v1/models 要 Bearer STUB_KEY，其余路径造各种坏响应 ----------
+const stubHits = [];
+const stub = createServer((reqHttp, resHttp) => {
+	const u = new URL(reqHttp.url ?? "/", "http://stub.invalid");
+	stubHits.push({ path: u.pathname, auth: reqHttp.headers.authorization ?? "" });
+	if (u.pathname === "/v1/models") {
+		if (reqHttp.headers.authorization !== `Bearer ${STUB_KEY}`) {
+			resHttp.writeHead(401, { "Content-Type": "application/json" });
+			resHttp.end(JSON.stringify({ error: { message: "invalid api key (upstream echo: sk-upstreamecho1234567890abcdef)" } }));
+			return;
+		}
+		resHttp.writeHead(200, { "Content-Type": "application/json" });
+		resHttp.end(
+			JSON.stringify({
+				object: "list",
+				data: [{ id: "stub-model-b" }, { id: "stub-model-a" }, { id: "stub-model-a" }, { id: 42 }, { name: "no-id" }],
+			}),
+		);
+		return;
+	}
+	if (u.pathname === "/bad/models") {
+		resHttp.writeHead(200, { "Content-Type": "application/json" });
+		resHttp.end("this is not json");
+		return;
+	}
+	if (u.pathname === "/nodata/models") {
+		resHttp.writeHead(200, { "Content-Type": "application/json" });
+		resHttp.end(JSON.stringify({ object: "list" }));
+		return;
+	}
+	if (u.pathname === "/hang/models") return; // 永不响应，靠客户端超时
+	if (u.pathname === "/big/models") {
+		resHttp.writeHead(200, { "Content-Type": "application/json" });
+		resHttp.end(JSON.stringify({ data: [{ id: "x".repeat(5000) }] }));
+		return;
+	}
+	resHttp.statusCode = 404;
+	resHttp.end("{}");
+});
+await new Promise((r) => stub.listen(0, "127.0.0.1", r));
+const STUB_BASE = `http://127.0.0.1:${stub.address().port}`;
+const STUB_V1 = `${STUB_BASE}/v1`;
+const modelsHitCount = () => stubHits.filter((h) => h.path === "/v1/models").length;
 
 async function unitPart() {
-	const { MODEL_PROVIDERS, getModelProvider, isKnownModelProvider, resolveModelProviderId } = await import("../lib/model-providers.mjs");
+	const mp = await import("../lib/model-providers.mjs");
 	const settings = await import("../lib/settings.mjs");
 
-	const expectedIds = ["deepseek", "openai", "moonshot", "zhipu", "dashscope", "siliconflow", "openrouter", "custom"];
 	check(
-		"目录恰含 8 个服务商 id（deepseek/openai/moonshot/zhipu/dashscope/siliconflow/openrouter/custom）",
-		MODEL_PROVIDERS.length === expectedIds.length && expectedIds.every((id) => getModelProvider(id)),
-		`实际 ${MODEL_PROVIDERS.map((p) => p.id).join(",")}`,
+		"lib 导出 loadModelProviders 与 fetchUpstreamModels（目录改为异步派生 + 拉取函数）",
+		typeof mp.loadModelProviders === "function" && typeof mp.fetchUpstreamModels === "function",
+		`loadModelProviders=${typeof mp.loadModelProviders} fetchUpstreamModels=${typeof mp.fetchUpstreamModels}`,
 	);
+	const providers = typeof mp.loadModelProviders === "function" ? await mp.loadModelProviders() : [];
+	const byId = (id) => providers.find((p) => p.id === id);
+
+	check("派生目录服务商数量远大于手写 8 条（≥25，含 custom）", providers.length >= 25, `实际 ${providers.length}`);
 	check(
-		"非 custom 条目 baseUrl 均为 https 且 models 非空；custom 的 baseUrl 为空、models 为空",
-		MODEL_PROVIDERS.every((p) => (p.id === "custom" ? p.baseUrl === "" && p.models.length === 0 : /^https:\/\//.test(p.baseUrl) && p.models.length > 0)),
+		"custom 恒为最后一项且 baseUrl 为空、models 为空",
+		providers.length > 0 && providers[providers.length - 1].id === "custom" && byId("custom")?.baseUrl === "" && byId("custom")?.models.length === 0,
+		JSON.stringify(providers[providers.length - 1]),
 	);
-	const ds = getModelProvider("deepseek");
+	const ds = byId("deepseek");
 	check(
-		"deepseek 预置准确：baseUrl 与 deepseek-chat/deepseek-reasoner",
-		ds.baseUrl === "https://api.deepseek.com/v1" && ds.models.includes("deepseek-chat") && ds.models.includes("deepseek-reasoner"),
+		"deepseek 来自 pi-ai 目录：name=DeepSeek、baseUrl=https://api.deepseek.com、模型含 deepseek-flash 与 deepseek-v4-pro",
+		ds?.name === "DeepSeek" && ds?.baseUrl === "https://api.deepseek.com" && ds.models.includes("deepseek-flash") && ds.models.includes("deepseek-v4-pro"),
 		JSON.stringify(ds),
 	);
-	check("resolveModelProviderId：无 provider 字段 → custom", resolveModelProviderId({}) === "custom" && resolveModelProviderId(null) === "custom");
 	check(
-		"resolveModelProviderId：合法 id 原样、未知 id → custom；isKnownModelProvider 同口径",
-		resolveModelProviderId({ provider: "deepseek" }) === "deepseek" &&
-			resolveModelProviderId({ provider: "nope" }) === "custom" &&
-			isKnownModelProvider("zhipu") &&
-			!isKnownModelProvider("nope"),
+		"不兼容 api 的服务商不出现：anthropic / amazon-bedrock / azure / openai / google / mistral 均不在目录",
+		["anthropic", "amazon-bedrock", "azure", "openai", "google", "mistral"].every((id) => !byId(id)),
+		providers.map((p) => p.id).join(","),
+	);
+	check(
+		"每个非 custom 条目 baseUrl 非空且 models 非空",
+		providers.filter((p) => p.id !== "custom").every((p) => p.baseUrl && p.models.length > 0),
 	);
 
-	settings.saveModelSettingsFile({ provider: "deepseek", baseUrl: "https://api.deepseek.com/v1", modelId: "deepseek-chat", apiKey: DEEPSEEK_KEY });
+	// 与 pi-ai dist 交叉核对：混合 api 的服务商，我们列出的模型恰为其 openai-completions 子集。
+	const all = await import(pathToFileURL(join(REPO_ROOT, "packages", "ai", "dist", "providers", "all.js")).href);
+	let subsetOk = true;
+	let subsetDetail = "";
+	for (const pid of ["fireworks", "github-copilot", "opencode"]) {
+		const compatIds = all
+			.getBuiltinModels(pid)
+			.filter((m) => m.api === "openai-completions")
+			.map((m) => m.id)
+			.sort();
+		const ours = [...(byId(pid)?.models ?? [])].sort();
+		if (JSON.stringify(compatIds) !== JSON.stringify(ours)) {
+			subsetOk = false;
+			subsetDetail = `${pid}: pi-ai 子集 ${compatIds.length} 条 vs 我们 ${ours.length} 条`;
+			break;
+		}
+	}
+	check("混合 api 服务商（fireworks/github-copilot/opencode）的名单恰为 pi-ai 的 openai-completions 子集", subsetOk, subsetDetail);
+
+	const isKnown = async (id) => (typeof mp.isKnownModelProvider === "function" ? await mp.isKnownModelProvider(id) : false);
+	const resolve = async (saved) => (typeof mp.resolveModelProviderId === "function" ? await mp.resolveModelProviderId(saved) : "custom");
+	check(
+		"归属判定按 pi-ai id：deepseek/moonshotai/openrouter 识别；旧手写 id（moonshot/zhipu/dashscope/siliconflow）回落 custom",
+		(await isKnown("deepseek")) &&
+			(await isKnown("moonshotai")) &&
+			!(await isKnown("moonshot")) &&
+			(await resolve({ provider: "deepseek" })) === "deepseek" &&
+			(await resolve({ provider: "moonshot" })) === "custom" &&
+			(await resolve({ provider: "zhipu" })) === "custom" &&
+			(await resolve({ provider: "dashscope" })) === "custom" &&
+			(await resolve({ provider: "siliconflow" })) === "custom" &&
+			(await resolve({})) === "custom" &&
+			(await resolve(null)) === "custom",
+	);
+
+	settings.saveModelSettingsFile({ provider: "moonshotai-cn", baseUrl: "https://api.moonshot.cn/v1", modelId: "kimi-k2-turbo-preview", apiKey: DEEPSEEK_KEY });
 	const saved = settings.readModelSettingsFile();
-	check("saveModelSettingsFile 落盘 provider 字段", saved.provider === "deepseek", JSON.stringify(saved.provider));
+	check("saveModelSettingsFile 落盘 pi-ai 风格 provider id（moonshotai-cn）", saved.provider === "moonshotai-cn", JSON.stringify(saved.provider));
 
 	// 旧格式：直接写一份没有 provider 的文件，读回应原值不丢、归属 custom。
 	writeFileSync(
@@ -69,12 +161,52 @@ async function unitPart() {
 	const legacy = settings.readModelSettingsFile();
 	check(
 		"旧格式文件（无 provider）读回原值不丢且归属 custom",
-		legacy.baseUrl === "https://legacy.example.com/v1" && legacy.modelId === "legacy-model" && legacy.apiKey === LEGACY_KEY && resolveModelProviderId(legacy) === "custom",
+		legacy.baseUrl === "https://legacy.example.com/v1" && legacy.modelId === "legacy-model" && legacy.apiKey === LEGACY_KEY && (await resolve(legacy)) === "custom",
 		JSON.stringify({ ...legacy, apiKey: legacy.apiKey ? "***" : "" }),
+	);
+
+	// ---------- fetchUpstreamModels 单元（对本地 stub） ----------
+	const fetchModels = typeof mp.fetchUpstreamModels === "function" ? mp.fetchUpstreamModels : async () => ({ ok: false, status: 0, error: "函数不存在" });
+	const okRes = await fetchModels({ baseUrl: STUB_V1, apiKey: STUB_KEY });
+	check(
+		"fetchUpstreamModels 正常解析：data[].id 去重排序、忽略无 id 项",
+		okRes.ok === true && JSON.stringify(okRes.models) === JSON.stringify(["stub-model-a", "stub-model-b"]),
+		JSON.stringify(okRes).slice(0, 200),
+	);
+	check(
+		"拉取时带上了 Bearer Key（stub 记录到的 Authorization）",
+		stubHits.some((h) => h.path === "/v1/models" && h.auth === `Bearer ${STUB_KEY}`),
+	);
+	const unauthRes = await fetchModels({ baseUrl: STUB_V1, apiKey: TYPED_WRONG_KEY });
+	check(
+		"上游 401：ok=false、status=401，错误文本不含候选 Key、也不含上游回显的 sk- 串（已脱敏）",
+		unauthRes.ok === false &&
+			unauthRes.status === 401 &&
+			!String(unauthRes.error).includes(TYPED_WRONG_KEY) &&
+			!String(unauthRes.error).includes("sk-upstreamecho"),
+		JSON.stringify(unauthRes).slice(0, 300),
+	);
+	const badJson = await fetchModels({ baseUrl: `${STUB_BASE}/bad`, apiKey: STUB_KEY });
+	check("上游返回坏 JSON：ok=false", badJson.ok === false, JSON.stringify(badJson).slice(0, 200));
+	const noData = await fetchModels({ baseUrl: `${STUB_BASE}/nodata`, apiKey: STUB_KEY });
+	check("上游响应缺 data 数组：ok=false", noData.ok === false, JSON.stringify(noData).slice(0, 200));
+	const t0 = Date.now();
+	const hang = await fetchModels({ baseUrl: `${STUB_BASE}/hang`, apiKey: STUB_KEY }, { timeoutMs: 300 });
+	check(
+		"上游永不响应：按超时返回 ok=false（注入 300ms，实际 <4s）",
+		hang.ok === false && Date.now() - t0 < 4000,
+		`elapsed=${Date.now() - t0}ms ${JSON.stringify(hang).slice(0, 120)}`,
+	);
+	const big = await fetchModels({ baseUrl: `${STUB_BASE}/big`, apiKey: STUB_KEY }, { maxBytes: 1024 });
+	check("上游响应超过体积上限：ok=false（注入 maxBytes=1024）", big.ok === false, JSON.stringify(big).slice(0, 200));
+	check(
+		"生产常量钉死：FETCH_MODELS_TIMEOUT_MS ≤ 10000、FETCH_MODELS_MAX_BYTES ≤ 1000000",
+		typeof mp.FETCH_MODELS_TIMEOUT_MS === "number" && mp.FETCH_MODELS_TIMEOUT_MS <= 10_000 && typeof mp.FETCH_MODELS_MAX_BYTES === "number" && mp.FETCH_MODELS_MAX_BYTES <= 1_000_000,
+		`timeout=${mp.FETCH_MODELS_TIMEOUT_MS} maxBytes=${mp.FETCH_MODELS_MAX_BYTES}`,
 	);
 }
 
-// ---------- 子进程部分：真 server 上的目录接口与保存/读回 ----------
+// ---------- 子进程部分：真 server 上的目录接口、保存/读回与拉取接口 ----------
 async function waitReady(proc, port, timeoutMs = 20000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
@@ -131,29 +263,31 @@ async function serverPart() {
 		check("GET /api/model-providers 未登录返回 401", unauth.status === 401, `实际 ${unauth.status}`);
 
 		const catalog = await api("/api/model-providers");
-		const dsEntry = catalog.json?.providers?.find((p) => p.id === "deepseek");
+		const catProviders = catalog.json?.providers ?? [];
+		const dsEntry = catProviders.find((p) => p.id === "deepseek");
 		check(
-			"GET /api/model-providers 登录后 200 且形状完整（8 条、deepseek 字段齐）",
+			"GET /api/model-providers 200：派生目录 ≥25 条、deepseek 字段与 pi-ai 一致、无 anthropic、custom 在末尾",
 			catalog.status === 200 &&
-				Array.isArray(catalog.json?.providers) &&
-				catalog.json.providers.length === 8 &&
+				catProviders.length >= 25 &&
 				dsEntry?.name === "DeepSeek" &&
-				dsEntry?.baseUrl === "https://api.deepseek.com/v1" &&
+				dsEntry?.baseUrl === "https://api.deepseek.com" &&
 				Array.isArray(dsEntry?.models) &&
-				dsEntry.models.includes("deepseek-reasoner"),
-			`status=${catalog.status} body=${catalog.text.slice(0, 200)}`,
+				dsEntry.models.includes("deepseek-v4-pro") &&
+				!catProviders.some((p) => p.id === "anthropic") &&
+				catProviders[catProviders.length - 1]?.id === "custom",
+			`status=${catalog.status} count=${catProviders.length} body=${catalog.text.slice(0, 200)}`,
 		);
 
 		const save = await api("/api/settings/model", {
 			method: "PUT",
-			body: JSON.stringify({ provider: "deepseek", baseUrl: "https://api.deepseek.com/v1", modelId: "deepseek-chat", apiKey: DEEPSEEK_KEY }),
+			body: JSON.stringify({ provider: "deepseek", baseUrl: "https://api.deepseek.com", modelId: "deepseek-v4-pro", apiKey: DEEPSEEK_KEY }),
 		});
 		check(
-			"PUT 保存 deepseek：回 provider=deepseek、预置 baseUrl、Key 只末四位掩码且响应无全文",
+			"PUT 保存 deepseek：回 provider=deepseek、pi-ai baseUrl、Key 只末四位掩码且响应无全文",
 			save.status === 200 &&
 				save.json?.provider === "deepseek" &&
-				save.json?.baseUrl === "https://api.deepseek.com/v1" &&
-				save.json?.modelId === "deepseek-chat" &&
+				save.json?.baseUrl === "https://api.deepseek.com" &&
+				save.json?.modelId === "deepseek-v4-pro" &&
 				save.json?.configured === true &&
 				save.json?.apiKeyHint === `••••${DEEPSEEK_KEY.slice(-4)}` &&
 				!save.text.includes(DEEPSEEK_KEY),
@@ -176,21 +310,70 @@ async function serverPart() {
 		);
 
 		const bad = await api("/api/settings/model", { method: "PUT", body: JSON.stringify({ provider: "nope" }) });
+		const oldId = await api("/api/settings/model", { method: "PUT", body: JSON.stringify({ provider: "moonshot" }) });
 		const afterBad = await api("/api/settings/model");
 		check(
-			"PUT 未知 provider 返回 400 且已有配置不变",
-			bad.status === 400 && afterBad.json?.provider === "deepseek",
-			`status=${bad.status} provider=${afterBad.json?.provider}`,
+			"PUT 未知 provider 与旧手写 id（moonshot）均返回 400 且已有配置不变",
+			bad.status === 400 && oldId.status === 400 && afterBad.json?.provider === "deepseek",
+			`nope=${bad.status} moonshot=${oldId.status} provider=${afterBad.json?.provider}`,
 		);
 
 		const custom = await api("/api/settings/model", {
 			method: "PUT",
-			body: JSON.stringify({ provider: "custom", baseUrl: "http://127.0.0.1:9/v1", modelId: "any-model-x", apiKey: CUSTOM_KEY }),
+			body: JSON.stringify({ provider: "custom", baseUrl: STUB_V1, modelId: "stub-model-a", apiKey: STUB_KEY }),
 		});
 		check(
-			"PUT 保存 custom 任意端点与任意模型名可用，读回 provider=custom",
-			custom.status === 200 && custom.json?.provider === "custom" && custom.json?.baseUrl === "http://127.0.0.1:9/v1" && custom.json?.modelId === "any-model-x",
+			"PUT 保存 custom 任意端点（指向 stub）可用，读回 provider=custom",
+			custom.status === 200 && custom.json?.provider === "custom" && custom.json?.baseUrl === STUB_V1 && custom.json?.modelId === "stub-model-a",
 			`status=${custom.status} body=${custom.text.slice(0, 300)}`,
+		);
+
+		// ---------- fetch-models 路由 ----------
+		const fmUnauth = await api("/api/settings/model/fetch-models", { method: "POST", body: JSON.stringify({ baseUrl: STUB_V1 }) }, false);
+		check("POST fetch-models 未登录返回 401", fmUnauth.status === 401, `实际 ${fmUnauth.status}`);
+
+		const hitsBefore = modelsHitCount();
+		const fmSaved = await api("/api/settings/model/fetch-models", { method: "POST", body: JSON.stringify({ baseUrl: STUB_V1 }) });
+		check(
+			"fetch-models 缺省 Key + 端点与已保存一致：复用已保存 Key 拉到 stub 模型（去重排序）",
+			fmSaved.status === 200 &&
+				fmSaved.json?.ok === true &&
+				JSON.stringify(fmSaved.json?.models) === JSON.stringify(["stub-model-a", "stub-model-b"]) &&
+				modelsHitCount() === hitsBefore + 1 &&
+				stubHits[stubHits.length - 1]?.auth === `Bearer ${STUB_KEY}`,
+			`status=${fmSaved.status} body=${fmSaved.text.slice(0, 300)}`,
+		);
+
+		const hitsBeforeMismatch = modelsHitCount();
+		const fmMismatch = await api("/api/settings/model/fetch-models", { method: "POST", body: JSON.stringify({ baseUrl: `${STUB_V1}-other` }) });
+		check(
+			"fetch-models 缺省 Key + 端点与已保存不一致：400 且没有向上游发出任何请求（R7 守卫）",
+			fmMismatch.status === 400 && modelsHitCount() === hitsBeforeMismatch,
+			`status=${fmMismatch.status} hits=${modelsHitCount() - hitsBeforeMismatch} body=${fmMismatch.text.slice(0, 200)}`,
+		);
+
+		const fmTyped = await api("/api/settings/model/fetch-models", {
+			method: "POST",
+			body: JSON.stringify({ baseUrl: STUB_V1, apiKey: TYPED_WRONG_KEY }),
+		});
+		check(
+			"fetch-models 带当次 Key：用候选 Key 拉取（上游 401 → ok=false/status=401），响应不含候选 Key",
+			fmTyped.status === 200 &&
+				fmTyped.json?.ok === false &&
+				fmTyped.json?.status === 401 &&
+				!fmTyped.text.includes(TYPED_WRONG_KEY) &&
+				stubHits[stubHits.length - 1]?.auth === `Bearer ${TYPED_WRONG_KEY}`,
+			`status=${fmTyped.status} body=${fmTyped.text.slice(0, 300)}`,
+		);
+
+		const fmBadJson = await api("/api/settings/model/fetch-models", {
+			method: "POST",
+			body: JSON.stringify({ baseUrl: `${STUB_BASE}/bad`, apiKey: STUB_KEY }),
+		});
+		check(
+			"fetch-models 上游坏 JSON：ok=false 且带错误说明",
+			fmBadJson.status === 200 && fmBadJson.json?.ok === false && typeof fmBadJson.json?.error === "string" && fmBadJson.json.error.length > 0,
+			`status=${fmBadJson.status} body=${fmBadJson.text.slice(0, 300)}`,
 		);
 
 		const legacyPatch = await api("/api/settings/model", { method: "PUT", body: JSON.stringify({ modelId: "legacy-patched" }) });
@@ -241,6 +424,7 @@ try {
 	await serverPart();
 	await legacyServerPart();
 } finally {
+	stub.close();
 	rmSync(TMP_ROOT, { recursive: true, force: true });
 }
 const failed = results.filter((r) => !r.ok);

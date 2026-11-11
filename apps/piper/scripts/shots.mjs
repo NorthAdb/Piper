@@ -76,6 +76,13 @@ await new Promise((r) => fixtureServer.listen(0, "127.0.0.1", r));
 const FIXTURE_PORT = fixtureServer.address().port;
 
 const shotsModelStub = createServer((reqHttp, resHttp) => {
+	// 模型名单拉取（改版截图 12 用）：设置页会用已保存 Key 向端点 GET /models，
+	// stub 回两个假模型名，证明拉取链路能把名单填进下拉。
+	if (reqHttp.url?.startsWith("/v1/models")) {
+		resHttp.writeHead(200, { "Content-Type": "application/json" });
+		resHttp.end(JSON.stringify({ object: "list", data: [{ id: "stub-alpha" }, { id: "stub-beta" }] }));
+		return;
+	}
 	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
 		resHttp.statusCode = 404;
 		resHttp.end(JSON.stringify({ error: { message: "not found" } }));
@@ -348,14 +355,35 @@ try {
 	await clickText("设置", { maxX: 264 });
 	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "设置-模型组出现");
 	await shot("04-settings-model-configured.png"); // 模型已配置态：Key 只显示末四位掩码
-	// 服务商选择截图：在表单里选 DeepSeek（不保存，种子里的 stub 配置不被改动），
-	// baseUrl 应自动预填 api.deepseek.com、模型预填 deepseek-chat；假 Key 打进
-	// password 输入框只显示圆点。截完这张，后续流程离开设置页即丢弃未保存改动。
-	await selectRadixOption("#model-provider", "DeepSeek");
-	await waitFor(`document.querySelector('#model-base-url')?.value === 'https://api.deepseek.com/v1'`, "选 DeepSeek 后 baseUrl 自动预填");
-	await evaluate(`document.querySelector('#model-api-key').focus()`);
-	await cdp("Input.insertText", { text: "sk-deepseek-fake-00000000wxyz" }, sessionId);
+	// 服务商 + 拉取模型截图（改版口径）：把已保存配置直接写成 provider=deepseek、
+	// 但 baseUrl 指向本地模型 stub——截图里的端点是本地替身、不是真 DeepSeek，
+	// Key 也是种子假 Key。重载后表单读回 DeepSeek 归属，且已保存 Key 在场会
+	// 自动向 stub 拉一次 /models；等「已从端点拉取 2 个模型」出现后打开模型
+	// 下拉，名单里应是 stub 回的 stub-alpha / stub-beta。
+	runSeed(`
+import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+saveModelSettingsFile({ provider: "deepseek", baseUrl: "${SHOTS_MODEL_BASE}", modelId: "stub-alpha", apiKey: "${FAKE_KEY}" });
+console.log("截图 12 用配置已写入（provider=deepseek，端点=本地 stub）");
+`);
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "重载后主界面出现");
+	await clickText("设置", { maxX: 264 });
+	await waitFor(bodyHas("先选服务商，再填该服务商的 API Key 接入"), "重载后设置-模型组出现");
+	await waitFor(bodyHas("已从端点拉取 2 个模型"), "自动拉取 stub 模型名单成功");
+	await clickPoint(centerOf("#model-id-select"), "打开模型下拉");
+	await waitFor(
+		`[...document.querySelectorAll('[role="option"]')].some((el) => (el.textContent || '').includes('stub-beta'))`,
+		"模型下拉出现 stub-beta",
+	);
 	await shot("12-settings-model-deepseek.png");
+	// 收起模型下拉再继续：Radix 下拉开着时点别处只会先关下拉、吞掉那次点击。
+	await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	const dropdownClosed = await evaluate(`document.querySelectorAll('[role="option"]').length === 0`).catch(() => false);
+	if (!dropdownClosed) {
+		await clickPoint(centerOf("#model-id-select"), "再次点击模型触发器收起下拉");
+		await waitFor(`document.querySelectorAll('[role="option"]').length === 0`, "模型下拉已收起");
+	}
 	await clickText("基础资料");
 	await waitFor(bodyHas("关于我"), "设置-基础资料组出现");
 	await shot("05-settings-profile.png");

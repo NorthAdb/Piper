@@ -119,6 +119,11 @@ export function testModelSettings(input: ModelSettingsInput): Promise<{ ok: bool
 	return api("/api/settings/model/test", { method: "POST", body: JSON.stringify(input) });
 }
 
+// 从端点拉取模型名单：apiKey 缺省时服务端只许端点与已保存配置一致时复用已保存 Key。
+export function fetchModelList(input: { baseUrl: string; apiKey?: string }): Promise<{ ok: boolean; models?: string[]; status?: number; error?: string }> {
+	return api("/api/settings/model/fetch-models", { method: "POST", body: JSON.stringify(input) });
+}
+
 export function getProfileSettings(): Promise<ProfileSettings> {
 	return api("/api/settings/profile");
 }

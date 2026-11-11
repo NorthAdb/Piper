@@ -1444,35 +1444,64 @@ PR 上重复跑、引入无关噪声。
 登录页里的「Sign in with an account」（账号 / OAuth）不在本轮，表单里没有
 账号入口。自定义端点保留为兜底。
 
-- 服务商目录单一数据源：新 `lib/model-providers.mjs` 导出 8 条（deepseek /
-  openai / moonshot / zhipu / dashscope / siliconflow / openrouter /
-  custom），server 提供只读接口 `GET /api/model-providers`（未登录 401）。
-  目录只是预置便利：baseUrl 与模型名都可改填任意值，不是白名单。
+第一版是 Piper 自己手写的 8 条小目录，用户否决（「pi 不是已经实现了
+provider 的选择了吗」）。**改版后目录不再手写**：
+
+- 目录派生自 pi-ai：`lib/model-providers.mjs` 懒加载基座
+  `packages/ai/dist/providers/all.js`，用 `builtinProviders()` 枚举 43 个
+  服务商、`getBuiltinModels(id)` 取各自的 chat 模型。筛选口径由内核决定：
+  Piper 内核只用 pi-ai 的 `openAICompletionsApi` 建 provider（模型 api 恒
+  为 `openai-completions`），所以只保留「至少有一个这种模型的服务商」，
+  名单也只列这种模型（混合 api 的服务商只列兼容子集），baseUrl 取子集
+  第一个模型的 baseUrl 且必须非空。筛后 **28 家 + custom = 29 条**
+  （deepseek、moonshotai(-cn)、zai、openrouter、groq、fireworks 等）。
+  纯其他协议的服务商（anthropic、amazon-bedrock、openai、google、
+  mistral 等）不出现——内核现在说不了那种协议，不是名单取舍；想用
+  OpenAI 官方端点走「自定义端点」手填即可。基座 dist 缺失时目录回落
+  为只有 custom。server 提供只读接口 `GET /api/model-providers`（未登
+  录 401）。注意 deepseek 在 pi-ai 里的 baseUrl 是
+  `https://api.deepseek.com`（无 /v1）、模型是 deepseek-flash 与
+  deepseek-v4-pro，与第一版手写值不同，以 pi-ai 为准。
+- 模型名单从端点拉取：新接口 `POST /api/settings/model/fetch-models`
+  用表单当次的 baseUrl（+Key）向端点 `GET {baseUrl}/models` 拉真实名单
+  （解析 `data[].id`、去重排序）。apiKey 缺省时守 R7 口径：只许端点与
+  已保存配置的 baseUrl 完全一致时复用已保存 Key，不一致回 400 且不发
+  出任何上游请求；拉取有超时（10s）与体积（1MB）上限，失败回状态码 +
+  脱敏截断信息，响应不带 Key。前端：表单有 Key（已保存的或刚填入的）
+  时自动拉一次填充模型下拉，「获取可用模型」按钮可手动刷新；拉取失
+  败只提示、不清空已有可选模型（目录名单仍在）；手输任意模型名保留。
 - 存储向后兼容：`settings-model.json` 在原 {baseUrl, modelId, apiKey} 上
-  增加 `provider` 字段；旧文件无 provider 一律按 custom 读回、原值不丢；
-  PUT 带未知 provider 回 400 且文件不变；无 provider 字段的部分更新不
-  清空已存归属。读回仍只有掩码（`apiKeyHint`），Key 的保存、0600、热
-  生效与 redact 覆盖维持现状。
+  增加 `provider` 字段，存 pi-ai 的 provider id；旧文件无 provider、或
+  provider 已不在目录中（第一版手写的 moonshot / zhipu 等）一律按
+  custom 读回、原值不丢；PUT 带未知 provider 回 400 且文件不变；无
+  provider 字段的部分更新不清空已存归属。读回仍只有掩码
+  （`apiKeyHint`），Key 的保存、0600、热生效与 redact 覆盖维持现状。
 - 前端：服务商下拉（当前归属且已配置时标「已配置」）；选中后 baseUrl
-  自动预填预置地址、模型名预填首个预置模型；baseUrl 对所有服务商都可
-  编辑——**改动了预置地址，保存时按自定义端点归属**（provider 存 custom，
-  表单上有提示行），使读回归属与实际端点一致；模型名是预置下拉 +「自
-  定义模型名…」手输切换。内核零改动，仍按 baseUrl+modelId+apiKey 建
-  OpenAI 兼容 provider，DeepSeek 等靠预置地址即可连。
-- 测试：新 `scripts/test-model-providers.mjs` 18/18（目录形状与归属判
-  定、目录接口 401/200、保存 deepseek 后读回 provider 与预置 baseUrl 且
-  响应无 Key 全文、落盘含 provider 且 0600、未知 provider 400、custom
-  任意端点、旧客户端形状部分更新、旧格式文件起服读回 custom 原值不
-  丢），已纳入 `npm run test` 聚合；全套聚合退出码 0（findings 27、
-  scan 10、pr-review 16、schedule 14、gateway 27、recovery 7、listen 9、
-  badtz 4、secrets 21、model-stub 10、r10 22、webfetch 43、eval:scan 21、
-  regression 72，均不低于基线）。
-- 截图：`docs/screens/12-settings-model-deepseek.png`（表单里选 DeepSeek、
-  baseUrl 自动预填、模型 deepseek-chat、假 Key 在 password 框内只显示圆
-  点，未保存故种子 stub 配置未动）；04 图同步更新为新表单（种子配置无
-  provider，按「自定义端点（已配置）」读回，Key 末四位掩码）。逐张目检
-  无真实秘密。本轮未用真 DeepSeek Key 实测真连（没有真 Key）；真连路径
-  与既有 OpenAI 兼容链路同一条，由 test-model-stub 以 custom 方式覆盖。
-- 明确不做：OAuth / 账号登录、多服务商多 Key 并存与运行时切换（仍是
-  单个当前配置，只多了 provider 归属与预置）、改 `packages/`、改 SSE
-  事件名、加新依赖。
+  自动预填目录地址、模型名预填目录名单首个；baseUrl 对所有服务商都可
+  编辑——**改动了目录地址，保存时按自定义端点归属**（provider 存
+  custom，表单上有提示行），使读回归属与实际端点一致。内核零改动，
+  仍按 baseUrl+modelId+apiKey 建 OpenAI 兼容 provider。
+- 测试：`scripts/test-model-providers.mjs` 按新口径改写为 34 项（先红
+  18/34、改实现后 34/34）：目录派生与筛选（数量 ≥25、deepseek 字段与
+  pi-ai 一致、混合 api 子集与 dist 交叉核对、anthropic / openai 等反例
+  不出现、旧手写 id 回落 custom）、拉取函数单测（本地 stub /models：
+  正常解析去重排序、401 脱敏、坏 JSON、缺 data、超时、超体积、常量钉
+  死）、fetch-models 路由（401、缺省 Key 地址一致复用已保存 Key 且
+  stub 断言 Authorization、地址不一致 400 且零上游请求、当次错 Key
+  的 401 回执不含 Key）、目录接口与 PUT 口径、旧格式文件读回。已纳入
+  `npm run test` 聚合；全套聚合退出码 0（findings 27、scan 10、
+  pr-review 16、schedule 14、gateway 27、recovery 7、listen 9、badtz 4、
+  secrets 21、model-stub 10、model-providers 34、r10 22、webfetch 43、
+  eval:scan 21、regression 72，聚合只增不减）。
+- 截图：`docs/screens/12-settings-model-deepseek.png`——已保存配置的
+  provider 为 deepseek，但端点是本地模型 stub（替身、非真 DeepSeek
+  地址，图中可见 127.0.0.1）、Key 为种子假值；页面用已保存 Key 自动向
+  stub 拉取 /models 成功（图中「已从端点拉取 2 个模型」），打开的模型
+  下拉里是 stub 返回的 stub-alpha（已选中）与 stub-beta。04 图同步更
+  新为新表单（种子配置按「自定义端点（已配置）」读回，含「获取可用模
+  型」按钮，Key 末四位掩码）。逐张目检无真实秘密。本轮未用真 DeepSeek
+  Key 实测真连（没有真 Key，那是 P1-7 的用户事项）；真连路径与既有
+  OpenAI 兼容链路同一条，由 test-model-stub 覆盖。
+- 明确不做：OAuth / 账号登录、不兼容 api 类型服务商的接入（不列也不
+  接）、多服务商多 Key 并存与运行时切换（仍是单个当前配置）、改
+  `packages/`（只读 pi-ai 导出）、改 SSE 事件名、加新依赖。
