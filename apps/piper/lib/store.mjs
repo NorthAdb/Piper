@@ -6,6 +6,7 @@
 //   sessions/<botId>.jsonl    每 bot 独立会话流水（一行一条）
 //   artifacts/<id>.md         产物（Markdown），文件头注释里带结构化元数据
 //   routines.json             routine 定义 + 上次运行结果
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -297,7 +298,10 @@ export function updateRoutine(id, patch) {
 export function saveArtifact({ botId, kind, title, body }) {
 	ensureDir(join(DATA_DIR, "artifacts"));
 	const ts = new Date();
-	const id = `${ts.toISOString().slice(0, 10)}-${kind}-${ts.getTime().toString(36)}`;
+	// id 的时间戳部分只有毫秒精度：同 kind 在同一毫秒连写会同 id 互相覆盖（第二轮
+	// F11；实测紧循环连写 300 条只剩 21 条）。尾部加 6 位十六进制随机后缀保唯一，
+	// 日期与 kind 前缀不变，按 id 读取/引用的既有路径不受影响。
+	const id = `${ts.toISOString().slice(0, 10)}-${kind}-${ts.getTime().toString(36)}-${randomBytes(3).toString("hex")}`;
 	// 产物正文拼外部数据（GitHub 响应、错误原文等），落盘前统一脱敏（R7）。
 	const meta = { id, botId, kind, title: redact(String(title ?? "")), createdAt: ts.toISOString() };
 	writeFileSync(join(DATA_DIR, "artifacts", `${id}.md`), `<!-- piper-artifact ${JSON.stringify(meta)} -->\n${redact(String(body ?? ""))}`, "utf8");

@@ -3,6 +3,9 @@
 // 设置接口把时区修好。用法（在 apps/piper 下）：node scripts/test-badtz.mjs
 // R4 起坏文件预置在临时数据目录（PIPER_DATA_DIR），子进程全程只碰隔离目录——
 // R3 当年是直接改用户真实 data/settings-profile.json 再还原，正是 B4 的污染面。
+// 第二轮 F10：收尾必须先等子进程真退出再删临时目录。旧写法 kill 后立刻 rmSync，
+// 子进程尚未写完的启动补跑（日报产物、会话流水等）会把目录重新写出来，留下
+// /tmp/piper-badtz-* 残留（实测连跑 40 次留 2 个，残留里正是补跑写的文件）。
 import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -34,6 +37,29 @@ function startServer() {
 	proc.stdout.on("data", (d) => (out += d));
 	proc.stderr.on("data", (d) => (out += d));
 	return { proc, output: () => out };
+}
+
+// 等子进程真正退出（F10）：SIGTERM 后进程还要跑完关闭流程与在途异步写，
+// 在此之前删目录必然竞态。超时未退则 SIGKILL 兜底。
+async function waitExit(proc, timeoutMs = 10000) {
+	if (proc.exitCode !== null) return true;
+	const exited = await new Promise((resolvePromise) => {
+		const timer = setTimeout(() => resolvePromise(false), timeoutMs);
+		proc.once("exit", () => {
+			clearTimeout(timer);
+			resolvePromise(true);
+		});
+	});
+	if (exited) return true;
+	proc.kill("SIGKILL");
+	if (proc.exitCode !== null) return true;
+	return new Promise((resolvePromise) => {
+		const timer = setTimeout(() => resolvePromise(false), 5000);
+		proc.once("exit", () => {
+			clearTimeout(timer);
+			resolvePromise(true);
+		});
+	});
 }
 
 async function waitReady(proc, timeoutMs = 15000) {
@@ -101,6 +127,7 @@ try {
 	);
 } finally {
 	proc.kill("SIGTERM");
+	await waitExit(proc);
 	rmSync(TMP_ROOT, { recursive: true, force: true });
 }
 

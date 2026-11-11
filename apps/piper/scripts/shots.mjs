@@ -127,11 +127,12 @@ const SHOTS_MODEL_BASE = `http://127.0.0.1:${shotsModelStub.address().port}/v1`;
 const libUrl = (name) => `file://${join(APP_DIR, "lib", name)}`;
 runSeed(`
 import { ensureData, saveArtifact, updateRoutine } from "${libUrl("store.mjs")}";
-import { saveModelSettingsFile, saveWebSettingsFile } from "${libUrl("settings.mjs")}";
+import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
 import { addNotification } from "${libUrl("notify.mjs")}";
 ensureData();
 saveModelSettingsFile({ baseUrl: "${SHOTS_MODEL_BASE}", modelId: "gpt-4o-mini", apiKey: "${FAKE_KEY}" });
-saveWebSettingsFile({ fetchEnabled: true, searchEndpoint: "https://search.example.com/query", searchApiKey: "${FAKE_SEARCH_KEY}" });
+// 网页查询不在种子里预启（第二轮 F13）：06 要截「未启用」默认态，与 10 的已启用态
+// 区分；启用动作在截 06 之后经页面同源调用真实设置接口完成（见下方流程）。
 const artifact = saveArtifact({
 	botId: "repo-keeper",
 	kind: "morning-report",
@@ -331,8 +332,22 @@ try {
 	await shot("05-settings-profile.png");
 	await clickText("连接器");
 	await waitFor(bodyHas("GitHub"), "设置-连接器组出现");
+	// F13：06 截网页查询「未启用」默认态（种子未预启）——把网页查询卡滚到视口中央，
+	// 卡上应显示「网页抓取：未启用」；与下方 10 的已启用态是同一页的两种状态，不再重复。
+	await evaluate(`(() => { const el = [...document.querySelectorAll('*')].find((e) => e.children.length === 0 && (e.textContent || '').trim() === '网页查询'); el?.scrollIntoView({ block: 'center' }); return Boolean(el); })()`);
+	await waitFor(bodyHas("网页抓取：未启用"), "网页查询卡未启用态出现");
 	await shot("06-settings-connectors.png");
-	// L0-6：网页查询已启用态——把网页查询卡滚到视口中央再截（卡上应有已启用与搜索掩码）
+	// 经页面同源调用真实设置接口启用网页抓取并配置搜索，再整页刷新回到连接器组截 10。
+	const putStatus = await evaluate(
+		`fetch('/api/settings/connectors/web', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ fetchEnabled: true, searchEndpoint: 'https://search.example.com/query', searchApiKey: '${FAKE_SEARCH_KEY}' }) }).then((r) => r.status)`,
+	);
+	if (putStatus !== 200) throw new Error(`启用网页查询失败：PUT /api/settings/connectors/web 回 ${putStatus}`);
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "启用后刷新主界面出现");
+	await clickText("设置", { maxX: 264 });
+	await waitFor(bodyHas("只接一个 OpenAI 兼容端点"), "启用后设置-模型组出现");
+	await clickText("连接器");
+	await waitFor(bodyHas("GitHub"), "启用后设置-连接器组出现");
 	await evaluate(`(() => { const el = [...document.querySelectorAll('*')].find((e) => e.children.length === 0 && (e.textContent || '').trim() === '网页查询'); el?.scrollIntoView({ block: 'center' }); return Boolean(el); })()`);
 	await waitFor(bodyHas("网页抓取：已启用"), "网页查询卡已启用态出现");
 	await shot("10-settings-connectors-web-enabled.png");

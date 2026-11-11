@@ -27,7 +27,7 @@ function check(name, ok, detail = "") {
 const { createFinding, updateFinding, getFinding } = await import("../lib/findings.mjs");
 const { listApprovals, getApproval, sweepExpiredFindings } = await import("../lib/approvals.mjs");
 const { listConnectors, saveProfileSettings } = await import("../lib/settings.mjs");
-const { saveArtifact } = await import("../lib/store.mjs");
+const { saveArtifact, listArtifacts, readArtifact } = await import("../lib/store.mjs");
 
 const findingsFile = join(TMP_DATA, "findings.jsonl");
 const noTmpResidue = (dir) => readdirSync(dir).every((f) => !f.includes(".tmp-"));
@@ -131,8 +131,26 @@ async function waitExit(proc, timeoutMs = 10000) {
 	return false;
 }
 
-// 注意：saveArtifact 的 id 只到毫秒（日期 + kind + 毫秒数），同 kind 两条产物在同一
-// 毫秒内写入会同 id 覆盖——那是既有存储口径、与 R10 无关；这里用不同 kind 避开。
+// ---------- F11（第二轮）：产物 id 随机后缀，同 kind 同毫秒连写不覆盖 ----------
+// id 的时间戳部分只有毫秒精度，紧循环连写必然大量同毫秒同 kind：旧实现同 id 覆盖
+// （实测连写 300 条只剩 21 条落盘）。随机后缀后 300 条 id 必须全唯一、一条不丢、
+// 按 id 读回正文不串。
+const f11Metas = [];
+for (let i = 0; i < 300; i++) f11Metas.push(saveArtifact({ botId: "bot-f11", kind: "note", title: `F11 连写 ${i}`, body: `f11-body-${i}-end` }));
+const f11Ids = f11Metas.map((m) => m.id);
+check("同 kind 紧循环连写 300 条产物 id 全唯一", new Set(f11Ids).size === 300, `unique=${new Set(f11Ids).size}/300`);
+check(
+	"300 条产物全部落盘（按 bot 数得全）",
+	listArtifacts().filter((a) => a.botId === "bot-f11").length === 300,
+	`listed=${listArtifacts().filter((a) => a.botId === "bot-f11").length}/300`,
+);
+check(
+	"按 id 读回首尾两条正文不串",
+	(readArtifact(f11Ids[0])?.body ?? "").includes("f11-body-0-end") && (readArtifact(f11Ids[299])?.body ?? "").includes("f11-body-299-end"),
+);
+
+// F11 之前两条种子靠不同 kind 避开同毫秒覆盖；F11 后 id 已带随机后缀，这里仍用
+// 不同 kind，只为让下面过滤断言的标题互不干扰。
 saveArtifact({ botId: "bot-a", kind: "note", title: "A 的产物", body: "a" });
 saveArtifact({ botId: "bot-b", kind: "report", title: "B 的产物", body: "b" });
 
