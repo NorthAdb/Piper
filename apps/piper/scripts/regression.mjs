@@ -1,11 +1,21 @@
-// Piper API 回归脚本：把历次实测的断言固化成可重复运行的检查。
+// Piper API 回归脚本（硬门禁）：把历次实测的断言固化成可重复运行的检查。
 // 用法（在 apps/piper 下）：
 //   node scripts/regression.mjs        （或 npm run regression）
 // 行为：以「无模型 Key」的默认环境在本机测试端口启动一份 server.mjs，逐项断言后退出。
-// 退出码 0 = 全部通过；1 = 有失败。晨间扫描一项会真实调用 GitHub 公开 API（与产品行为一致），
-// 其余断言不依赖外网。运行会写 apps/piper/data/（测试 bot 会清理，扫描产物会留下一份日报）。
+// 退出码 0 = 全部通过；1 = 有失败。
+// R4 测试隔离（本脚本的立身之本，改动前先想清楚）：
+//   - 数据目录经 PIPER_DATA_DIR 指向临时目录：子进程 server 与本进程内 import 的 lib
+//     共用同一隔离目录，用户真实 data/ 一个字节都不碰、也不读——机器上有没有真实
+//     配置，本套件结果都一样（R4 前「文件存在就 SKIP」的保护逻辑已删除，原被跳过的
+//     27-30、36-39 在隔离目录里恒为真断言）。
+//   - GitHub 经 PIPER_GITHUB_API_BASE 指向脚本内起的本地桩（下方 STUB_REPOS），
+//     全程离线、结果确定；打真实 GitHub 的几项已拆到 scripts/regression-live.mjs
+//     （npm run regression:live，非门禁）。
+//   - 收到 SIGINT/SIGTERM 时先杀子进程、关桩、删临时目录再退出，不留孤儿与残留。
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { createServer } from "node:http";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -13,6 +23,91 @@ const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.REGRESSION_PORT || 4398);
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = "piper-dev";
+
+// ---- 隔离目录：必须在任何 lib import 与子进程启动之前建好并写入环境 ----
+const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-regression-"));
+const TMP_DATA = join(TMP_ROOT, "data");
+process.env.PIPER_DATA_DIR = TMP_DATA;
+
+// ---- 本地 GitHub 桩：路径映射与 test-scan 替身同口径；未映射仓库回 404 ----
+// 通知组「绑不存在的仓库整轮失败」就靠这个 404。桩数据保持安静：最新已结束 run
+// 为 success、无 open PR（不开 Finding），日报结构（两节标题）仍可断言。
+function stubRepo(ownerRepo) {
+	return {
+		info: { stargazers_count: 7, forks_count: 2, default_branch: "main", pushed_at: "2026-11-10T00:00:00Z" },
+		commits: [
+			{ commit: { message: "chore: stub commit", author: { date: "2026-11-10T00:00:00Z", name: "stub" } }, author: { login: "stub" } },
+		],
+		pulls: [],
+		issues: [],
+		runs: [
+			{
+				id: 1001,
+				name: "CI",
+				status: "completed",
+				conclusion: "success",
+				head_branch: "main",
+				html_url: `https://github.com/${ownerRepo}/actions/runs/1001`,
+				created_at: "2026-11-10T00:00:00Z",
+			},
+		],
+		reviews: {},
+	};
+}
+const STUB_REPOS = { "NorthAdb/LinkForge": stubRepo("NorthAdb/LinkForge"), "NorthAdb/Loom": stubRepo("NorthAdb/Loom") };
+const ghStub = createServer((reqHttp, resHttp) => {
+	const u = new URL(reqHttp.url ?? "/", "http://stub.invalid");
+	const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
+	const entry = m ? STUB_REPOS[m[1]] : undefined;
+	resHttp.setHeader("Content-Type", "application/json");
+	if (!entry) {
+		resHttp.statusCode = 404;
+		resHttp.end(JSON.stringify({ message: "Not Found" }));
+		return;
+	}
+	const rest = m[2] ?? "";
+	let payload;
+	if (rest === "") payload = entry.info;
+	else if (rest.startsWith("/commits")) payload = entry.commits;
+	else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+	else if (rest.startsWith("/pulls")) payload = entry.pulls;
+	else if (rest.startsWith("/issues")) payload = entry.issues;
+	else if (rest.startsWith("/actions/runs")) payload = { workflow_runs: entry.runs };
+	else {
+		resHttp.statusCode = 404;
+		resHttp.end(JSON.stringify({ message: "Not Found" }));
+		return;
+	}
+	resHttp.end(JSON.stringify(payload));
+});
+await new Promise((resolveListen) => ghStub.listen(0, "127.0.0.1", resolveListen));
+const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
+process.env.PIPER_GITHUB_API_BASE = GH_BASE;
+
+// ---- 信号处理：杀子进程、关桩、清临时目录，不留孤儿 server 与残留 ----
+let serverProc = null;
+let cleanedUp = false;
+function cleanup() {
+	if (cleanedUp) return;
+	cleanedUp = true;
+	try {
+		serverProc?.kill("SIGTERM");
+	} catch {
+		/* 已退出 */
+	}
+	try {
+		ghStub.close();
+	} catch {
+		/* 已关闭 */
+	}
+	rmSync(TMP_ROOT, { recursive: true, force: true });
+}
+for (const sig of ["SIGINT", "SIGTERM"]) {
+	process.on(sig, () => {
+		cleanup();
+		process.exit(sig === "SIGINT" ? 130 : 143);
+	});
+}
 
 const results = [];
 let seq = 0;
@@ -71,12 +166,14 @@ async function waitReady(proc) {
 async function main() {
 	if (!existsSync(join(APP_DIR, "public", "index.html"))) {
 		console.error("缺少 public/index.html：先在 apps/piper 下执行 npm run build:web 再跑回归。");
+		cleanup();
 		process.exit(2);
 	}
-	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN };
+	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
 	// 默认环境必须是「无模型 Key」：显式剔除可能从外层继承的模型与 GitHub 令牌变量
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
 	const proc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
+	serverProc = proc;
 	let serverLog = "";
 	proc.stdout.on("data", (d) => (serverLog += d));
 	proc.stderr.on("data", (d) => (serverLog += d));
@@ -169,7 +266,8 @@ async function main() {
 		const restored = await req("/api/bots");
 		check("删除草案 bot 后列表恢复为两个预置 bot", (restored.json?.bots ?? []).length === 2, `实际 ${(restored.json?.bots ?? []).length}`);
 
-		// ---- 晨间扫描与产物（20-22，真实调用 GitHub 公开 API）----
+		// ---- 晨间扫描与产物（20-22，R4 起走本地 GitHub 桩，离线确定性；真实
+		// GitHub 公开 API 的同口径检查在 scripts/regression-live.mjs，非门禁）----
 		// P1-4：服务端启动时可能触发一次启动补跑（今日已过点且未成功时）。先等调度空闲，
 		// 避免补跑与下面手动扫描的产物计数竞态（补跑产物会计入 before，断言仍是手动 +1）。
 		for (let i = 0; i < 160; i++) {
@@ -204,11 +302,16 @@ async function main() {
 		// 「结构合法」口径：是数组，且每条带 findingId / writeIntent / 合法 status，不再要求恒空。
 		const approvals = await req("/api/approvals");
 		check(
-			"GET /api/approvals 来自真实存储且结构合法（数组；每条带 findingId、writeIntent 与 open/approved 状态）",
+			"GET /api/approvals 来自真实存储且结构合法（数组；每条带 findingId、writeIntent、intentHash 与 open/approved/executing 状态）",
 			approvals.status === 200 &&
 				Array.isArray(approvals.json?.approvals) &&
 				(approvals.json?.approvals ?? []).every(
-					(a) => typeof a.findingId === "string" && a.writeIntent?.kind === "pr_comment" && ["open", "approved"].includes(a.status),
+					(a) =>
+						typeof a.findingId === "string" &&
+						a.writeIntent?.kind === "pr_comment" &&
+						typeof a.intentHash === "string" &&
+						a.intentHash.length > 0 &&
+						["open", "approved", "executing"].includes(a.status),
 				),
 			`实际 ${approvals.status} 条数=${approvals.json?.approvals?.length}`,
 		);
@@ -243,8 +346,12 @@ async function main() {
 		await runScheduleChecks({ req, check, anon });
 		await runApprovalChecks({ req, check, anon });
 		await runAuditChecks({ req, check, anon });
+		await runSecurityChecks({ check, cookie });
+		await runTimezoneChecks({ req, check });
+		await runSecretsChecks({ req, check });
 	} finally {
 		proc.kill("SIGTERM");
+		cleanup();
 	}
 	const failed = results.filter((r) => !r.ok);
 	console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);
@@ -258,14 +365,11 @@ async function main() {
 
 // 切片扩展断言的挂载点：后续切片在此追加。
 // L0-2（27-30）：模型设置存储——无 Key 默认值、保存不回显全文、测试连接失败不崩溃、清除恢复未配置。
-// 保护：若 data/settings-model.json 在运行前就存在（用户真实配置），整组跳过，绝不覆盖或清除。
+// R4 前这里有「真实 settings-model.json 存在就整组 SKIP」的保护；隔离后操作的是
+// 临时目录里的文件，恒真跑，不再跳过。
 async function runExtraChecks({ req, chatEvents, check }) {
 	const { existsSync, rmSync } = await import("node:fs");
-	const settingsFile = join(APP_DIR, "data", "settings-model.json");
-	if (existsSync(settingsFile)) {
-		console.log("SKIP 27-30 已存在 data/settings-model.json（视为用户真实配置），跳过设置组断言以免覆盖");
-		return;
-	}
+	const settingsFile = join(TMP_DATA, "settings-model.json");
 	const FAKE_KEY = "sk-regression-1234567890abcd";
 	try {
 		const before = await req("/api/settings/model");
@@ -294,9 +398,19 @@ async function runExtraChecks({ req, chatEvents, check }) {
 			body: JSON.stringify({ baseUrl: "http://127.0.0.1:9/v1", apiKey: "sk-bad" }),
 		});
 		const alive = await req("/api/session");
+		// R9：这一项必须能区分两类失败——「端点不通」（本项的死端口）与「基座未构建」
+		// （packages dist 缺失时内核报 BASE_NOT_BUILT、error 含「基座未构建」）。旧断言只看
+		// ok:false，基座没构建时也会误绿；现加 error 不含「基座未构建」的反向断言钉死分类。
+		// 对话链路上的三类失败（MODEL_NOT_CONFIGURED / MODEL_ERROR / 成功流）由
+		// scripts/test-model-stub.mjs 以错误 code 逐项区分，不在这里重复。
 		check(
-			"POST /api/settings/model/test 坏端点返回 ok:false 且进程存活",
-			test.status === 200 && test.json?.ok === false && typeof test.json?.error === "string" && alive.status === 200,
+			"POST /api/settings/model/test 坏端点返回 ok:false（端点不通类：error 不含「基座未构建」）且进程存活",
+			test.status === 200 &&
+				test.json?.ok === false &&
+				typeof test.json?.error === "string" &&
+				test.json.error.length > 0 &&
+				!test.json.error.includes("基座未构建") &&
+				alive.status === 200,
 			`实际 ${test.status} ${JSON.stringify(test.json)}`,
 		);
 
@@ -314,7 +428,7 @@ async function runExtraChecks({ req, chatEvents, check }) {
 }
 
 // L0-3（31-35）：基础资料与「关于我」——未登录写 401、profile 保存读回、about-me 三处同源、
-// 超限拒绝不写坏原文件。运行前快照原 profile 与 about-me，结束时还原，不污染用户真实数据。
+// 超限拒绝不写坏原文件。全部发生在隔离目录内；组内仍按快照—还原自洽（与真实数据无关）。
 async function runProfileChecks({ req, check, anon }) {
 	const origProfile = (await req("/api/settings/profile")).json ?? {};
 	const origAbout = (await req("/api/about-me")).json?.markdown ?? "";
@@ -372,15 +486,13 @@ async function runProfileChecks({ req, check, anon }) {
 }
 
 // L0-4（36-39）：连接器列表与 GitHub 配置——四卡与状态、保存不回显全文、scan 走唯一令牌入口、清除回到无令牌。
-// 保护：若 data/settings-github.json 运行前已存在（用户真实令牌），整组跳过，绝不覆盖或清除。
+// R4 前这里有「真实 settings-github.json 存在就整组 SKIP」的保护；隔离后恒真跑。
 // 本组在脚本进程内临时剔除 GITHUB_TOKEN，使 githubToken() 的断言不受外层环境影响（结束恢复）。
+// 本进程内 import 的 lib 与子进程 server 共用同一 PIPER_DATA_DIR：经 API 保存的令牌
+// 文件，进程内 githubToken() 读到的正是同一份。
 async function runConnectorChecks({ req, check }) {
 	const { existsSync, rmSync, readFileSync } = await import("node:fs");
-	const githubFile = join(APP_DIR, "data", "settings-github.json");
-	if (existsSync(githubFile)) {
-		console.log("SKIP 36-39 已存在 data/settings-github.json（视为用户真实令牌），跳过连接器组断言以免覆盖");
-		return;
-	}
+	const githubFile = join(TMP_DATA, "settings-github.json");
 	const FAKE_TOKEN = "ghp_regressiontoken1234567890wxyz";
 	const savedEnvToken = process.env.GITHUB_TOKEN;
 	delete process.env.GITHUB_TOKEN;
@@ -451,6 +563,50 @@ async function runConnectorChecks({ req, check }) {
 			cleared.status === 200 && ghClear?.status === "unconfigured" && githubToken() === "",
 			`实际 status=${ghClear?.status} token空=${githubToken() === ""}`,
 		);
+
+		// L0-6：网页查询卡默认未启用但可配置；未登录 PUT 401；启用后 connected；
+		// 搜索密钥保存后读回只有掩码、响应不含全文；非法端点 400。
+		const FAKE_SEARCH_KEY = "sk-websearch-regression-0000beef";
+		const webBefore = byId.web;
+		const anonPut = await fetch(`${BASE}/api/settings/connectors/web`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ fetchEnabled: true }),
+		});
+		check(
+			"网页查询卡默认 unconfigured 且 configurable、范围含主 bot；未登录 PUT /api/settings/connectors/web 回 401",
+			webBefore?.status === "unconfigured" &&
+				webBefore?.configurable === true &&
+				webBefore?.fetchEnabled === false &&
+				(webBefore?.bots ?? []).includes("piper-main") &&
+				anonPut.status === 401,
+			`card=${JSON.stringify(webBefore)} anon=${anonPut.status}`,
+		);
+		const putWeb = await req("/api/settings/connectors/web", {
+			method: "PUT",
+			body: JSON.stringify({ fetchEnabled: true, searchEndpoint: "https://search.example.com/query", searchApiKey: FAKE_SEARCH_KEY }),
+		});
+		const listWeb = await req("/api/settings/connectors");
+		const webAfter = (listWeb.json?.connectors ?? []).find((c) => c.id === "web");
+		check(
+			"启用网页查询并保存搜索配置后卡 connected、searchConfigured=true、读回只有末四位掩码且响应不含密钥全文",
+			putWeb.status === 200 &&
+				webAfter?.status === "connected" &&
+				webAfter?.fetchEnabled === true &&
+				webAfter?.searchConfigured === true &&
+				String(webAfter?.searchKeyHint ?? "").endsWith("beef") &&
+				!JSON.stringify(listWeb.json).includes(FAKE_SEARCH_KEY),
+			`put=${putWeb.status} card=${JSON.stringify(webAfter)}`,
+		);
+		const badEndpoint = await req("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ searchEndpoint: "ftp://example.com/x" }) });
+		const putWebOff = await req("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ fetchEnabled: false, searchApiKey: "" }) });
+		const listWebOff = await req("/api/settings/connectors");
+		const webOff = (listWebOff.json?.connectors ?? []).find((c) => c.id === "web");
+		check(
+			"搜索端点非 http/https 回 400；关闭抓取并清除密钥后卡回到 unconfigured 且 searchConfigured=false",
+			badEndpoint.status === 400 && putWebOff.status === 200 && webOff?.status === "unconfigured" && webOff?.searchConfigured === false,
+			`bad=${badEndpoint.status} off=${JSON.stringify(webOff)}`,
+		);
 	} finally {
 		if (existsSync(githubFile)) rmSync(githubFile);
 		if (savedEnvToken !== undefined) process.env.GITHUB_TOKEN = savedEnvToken;
@@ -459,7 +615,8 @@ async function runConnectorChecks({ req, check }) {
 
 // L0-5（40-43）：应用内通知——未登录 401、成功扫描写完成通知、标记已读跨进程持久（文件落盘）、
 // 绑定不存在仓库时整轮失败写失败通知且进程不崩溃，恢复后成功扫描再写完成通知。
-// 注意 data/notifications.jsonl 跨运行累积，断言一律按本轮 artifactId / 新增条目定位，不假设列表为空。
+// R4：扫描走本地桩，「不存在的仓库」由桩回 404 实现整轮失败；通知文件在隔离目录内
+// 从空开始累积，断言仍按本轮 artifactId / 新增条目定位，不假设列表为空。
 async function runNotificationChecks({ req, check, anon }) {
 	const unauth = await anon("/api/notifications");
 	check("未登录 GET /api/notifications 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
@@ -531,7 +688,7 @@ async function runFindingChecks({ req, check, anon }) {
 		list.status === 200 &&
 			Array.isArray(list.json?.findings) &&
 			(list.json?.findings ?? []).every(
-				(f) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed"].includes(f.status),
+				(f) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed", "executing"].includes(f.status),
 			),
 		`实际 ${list.status} 条数=${list.json?.findings?.length}`,
 	);
@@ -646,6 +803,107 @@ async function runAuditChecks({ req, check, anon }) {
 			(filtered.json?.records ?? []).every((r) => r.findingId === "f-no-such-item"),
 		`实际 all=${all.status}/${all.json?.records?.length} filtered=${filtered.status}/${filtered.json?.records?.length}`,
 	);
+}
+
+// R2（59-63）：监听与跨源写入收口的服务端契约——会话 Cookie SameSite=Strict；写请求
+// 带跨源 Origin 回 403、Content-Type 非 JSON 回 415、同源 Origin 正常放行；登录限速
+// （连续 11 次错口令均 401、第 12 次 429）。监听地址绑定与「非回环 + 默认口令拒绝
+// 启动」需要另起进程，在 scripts/test-listen.mjs 覆盖。本组放在最后：限速锁定来源后
+// 不应再有依赖登录的断言。
+async function runSecurityChecks({ check, cookie }) {
+	const login = await fetch(`${BASE}/api/login`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ token: TOKEN }),
+	});
+	const setCookie = login.headers.get("set-cookie") || "";
+	check("登录 Cookie 带 SameSite=Strict", login.status === 200 && setCookie.includes("SameSite=Strict"), `status=${login.status} set-cookie=${setCookie}`);
+
+	const put = (headers, body = "{}") =>
+		fetch(`${BASE}/api/settings/profile`, {
+			method: "PUT",
+			headers: { "Content-Type": "application/json", Cookie: cookie, ...headers },
+			body,
+		});
+	const evil = await put({ Origin: "http://evil.example" }, JSON.stringify({ displayName: "跨源写入不应生效" }));
+	check("带跨源 Origin（evil.example）的 PUT 返回 403", evil.status === 403, `实际 ${evil.status}`);
+
+	const plain = await put({ "Content-Type": "text/plain" });
+	check("Content-Type 为 text/plain 的 PUT 返回 415", plain.status === 415, `实际 ${plain.status}`);
+
+	const sameOrigin = await put({ Origin: BASE }, JSON.stringify({ displayName: "回归测试" }));
+	check("带同源 Origin 的 PUT 正常放行（200）", sameOrigin.status === 200, `实际 ${sameOrigin.status}`);
+
+	const statuses = [];
+	for (let i = 0; i < 12; i++) {
+		const r = await fetch(`${BASE}/api/login`, {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ token: `wrong-${i}` }),
+		});
+		statuses.push(r.status);
+	}
+	check(
+		"连续 11 次错口令均 401、第 12 次返回 429（登录限速）",
+		statuses.slice(0, 11).every((s) => s === 401) && statuses[11] === 429,
+		`实际 ${statuses.join(",")}`,
+	);
+}
+
+// R3（64-66）：时区保存校验——非法 IANA 时区回 400 且 settings-profile.json 字节不变；
+// 合法时区仍可正常保存（校验不误杀）。文件指隔离目录内的那份；运行前快照，结束时还原。
+async function runTimezoneChecks({ req, check }) {
+	const { existsSync, readFileSync } = await import("node:fs");
+	const profileFile = join(TMP_DATA, "settings-profile.json");
+	const origProfile = (await req("/api/settings/profile")).json ?? {};
+	const origBytes = existsSync(profileFile) ? readFileSync(profileFile, "utf8") : null;
+	try {
+		const bad = await req("/api/settings/profile", { method: "PUT", body: JSON.stringify({ timezone: "Foo/Bar" }) });
+		check("PUT /api/settings/profile 非法时区 Foo/Bar 返回 400", bad.status === 400, `实际 ${bad.status}`);
+
+		const afterBad = await req("/api/settings/profile");
+		const afterBytes = existsSync(profileFile) ? readFileSync(profileFile, "utf8") : null;
+		check(
+			"非法时区被拒后 profile 读回与 settings-profile.json 文件字节均不变",
+			afterBad.json?.timezone === (origProfile.timezone ?? "Asia/Hong_Kong") && afterBytes === origBytes,
+			`读回=${JSON.stringify(afterBad.json)} 文件一致=${afterBytes === origBytes}`,
+		);
+
+		const good = await req("/api/settings/profile", { method: "PUT", body: JSON.stringify({ timezone: "Asia/Singapore" }) });
+		const readGood = await req("/api/settings/profile");
+		check(
+			"合法时区 Asia/Singapore 仍可保存（200）并读回一致",
+			good.status === 200 && readGood.json?.timezone === "Asia/Singapore",
+			`put=${good.status} 读回=${JSON.stringify(readGood.json)}`,
+		);
+	} finally {
+		await req("/api/settings/profile", {
+			method: "PUT",
+			body: JSON.stringify({ displayName: origProfile.displayName ?? "", timezone: origProfile.timezone ?? "" }),
+		});
+	}
+}
+
+// R7（67-69）：秘密面——短 Key（≤8 位）读回为固定掩码；模型测试接口只传 baseUrl
+// 回 400（不得把已保存 Key 发往请求体给定的地址）；baseUrl 非 http/https 回 400。
+// 本组在最后运行（会改动已保存的模型 Key），隔离临时目录随回归结束整体丢弃，无需还原。
+async function runSecretsChecks({ req, check }) {
+	const put = await req("/api/settings/model", { method: "PUT", body: JSON.stringify({ apiKey: "k1234567" }) });
+	const view = await req("/api/settings/model");
+	check(
+		"短 Key（8 位）保存后 GET /api/settings/model 的 apiKeyHint 为固定掩码（不含真实末位）",
+		put.status === 200 && view.json?.apiKeyHint === "••••••••",
+		`put=${put.status} hint=${JSON.stringify(view.json?.apiKeyHint)}`,
+	);
+
+	const onlyBase = await req("/api/settings/model/test", { method: "POST", body: JSON.stringify({ baseUrl: "http://127.0.0.1:9/v1" }) });
+	check("POST /api/settings/model/test 只传 baseUrl 返回 400（不外送已保存 Key）", onlyBase.status === 400, `实际 ${onlyBase.status}`);
+
+	const badProto = await req("/api/settings/model/test", {
+		method: "POST",
+		body: JSON.stringify({ baseUrl: "ftp://example.invalid/v1", apiKey: "sk-bad-1234567890" }),
+	});
+	check("POST /api/settings/model/test 非 http/https 的 baseUrl 返回 400", badProto.status === 400, `实际 ${badProto.status}`);
 }
 
 main().catch((err) => {

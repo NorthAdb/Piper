@@ -1,0 +1,117 @@
+{
+ "description": "已执行冷却（R5）：PR 42 已有一条 executed 的 Finding（已留过言），头部提交未变（aaa111）时第一轮不重开——不以时间自动再催；第二轮头部变为 bbb222 后可重开一条。",
+ "expect": {
+  "created": 1,
+  "createdPerScan": [
+   0,
+   1
+  ],
+  "failures": 0,
+  "findings": [
+   {
+    "evidenceUrl": "https://github.com/NorthAdb/ExecutedCool/pull/42",
+    "repo": "NorthAdb/ExecutedCool",
+    "subject": "42",
+    "type": "pr_needs_review"
+   }
+  ]
+ },
+ "name": "reopen-after-executed",
+ "phases": [
+  {
+   "NorthAdb/ExecutedCool": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 0,
+     "pushed_at": "2026-11-10T02:00:00Z",
+     "stargazers_count": 1
+    },
+    "issues": [],
+    "pulls": [
+     {
+      "created_at": "2026-11-09T10:00:00Z",
+      "draft": false,
+      "head": {
+       "sha": "aaa111"
+      },
+      "html_url": "https://github.com/NorthAdb/ExecutedCool/pull/42",
+      "number": 42,
+      "title": "Add thing",
+      "user": {
+       "login": "contributor"
+      }
+     }
+    ],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T01:00:00Z",
+      "head_branch": "main",
+      "head_sha": "aaa111",
+      "html_url": "https://github.com/NorthAdb/ExecutedCool/actions/runs/880201",
+      "id": 880201,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   }
+  },
+  {
+   "NorthAdb/ExecutedCool": {
+    "commits": [],
+    "info": {
+     "default_branch": "main",
+     "forks_count": 0,
+     "pushed_at": "2026-11-10T06:00:00Z",
+     "stargazers_count": 1
+    },
+    "issues": [],
+    "pulls": [
+     {
+      "created_at": "2026-11-09T10:00:00Z",
+      "draft": false,
+      "head": {
+       "sha": "bbb222"
+      },
+      "html_url": "https://github.com/NorthAdb/ExecutedCool/pull/42",
+      "number": 42,
+      "title": "Add thing",
+      "user": {
+       "login": "contributor"
+      }
+     }
+    ],
+    "reviews": {},
+    "runs": [
+     {
+      "conclusion": "success",
+      "created_at": "2026-11-10T05:00:00Z",
+      "head_branch": "main",
+      "head_sha": "bbb222",
+      "html_url": "https://github.com/NorthAdb/ExecutedCool/actions/runs/880202",
+      "id": 880202,
+      "name": "CI",
+      "status": "completed"
+     }
+    ]
+   }
+  }
+ ],
+ "seedFindings": [
+  {
+   "headSha": "aaa111",
+   "repo": "NorthAdb/ExecutedCool",
+   "status": "executed",
+   "subject": "42",
+   "type": "pr_needs_review",
+   "updatedAtDaysAgo": 20,
+   "writeIntent": {
+    "body": "晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。",
+    "kind": "pr_comment",
+    "prNumber": 42
+   }
+  }
+ ]
+}

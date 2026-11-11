@@ -6,12 +6,16 @@
 //   sessions/<botId>.jsonl    每 bot 独立会话流水（一行一条）
 //   artifacts/<id>.md         产物（Markdown），文件头注释里带结构化元数据
 //   routines.json             routine 定义 + 上次运行结果
+import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { redact } from "./redact.mjs";
 
 export const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
-export const DATA_DIR = join(APP_DIR, "data");
+// 数据目录：缺省 apps/piper/data；可用 PIPER_DATA_DIR 覆盖（相对路径按进程 cwd 解析）。
+// R4 起所有测试/回归脚本都经它指向临时目录，与用户真实 data/ 完全隔离。
+export const DATA_DIR = process.env.PIPER_DATA_DIR ? resolve(process.env.PIPER_DATA_DIR) : join(APP_DIR, "data");
 const BOTS_FILE = join(DATA_DIR, "bots.json");
 const ROUTINES_FILE = join(DATA_DIR, "routines.json");
 const ABOUT_ME_FILE = join(DATA_DIR, "about-me.md");
@@ -82,6 +86,63 @@ function readJson(file, fallback) {
 
 function writeJson(file, data) {
 	writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
+}
+
+// 整表重写走临时文件 + rename（R10）：写一半进程崩溃不会留下截断的文件，读者要么
+// 看到旧内容、要么看到新内容（rename 在同一文件系统内是原子替换）。tmp 名带 pid，
+// 避免并发写者踩同一个临时文件。设置文件与 findings.jsonl 的整表重写都经这里。
+export function writeFileAtomicSync(file, content, options) {
+	const tmp = `${file}.tmp-${process.pid}`;
+	writeFileSync(tmp, content, options);
+	renameSync(tmp, file);
+}
+
+// ---------- 数据目录进程锁（R10） ----------
+// 同一数据目录只允许一个 Piper 服务进程：两个进程同时整表重写 findings /
+// notifications 等文件会互相踩踏（后写者覆盖先写者的更新）。锁文件 data/piper.lock
+// 只存持有者 pid；启动时若已有存活进程持有则拒绝启动，pid 不存在则视为陈旧锁接管。
+const LOCK_FILE = join(DATA_DIR, "piper.lock");
+
+function pidAlive(pid) {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (err) {
+		return err?.code === "EPERM";
+	}
+}
+
+// 抢锁成功返回释放函数（只删自己持有的锁）；已有存活进程时抛错，调用方拒绝启动。
+export function acquireDataLock() {
+	ensureDir(DATA_DIR);
+	const writeOwn = () => writeFileSync(LOCK_FILE, `${process.pid}\n`, { flag: "wx" });
+	try {
+		writeOwn();
+	} catch (err) {
+		if (err?.code !== "EEXIST") throw err;
+		let holder = NaN;
+		try {
+			holder = Number(readFileSync(LOCK_FILE, "utf8").trim());
+		} catch {
+			/* 锁文件读不出内容，按陈旧处理 */
+		}
+		if (Number.isInteger(holder) && holder > 0 && holder !== process.pid && pidAlive(holder)) {
+			throw new Error(`数据目录 ${DATA_DIR} 已被另一个 Piper 进程占用（pid ${holder}），拒绝启动；请先停掉已有进程，或换 PIPER_DATA_DIR。`);
+		}
+		// 陈旧锁：持有进程已退出或内容无效——删掉重抢（单机单用户，竞态窗口可接受）。
+		rmSync(LOCK_FILE, { force: true });
+		writeOwn();
+	}
+	let released = false;
+	return function releaseDataLock() {
+		if (released) return;
+		released = true;
+		try {
+			if (Number(readFileSync(LOCK_FILE, "utf8").trim()) === process.pid) rmSync(LOCK_FILE, { force: true });
+		} catch {
+			/* 锁已被接管或删除，无需处理 */
+		}
+	};
 }
 
 export function botWorkspace(botId) {
@@ -195,7 +256,10 @@ function sessionFile(botId) {
 
 export function appendSession(botId, entry) {
 	ensureDir(join(DATA_DIR, "sessions"));
-	appendFileSync(sessionFile(botId), JSON.stringify({ ts: new Date().toISOString(), ...entry }) + "\n", "utf8");
+	// 会话 JSONL 是秘密禁入面（切片共同约束）：text 落盘前统一脱敏（R7），厂商错误
+	// 回显 Key、用户误粘贴的令牌都不进流水。draft 等结构化字段不走文本脱敏。
+	const safe = typeof entry?.text === "string" ? { ...entry, text: redact(entry.text) } : entry;
+	appendFileSync(sessionFile(botId), JSON.stringify({ ts: new Date().toISOString(), ...safe }) + "\n", "utf8");
 }
 
 export function readSession(botId) {
@@ -234,9 +298,13 @@ export function updateRoutine(id, patch) {
 export function saveArtifact({ botId, kind, title, body }) {
 	ensureDir(join(DATA_DIR, "artifacts"));
 	const ts = new Date();
-	const id = `${ts.toISOString().slice(0, 10)}-${kind}-${ts.getTime().toString(36)}`;
-	const meta = { id, botId, kind, title, createdAt: ts.toISOString() };
-	writeFileSync(join(DATA_DIR, "artifacts", `${id}.md`), `<!-- piper-artifact ${JSON.stringify(meta)} -->\n${body}`, "utf8");
+	// id 的时间戳部分只有毫秒精度：同 kind 在同一毫秒连写会同 id 互相覆盖（第二轮
+	// F11；实测紧循环连写 300 条只剩 21 条）。尾部加 6 位十六进制随机后缀保唯一，
+	// 日期与 kind 前缀不变，按 id 读取/引用的既有路径不受影响。
+	const id = `${ts.toISOString().slice(0, 10)}-${kind}-${ts.getTime().toString(36)}-${randomBytes(3).toString("hex")}`;
+	// 产物正文拼外部数据（GitHub 响应、错误原文等），落盘前统一脱敏（R7）。
+	const meta = { id, botId, kind, title: redact(String(title ?? "")), createdAt: ts.toISOString() };
+	writeFileSync(join(DATA_DIR, "artifacts", `${id}.md`), `<!-- piper-artifact ${JSON.stringify(meta)} -->\n${redact(String(body ?? ""))}`, "utf8");
 	return meta;
 }
 

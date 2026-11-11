@@ -77,8 +77,9 @@ export async function runMorningScan(): Promise<void> {
 	await api("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
 }
 
-export async function listArtifacts(): Promise<ArtifactMeta[]> {
-	return (await api<{ artifacts: ArtifactMeta[] }>("/api/artifacts")).artifacts;
+export async function listArtifacts(botId?: string): Promise<ArtifactMeta[]> {
+	const query = botId ? `?botId=${encodeURIComponent(botId)}` : "";
+	return (await api<{ artifacts: ArtifactMeta[] }>(`/api/artifacts${query}`)).artifacts;
 }
 
 export async function getArtifact(id: string): Promise<Artifact> {
@@ -89,8 +90,8 @@ export async function listApprovals(): Promise<Approval[]> {
 	return (await api<{ approvals: Approval[] }>("/api/approvals")).approvals;
 }
 
-export async function approveApproval(id: string): Promise<{ approval: Approval; execution: ApprovalExecution }> {
-	return api(`/api/approvals/${id}/approve`, { method: "POST", body: "{}" });
+export async function approveApproval(id: string, intentHash: string): Promise<{ approval: Approval; execution: ApprovalExecution }> {
+	return api(`/api/approvals/${id}/approve`, { method: "POST", body: JSON.stringify({ intentHash }) });
 }
 
 export async function rejectApproval(id: string): Promise<Approval> {
@@ -135,6 +136,10 @@ export async function getConnectors(): Promise<Connector[]> {
 
 export async function saveGithubToken(token: string): Promise<Connector> {
 	return (await api<{ connector: Connector }>("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token }) })).connector;
+}
+
+export async function saveWebSettings(patch: { fetchEnabled?: boolean; searchEndpoint?: string; searchApiKey?: string }): Promise<Connector> {
+	return (await api<{ connector: Connector }>("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify(patch) })).connector;
 }
 
 export function getNotifications(): Promise<{ notifications: NotificationEntry[]; unread: number }> {

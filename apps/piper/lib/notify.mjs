@@ -5,6 +5,7 @@
 import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, ensureData } from "./store.mjs";
+import { redact } from "./redact.mjs";
 
 export const NOTIFICATION_TYPES = ["routine.completed", "routine.failed", "approval.pending", "approval.executed", "approval.failed"];
 
@@ -33,8 +34,9 @@ export function addNotification({ type, title, body = "", routineId = null, arti
 	const entry = {
 		id: `n-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 		type,
-		title: String(title ?? ""),
-		body: String(body ?? ""),
+		// 通知正文常拼外部错误原文，落盘前统一脱敏（R7，出口在 lib/redact.mjs）。
+		title: redact(String(title ?? "")),
+		body: redact(String(body ?? "")),
 		routineId,
 		artifactId,
 		findingId,

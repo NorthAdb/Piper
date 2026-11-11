@@ -127,3 +127,37 @@ jobs:
       # regressions against packages/coding-agent/test/mcp-conformance/baseline.json.
       - name: MCP client conformance
         run: npm run test:mcp-conformance
+
+  # Piper's offline hard gate (audit rework R8). Everything here runs without
+  # live network access: the suites use local stubs and frozen fixtures, and the
+  # regression suite runs against a temp data dir with a local GitHub stub.
+  # regression:live is deliberately NOT part of CI.
+  piper:
+    name: piper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # apps/piper is a root workspace (apps/*) and its dependencies are in the
+      # root lockfile, so the root install covers it.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      # apps/piper imports @earendil-works/pi-agent-core and pi-ai, whose package
+      # exports resolve to dist/. Build just that dependency chain, in the same
+      # order as the root build: telemetry -> schema -> ai -> agent.
+      - name: Build the pi base packages Piper imports
+        run: npm run build --workspace @earendil-works/pi-telemetry --workspace @earendil-works/pi-schema --workspace @earendil-works/pi-ai --workspace @earendil-works/pi-agent-core
+
+      # npm run test in apps/piper aggregates: build:web, check, all offline
+      # test:* suites, eval:scan and the offline regression suite.
+      - name: Piper offline suites
+        working-directory: apps/piper
+        run: npm run test

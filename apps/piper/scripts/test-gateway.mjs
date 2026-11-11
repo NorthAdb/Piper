@@ -1,52 +1,89 @@
-// 薄网关测试（P1-6）：进程内 fetch 替身 + 临时 findings/audit/notifications 文件，全程不打活网、
-// 不对真实仓库发任何评论。用法（在 apps/piper 下）：node scripts/test-gateway.mjs（或 npm run test:gateway）
-// 覆盖：未批准直调被拒、正向批准恰好发一次评论、驳回零调用、过期/已关闭不能再批准、
-// 意图被改被拒、仓库未绑定被拒、不支持的意图被拒、无令牌明确失败且可重试、PR 已关闭
-// 执行失败保持 approved、正文含令牌被拒、写接口失败保持 approved、审计正负两类齐全
-// 且不含令牌、以及「除网关外无人构造 GitHub 评论写端点」的源码绕过断言。
-import { appendFileSync, existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+// 薄网关测试（P1-6 + R1 返工）：进程内 fetch 替身 + 临时 findings/audit/approvals/notifications
+// 文件，全程不打活网、不对真实仓库发任何评论。用法（在 apps/piper 下）：
+// node scripts/test-gateway.mjs（或 npm run test:gateway）
+// R4 起 PIPER_DATA_DIR 一并指向临时目录：网关经 store 读 bot 绑定、经 settings 读令牌，
+// 数据面全部隔离——种子 bots 由 ensureData 在临时目录生成，不再隐含依赖真实 data/。
+// SKIP 口径（R4）：跳过必须经 skip() 输出并在汇总单列，绝不计为 PASS。
+// 覆盖：未批准直调被拒、正向批准恰好发一次评论（正文 = 批准快照 + 幂等标记）、驳回零调用、
+// 过期/已关闭不能再批准、意图快照与当前存储不符被拒（denied/intent_changed）、带旧 intentHash
+// 批准回 409、仓库未绑定被拒、不支持的意图被拒、无令牌明确失败且可重试、PR 已关闭执行失败
+// 保持 approved、正文含令牌被拒、写接口失败保持 approved、并发批准互斥（替身 50ms 延迟下恰好
+// 一次写、第二个 409）、崩溃重放靠评论标记查重（总写次数仍 1）、审计正负两类齐全且不含令牌、
+// 以及「除网关外无人构造 GitHub 评论写端点」的源码绕过断言。
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "piper-gateway-"));
+process.env.PIPER_DATA_DIR = join(tmp, "data");
 process.env.PIPER_FINDINGS_FILE = join(tmp, "findings.jsonl");
 process.env.PIPER_AUDIT_FILE = join(tmp, "audit.jsonl");
+process.env.PIPER_APPROVALS_FILE = join(tmp, "approvals.jsonl");
 process.env.PIPER_NOTIFICATIONS_FILE = join(tmp, "notifications.jsonl");
 
-const SETTINGS_GITHUB_FILE = join(APP_DIR, "data", "settings-github.json");
-const hasSettingsToken = existsSync(SETTINGS_GITHUB_FILE);
+// 隔离目录里不存在 settings-github.json，令牌恒走 env 兜底（R4 前还要看本机真实
+// 设置文件是否存在、存在就整项跳过——那正是审计 B4 指出的不可复现点，已删除）。
 const ENV_TOKEN = "ghp_gateway_test_token_0001";
-if (!hasSettingsToken) process.env.GITHUB_TOKEN = ENV_TOKEN;
+process.env.GITHUB_TOKEN = ENV_TOKEN;
 
 const results = [];
 let seq = 0;
 function check(name, ok, detail = "") {
 	seq += 1;
-	results.push({ seq, name, ok });
+	results.push({ seq, name, ok, status: ok ? "pass" : "fail" });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
+function skip(name, reason = "") {
+	seq += 1;
+	results.push({ seq, name, ok: false, status: "skip" });
+	console.log(`SKIP ${String(seq).padStart(2, "0")} ${name}${reason ? ` — ${reason}` : ""}`);
+}
 
-// ---- fetch 替身：只认网关会用到的两个端点，其余一律 599 ----
+// ---- fetch 替身：网关会用到的端点（PR 查询、评论列表、评论发表），其余一律 599 ----
+// 评论按 PR 落在 commentsByKey 里模拟 GitHub 侧已存在的评论（崩溃重放靠它查重标记）。
 const realFetch = globalThis.fetch;
 const postCalls = [];
+const commentsByKey = new Map();
 let pullState = "open";
+let pullDraft = false;
+let pullReviews = [];
 let postShouldFail = false;
 let pullShouldFail = false;
+let fetchDelayMs = 0;
+let postCrashAfterSuccess = false;
 globalThis.fetch = async (url, init = {}) => {
+	if (fetchDelayMs) await new Promise((r) => setTimeout(r, fetchDelayMs));
 	const u = new URL(String(url));
 	const method = init.method ?? "GET";
-	if (method === "POST" && /\/issues\/\d+\/comments$/.test(u.pathname)) {
-		postCalls.push({ path: u.pathname, body: JSON.parse(init.body ?? "{}"), auth: init.headers?.Authorization ?? "" });
+	const commentsMatch = u.pathname.match(/^\/repos\/(.+)\/issues\/(\d+)\/comments$/);
+	if (commentsMatch && method === "GET") {
+		const key = `${commentsMatch[1]}#${commentsMatch[2]}`;
+		// 按 GitHub 口径分页：缺省 per_page=30，page 从 1 起（F2 用例靠它摆位标记评论）。
+		const all = commentsByKey.get(key) ?? [];
+		const perPage = Number(u.searchParams.get("per_page") ?? 30);
+		const page = Number(u.searchParams.get("page") ?? 1);
+		return { ok: true, status: 200, json: async () => all.slice((page - 1) * perPage, page * perPage) };
+	}
+	if (commentsMatch && method === "POST") {
+		const body = JSON.parse(init.body ?? "{}");
+		postCalls.push({ path: u.pathname, body, auth: init.headers?.Authorization ?? "" });
+		const key = `${commentsMatch[1]}#${commentsMatch[2]}`;
+		const comment = { body: body.body, html_url: `https://github.com/${commentsMatch[1]}/pull/${commentsMatch[2]}#issuecomment-4242` };
+		commentsByKey.set(key, [...(commentsByKey.get(key) ?? []), comment]);
+		if (postCrashAfterSuccess) throw new Error("simulated crash after POST succeeded");
 		if (postShouldFail) return { ok: false, status: 500, json: async () => ({}) };
-		const repo = u.pathname.split("/").slice(2, 4).join("/");
-		const n = u.pathname.match(/\/issues\/(\d+)\/comments/)[1];
-		return { ok: true, status: 201, json: async () => ({ html_url: `https://github.com/${repo}/pull/${n}#issuecomment-4242` }) };
+		return { ok: true, status: 201, json: async () => comment };
+	}
+	if (method === "GET" && /\/pulls\/\d+\/reviews$/.test(u.pathname)) {
+		const perPage = Number(u.searchParams.get("per_page") ?? 30);
+		const page = Number(u.searchParams.get("page") ?? 1);
+		return { ok: true, status: 200, json: async () => pullReviews.slice((page - 1) * perPage, page * perPage) };
 	}
 	if (method === "GET" && /\/pulls\/\d+$/.test(u.pathname)) {
 		if (pullShouldFail) return { ok: false, status: 500, json: async () => ({}) };
-		return { ok: true, status: 200, json: async () => ({ state: pullState }) };
+		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: pullDraft, head: { sha: "head-sha-1" } }) };
 	}
 	return { ok: false, status: 599, json: async () => ({}) };
 };
@@ -58,8 +95,10 @@ const saveArtifactStub = (input) => {
 };
 
 try {
+	const { ensureData } = await import("../lib/store.mjs");
+	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
 	const { createFinding, getFinding, updateFinding } = await import("../lib/findings.mjs");
-	const { approveApproval, listApprovals, rejectApproval } = await import("../lib/approvals.mjs");
+	const { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.mjs");
 	const { gatewayExecuteWrite } = await import("../lib/gateway.mjs");
 	const { listAudit } = await import("../lib/audit.mjs");
 	const { listNotifications } = await import("../lib/notify.mjs");
@@ -83,12 +122,24 @@ try {
 		});
 	}
 	const auditFor = (id) => listAudit({ findingId: id });
+	const viewOf = (id) => listApprovals().find((a) => a.findingId === id);
+	const snapOf = (f) => ({ kind: f.writeIntent.kind, repo: f.repo, prNumber: f.writeIntent.prNumber, body: f.writeIntent.body });
+	// 直接改 findings 文件里的 writeIntent（模拟存储被事后篡改，绕过 updateFinding 的字段保护）。
+	function tamperFindingFile(id, newBody) {
+		const lines = readFileSync(process.env.PIPER_FINDINGS_FILE, "utf8").split("\n").filter(Boolean);
+		const out = lines.map((line) => {
+			const f = JSON.parse(line);
+			if (f.id === id) f.writeIntent = { ...f.writeIntent, body: newBody };
+			return JSON.stringify(f);
+		});
+		writeFileSync(process.env.PIPER_FINDINGS_FILE, out.join("\n") + "\n", "utf8");
+	}
 
 	// 1. 负向：未批准直调网关 → denied/not_approved，写 API 0 次，审计有 denied
 	{
 		const f = makeFinding({ subject: "101" });
 		const before = postCalls.length;
-		const r = await gatewayExecuteWrite({ findingId: f.id, intent: f.writeIntent });
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-direct", snapshot: snapOf(f) });
 		check(
 			"负向：未经批准直调网关被拒（not_approved），替身写 API 0 次，审计有 denied",
 			r.ok === false && r.result === "denied" && r.reason === "not_approved" && postCalls.length === before && auditFor(f.id).some((x) => x.result === "denied" && x.reason === "not_approved"),
@@ -96,31 +147,37 @@ try {
 		);
 	}
 
-	// 2. 正向：批准 → 网关恰好发一次评论（参数=批准的仓库/PR/正文），状态 executed，
-	//    审计 approved + executed（带评论链接），审计 artifact 落盘（替身），通知 approval.executed
+	// 2. 正向：批准（带 intentHash）→ 网关执行快照恰好发一次评论（正文 = 快照正文 + 幂等标记），
+	//    状态 executed，审计 approved/executing/executed 同一 approvalId，artifact 与通知齐全
 	let executedFinding;
+	let executedApprovalId;
 	{
 		const f = makeFinding({ subject: "42" });
 		executedFinding = f;
+		const view = viewOf(f.id);
 		const before = postCalls.length;
-		const out = await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+		const out = await approveApproval(f.id, { intentHash: view?.intentHash, saveArtifactFn: saveArtifactStub });
 		const call = postCalls[before];
 		const recs = auditFor(f.id);
+		executedApprovalId = recs.find((x) => x.result === "approved")?.approvalId;
 		check(
-			"正向：批准后替身写 API 恰好一次，参数为批准的仓库/PR/正文且带令牌，Finding 转 executed",
+			"正向：批准后替身写 API 恰好一次，正文为批准快照加幂等标记且带令牌，Finding 转 executed",
 			out.execution.ok === true &&
 				postCalls.length === before + 1 &&
 				call.path === "/repos/NorthAdb/LinkForge/issues/42/comments" &&
-				call.body.body === BODY &&
+				typeof executedApprovalId === "string" &&
+				executedApprovalId.length > 0 &&
+				call.body.body === `${BODY}\n\n<!-- piper:approval=${executedApprovalId} -->` &&
 				call.auth === `Bearer ${token}` &&
 				getFinding(f.id).status === "executed" &&
 				out.approval.commentUrl === "https://github.com/NorthAdb/LinkForge/pull/42#issuecomment-4242",
 			JSON.stringify(out.execution),
 		);
 		check(
-			"正向审计：同一 Finding 可追到 approved 与 executed（含 commentUrl），且有网关执行 artifact 与 approval.executed 通知",
-			recs.some((x) => x.result === "approved") &&
-				recs.some((x) => x.result === "executed" && x.commentUrl?.includes("issuecomment-4242")) &&
+			"正向审计：同一 Finding 可追到 approved、executing（发前落痕）与 executed（含 commentUrl），approvalId 一致；有执行 artifact 与 approval.executed 通知",
+			recs.some((x) => x.result === "approved" && x.approvalId === executedApprovalId) &&
+				recs.some((x) => x.result === "executing" && x.approvalId === executedApprovalId) &&
+				recs.some((x) => x.result === "executed" && x.approvalId === executedApprovalId && x.commentUrl?.includes("issuecomment-4242")) &&
 				artifactCalls.length === 1 &&
 				artifactCalls[0].kind === "gateway-execution" &&
 				listNotifications().some((n) => n.type === "approval.executed" && n.findingId === f.id) &&
@@ -129,7 +186,7 @@ try {
 		);
 	}
 
-	// 3. 驳回：写 API 0 次，状态 rejected，审计有 rejected
+	// 3. 驳回：写 API 0 次，状态 rejected，审计有 rejected；已关闭再批准 → 409
 	{
 		const f = makeFinding({ subject: "103" });
 		const before = postCalls.length;
@@ -139,29 +196,28 @@ try {
 			a.status === "rejected" && postCalls.length === before && auditFor(f.id).some((x) => x.result === "rejected"),
 			`status=${a.status}`,
 		);
-		// 4. 已关闭再批准 → 409
 		let threw = null;
 		try {
-			await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+			await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		} catch (err) {
 			threw = err;
 		}
 		check("已关闭（rejected）再批准被拒（409），不产生写调用", threw?.status === 409 && postCalls.length === before, `threw=${threw?.status}`);
 	}
 
-	// 5. 过期：open 且已过期 → 批准时被惰性清理转 expired 并 409；approved 后过期 → 网关 denied/expired
+	// 4. 过期：open 且已过期 → 批准回 409 且转 expired；approved 后过期 → 网关 denied/expired
 	{
 		const f = makeFinding({ subject: "104", expiresAt: new Date(Date.now() - 1000).toISOString() });
 		let threw = null;
 		try {
-			await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+			await approveApproval(f.id, { intentHash: undefined, saveArtifactFn: saveArtifactStub });
 		} catch (err) {
 			threw = err;
 		}
 		const g = makeFinding({ subject: "105" });
 		updateFinding(g.id, { status: "approved", expiresAt: new Date(Date.now() - 1000).toISOString() });
 		const before = postCalls.length;
-		const r = await gatewayExecuteWrite({ findingId: g.id, intent: g.writeIntent });
+		const r = await gatewayExecuteWrite({ findingId: g.id, approvalId: "ap-direct", snapshot: snapOf(g) });
 		check(
 			"过期不能批准/执行：open 过期批准回 409 且状态转 expired；approved 过期被网关 denied/expired，写 API 0 次",
 			threw?.status === 409 && getFinding(f.id).status === "expired" && r.result === "denied" && r.reason === "expired" && getFinding(g.id).status === "expired" && postCalls.length === before,
@@ -169,16 +225,36 @@ try {
 		);
 	}
 
-	// 6. 意图被改：approved 后拿篡改正文来执行 → denied/intent_mismatch，写 API 0 次
+	// 5. 意图快照与当前存储不符：网关拿到的快照正文与 Finding 现存 writeIntent 不一致
+	//    → denied/intent_changed，写 API 0 次（旧实现会把被改后的正文发出去）
 	{
 		const f = makeFinding({ subject: "106" });
 		updateFinding(f.id, { status: "approved" });
 		const before = postCalls.length;
-		const r = await gatewayExecuteWrite({ findingId: f.id, intent: { ...f.writeIntent, body: "被篡改的正文" } });
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-direct", snapshot: { ...snapOf(f), body: "被篡改的正文" } });
 		check(
-			"意图被改被拒：请求动作与 Finding.writeIntent 不逐字一致 → denied/intent_mismatch，写 API 0 次",
-			r.result === "denied" && r.reason === "intent_mismatch" && postCalls.length === before,
+			"快照不符被拒：网关只执行批准快照，快照与当前 writeIntent 不一致 → denied/intent_changed，写 API 0 次",
+			r.result === "denied" && r.reason === "intent_changed" && postCalls.length === before,
 			JSON.stringify(r),
+		);
+	}
+
+	// 6. 篡改后再批准：文件里的 writeIntent 被直接改掉后，拿旧 intentHash 批准 → 409，写 API 0 次
+	{
+		const f = makeFinding({ subject: "116" });
+		const staleHash = viewOf(f.id)?.intentHash;
+		tamperFindingFile(f.id, "被篡改的正文");
+		const before = postCalls.length;
+		let threw = null;
+		try {
+			await approveApproval(f.id, { intentHash: staleHash, saveArtifactFn: saveArtifactStub });
+		} catch (err) {
+			threw = err;
+		}
+		check(
+			"篡改后批准被拒：writeIntent 被改后带旧 intentHash 批准回 409「内容已变」，状态仍 open，写 API 0 次",
+			threw?.status === 409 && /内容已变/.test(String(threw?.message ?? "")) && getFinding(f.id).status === "open" && postCalls.length === before,
+			`threw=${threw?.status} ${threw?.message ?? ""}`,
 		);
 	}
 
@@ -187,7 +263,7 @@ try {
 		const f = makeFinding({ repo: "Acme/Widgets", subject: "107", evidenceUrl: "https://github.com/Acme/Widgets/pull/42" });
 		updateFinding(f.id, { status: "approved" });
 		const before = postCalls.length;
-		const r = await gatewayExecuteWrite({ findingId: f.id, intent: f.writeIntent });
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-direct", snapshot: snapOf(f) });
 		check(
 			"仓库未绑定被拒：目标仓不在 bot 绑定仓内 → denied/repo_not_bound，写 API 0 次",
 			r.result === "denied" && r.reason === "repo_not_bound" && postCalls.length === before,
@@ -215,7 +291,11 @@ try {
 		};
 		appendFileSync(process.env.PIPER_FINDINGS_FILE, JSON.stringify(raw) + "\n", "utf8");
 		const before = postCalls.length;
-		const r = await gatewayExecuteWrite({ findingId: raw.id, intent: raw.writeIntent });
+		const r = await gatewayExecuteWrite({
+			findingId: raw.id,
+			approvalId: "ap-direct",
+			snapshot: { kind: "merge_pr", repo: raw.repo, prNumber: 42, body: "x" },
+		});
 		check(
 			"不支持的意图被拒：kind 非 pr_comment → denied/unsupported_intent，写 API 0 次",
 			r.result === "denied" && r.reason === "unsupported_intent" && postCalls.length === before,
@@ -223,12 +303,14 @@ try {
 		);
 	}
 
-	// 9. 无令牌：批准执行明确失败（no_token）、保持 approved、可重试成功（本机有设置令牌时跳过）
-	if (!hasSettingsToken) {
+	// 9. 无令牌：批准执行明确失败（no_token）、保持 approved、可重试成功。
+	//    R4 前本机若有真实 settings-github.json 本项整项「跳过也算过」；隔离后令牌
+	//    来源恒为 env，本项在任何机器上都真跑，不再有跳过分支。
+	{
 		const f = makeFinding({ subject: "109" });
 		delete process.env.GITHUB_TOKEN;
 		const before = postCalls.length;
-		const out1 = await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+		const out1 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		const failedOk =
 			out1.execution.ok === false &&
 			out1.execution.result === "failed" &&
@@ -237,14 +319,12 @@ try {
 			postCalls.length === before &&
 			auditFor(f.id).some((x) => x.result === "failed" && x.reason === "no_token");
 		process.env.GITHUB_TOKEN = ENV_TOKEN;
-		const out2 = await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+		const out2 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		check(
 			"无令牌不假成功：execution failed/no_token、Finding 保持 approved、审计有 failed；补上令牌后重试即 executed",
 			failedOk && out2.execution.ok === true && getFinding(f.id).status === "executed" && postCalls.length === before + 1,
 			`out1=${JSON.stringify(out1.execution)} out2=${JSON.stringify(out2.execution)}`,
 		);
-	} else {
-		check("无令牌用例：本机存在 settings-github.json（文件优先），跳过 env 令牌操纵", true, "skipped");
 	}
 
 	// 10. PR 已关闭：执行前复检失败 → failed/pr_not_open，保持 approved，收件箱 lastError 可见，写 API 0 次
@@ -252,7 +332,7 @@ try {
 		const f = makeFinding({ subject: "110" });
 		pullState = "closed";
 		const before = postCalls.length;
-		const out = await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		pullState = "open";
 		const listed = listApprovals().find((a) => a.findingId === f.id);
 		check(
@@ -271,7 +351,7 @@ try {
 		const f = makeFinding({ subject: "111", writeIntent: { kind: "pr_comment", prNumber: 42, body: `提醒：令牌是 ${token} 请审查` } });
 		updateFinding(f.id, { status: "approved" });
 		const before = postCalls.length;
-		const r = await gatewayExecuteWrite({ findingId: f.id, intent: f.writeIntent });
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-direct", snapshot: snapOf(f) });
 		check(
 			"正文含令牌被拒：denied/secret_in_body，写 API 0 次",
 			r.result === "denied" && r.reason === "secret_in_body" && postCalls.length === before,
@@ -283,7 +363,7 @@ try {
 	{
 		const f = makeFinding({ subject: "112" });
 		postShouldFail = true;
-		const out = await approveApproval(f.id, { saveArtifactFn: saveArtifactStub });
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		postShouldFail = false;
 		check(
 			"写接口失败：execution failed/comment_failed*，Finding 保持 approved，审计有 failed",
@@ -292,7 +372,53 @@ try {
 		);
 	}
 
-	// 13. 审计完整性：字段形状齐全且全文件不含令牌全文
+	// 13. 并发批准互斥：替身带 50ms 延迟，两个并发批准 → 写替身恰好 1 次、审计 executed 恰好
+	//     1 条、第二个请求 409「正在执行」（审计探针 P1 在旧实现上是 2 次写）
+	{
+		const f = makeFinding({ subject: "113" });
+		const hash = viewOf(f.id)?.intentHash;
+		fetchDelayMs = 50;
+		const before = postCalls.length;
+		const settle = (p) => p.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, e }));
+		const [r1, r2] = await Promise.all([
+			settle(approveApproval(f.id, { intentHash: hash, saveArtifactFn: saveArtifactStub })),
+			settle(approveApproval(f.id, { intentHash: hash, saveArtifactFn: saveArtifactStub })),
+		]);
+		fetchDelayMs = 0;
+		const successes = [r1, r2].filter((r) => r.ok && r.v.execution?.ok === true);
+		const conflicts = [r1, r2].filter((r) => !r.ok && r.e?.status === 409);
+		check(
+			"并发批准互斥：两个并发批准恰好一次写、一条 executed 审计，另一个回 409",
+			successes.length === 1 &&
+				conflicts.length === 1 &&
+				postCalls.length === before + 1 &&
+				auditFor(f.id).filter((x) => x.result === "executed").length === 1 &&
+				getFinding(f.id).status === "executed",
+			`r1=${JSON.stringify(r1.ok ? r1.v.execution : r1.e?.status)} r2=${JSON.stringify(r2.ok ? r2.v.execution : r2.e?.status)} posts=${postCalls.length - before}`,
+		);
+	}
+
+	// 14. 崩溃重放：替身 POST 在 GitHub 侧成功后抛错（模拟进程崩溃），Finding 退回 approved；
+	//     再次批准时网关先查评论标记，复用已有评论记 executed，写替身总计仍 1 次
+	{
+		const f = makeFinding({ subject: "114", writeIntent: { kind: "pr_comment", prNumber: 77, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/77" });
+		postCrashAfterSuccess = true;
+		const before = postCalls.length;
+		const out1 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		postCrashAfterSuccess = false;
+		const out2 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"崩溃重放幂等：POST 成功后崩溃退回 approved，再次批准靠标记查重不再 POST，总写次数 1 且转 executed",
+			out1.execution.ok === false &&
+				getFinding(f.id).status === "executed" &&
+				out2.execution.ok === true &&
+				postCalls.length === before + 1 &&
+				auditFor(f.id).filter((x) => x.result === "executed").length === 1,
+			`out1=${JSON.stringify(out1.execution)} out2=${JSON.stringify(out2.execution)} posts=${postCalls.length - before}`,
+		);
+	}
+
+	// 15. 审计完整性：字段形状齐全且全文件不含令牌全文
 	{
 		const rec = auditFor(executedFinding.id).find((x) => x.result === "executed");
 		const rawAudit = readFileSync(process.env.PIPER_AUDIT_FILE, "utf8");
@@ -307,13 +433,138 @@ try {
 				rec.intent?.bodyLength === BODY.length &&
 				rec.intent?.bodyPreview === BODY.slice(0, 120) &&
 				rec.findingId === executedFinding.id &&
-				rec.approvalId === executedFinding.id &&
+				rec.approvalId === executedApprovalId &&
 				!rawAudit.includes(token),
 			JSON.stringify(rec),
 		);
 	}
 
-	// 14. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
+	// 16. 规则前提复检（R5）：扫描时 PR 待审、批准后 PR 已被批准（审查人最新为 APPROVED 且
+	//     所针对 commit 与当前 head 一致）→ 网关 failed/precondition_changed，不发评论，
+	//     Finding 保持 approved、审计有 failed/precondition_changed
+	{
+		const f = makeFinding({ subject: "117" });
+		pullReviews = [{ state: "APPROVED", user: { login: "rev" }, commit_id: "head-sha-1" }];
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullReviews = [];
+		check(
+			"前提已变被拦：批准后 PR 已获批准 → failed/precondition_changed，写 API 0 次，保持 approved，审计有该原因",
+			out.execution.ok === false &&
+				out.execution.result === "failed" &&
+				out.execution.reason === "precondition_changed" &&
+				getFinding(f.id).status === "approved" &&
+				postCalls.length === before &&
+				auditFor(f.id).some((x) => x.result === "failed" && x.reason === "precondition_changed"),
+			JSON.stringify(out.execution),
+		);
+	}
+
+	// 直接改 findings 文件里的 updatedAt（模拟执行在途已停留很久，updatedAt 不是可改字段）。
+	function ageFindingFile(id, iso) {
+		const lines = readFileSync(process.env.PIPER_FINDINGS_FILE, "utf8").split("\n").filter(Boolean);
+		const out = lines.map((line) => {
+			const f = JSON.parse(line);
+			if (f.id === id) f.updatedAt = iso;
+			return JSON.stringify(f);
+		});
+		writeFileSync(process.env.PIPER_FINDINGS_FILE, out.join("\n") + "\n", "utf8");
+	}
+
+	// 17. executing 崩溃恢复（F1，第二轮返工）：进程在网关领取执行后、落终态前死亡
+	//     （kill -9 等），Finding 会永久卡 executing——批准 409、驳回 409。恢复函数把
+	//     超时（缺省 5 分钟，按 updatedAt 计）的 executing 退回 approved 并写审计
+	//     failed/interrupted；刚领取的（未超时）不动。启动语义 olderThanMs=0 全量恢复。
+	{
+		const stale = makeFinding({ subject: "118" });
+		updateFinding(stale.id, { status: "approved" });
+		updateFinding(stale.id, { status: "executing" });
+		ageFindingFile(stale.id, new Date(Date.now() - 10 * 60 * 1000).toISOString());
+		const fresh = makeFinding({ subject: "119" });
+		updateFinding(fresh.id, { status: "approved" });
+		updateFinding(fresh.id, { status: "executing" });
+		let recovered = null;
+		let err = null;
+		try {
+			recovered = recoverInterruptedExecutions();
+		} catch (e) {
+			err = e;
+		}
+		check(
+			"executing 恢复：超时 executing 退回 approved 并写审计 failed/interrupted，未超时的不动",
+			err === null &&
+				recovered === 1 &&
+				getFinding(stale.id).status === "approved" &&
+				auditFor(stale.id).some((x) => x.result === "failed" && x.reason === "interrupted") &&
+				getFinding(fresh.id).status === "executing",
+			`err=${err?.message ?? ""} recovered=${recovered} stale=${getFinding(stale.id).status} fresh=${getFinding(fresh.id).status}`,
+		);
+		let recoveredAtBoot = null;
+		try {
+			recoveredAtBoot = recoverInterruptedExecutions({ olderThanMs: 0 });
+		} catch (e) {
+			err = e;
+		}
+		check(
+			"executing 恢复（启动语义）：olderThanMs=0 时未超时的 executing 也退回 approved",
+			err === null && recoveredAtBoot === 1 && getFinding(fresh.id).status === "approved",
+			`err=${err?.message ?? ""} recovered=${recoveredAtBoot} fresh=${getFinding(fresh.id).status}`,
+		);
+	}
+
+	// 18. 评论幂等查重翻页（F2，第二轮返工）：查重改 per_page=100 翻页取尽，上限 10 页；
+	//     到上限仍没取尽且没找到标记 → 不发，failed/comments_check_incomplete，退回 approved。
+	//     摆位都靠「首次执行 POST 成功后崩溃」种下带标记评论，再用填充评论把它推到目标位置：
+	//     A 共 35 条、标记在第 35 条（GitHub 默认每页 30 时位于第 2 页，旧实现只取第一页必漏检重发）；
+	//     B 共 120 条、标记在第 111 条（per_page=100 的第 2 页）；
+	//     C 共 1006 条、标记在第 1006 条（超出 10 页 × 100 的取尽上限）。
+	//     A/B：重试 POST 0 次、复用已有评论记 executed；C：POST 0 次、保持 approved、审计有该原因。
+	async function seedCrashedWithMarker(f, total, markerIndex) {
+		postCrashAfterSuccess = true;
+		const out1 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		postCrashAfterSuccess = false;
+		const key = `${f.repo}#${f.writeIntent.prNumber}`;
+		const arr = commentsByKey.get(key) ?? [];
+		const markerComment = arr[arr.length - 1];
+		const fillers = Array.from({ length: total - 1 }, (_, i) => ({ body: `filler ${i}`, html_url: `https://example.invalid/filler-${i}` }));
+		commentsByKey.set(key, [...fillers.slice(0, markerIndex), markerComment, ...fillers.slice(markerIndex)]);
+		return out1;
+	}
+	{
+		const fA = makeFinding({ subject: "201", writeIntent: { kind: "pr_comment", prNumber: 201, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/201" });
+		await seedCrashedWithMarker(fA, 35, 34);
+		const beforeA = postCalls.length;
+		const outA = await approveApproval(fA.id, { intentHash: viewOf(fA.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"查重翻页 A：35 条评论、标记在第 35 条 → 重试 POST 0 次，复用已有评论记 executed",
+			outA.execution.ok === true && outA.execution.reused === true && postCalls.length === beforeA && getFinding(fA.id).status === "executed",
+			`out=${JSON.stringify(outA.execution)} posts=${postCalls.length - beforeA}`,
+		);
+		const fB = makeFinding({ subject: "202", writeIntent: { kind: "pr_comment", prNumber: 202, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/202" });
+		await seedCrashedWithMarker(fB, 120, 110);
+		const beforeB = postCalls.length;
+		const outB = await approveApproval(fB.id, { intentHash: viewOf(fB.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"查重翻页 B：120 条评论、标记在第 111 条（per_page=100 第 2 页）→ 重试 POST 0 次，复用记 executed",
+			outB.execution.ok === true && outB.execution.reused === true && postCalls.length === beforeB && getFinding(fB.id).status === "executed",
+			`out=${JSON.stringify(outB.execution)} posts=${postCalls.length - beforeB}`,
+		);
+		const fC = makeFinding({ subject: "203", writeIntent: { kind: "pr_comment", prNumber: 203, body: BODY }, evidenceUrl: "https://github.com/NorthAdb/LinkForge/pull/203" });
+		await seedCrashedWithMarker(fC, 1006, 1005);
+		const beforeC = postCalls.length;
+		const outC = await approveApproval(fC.id, { intentHash: viewOf(fC.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"查重翻页 C：标记超出 10 页上限 → POST 0 次，failed/comments_check_incomplete，保持 approved，审计有该原因",
+			outC.execution.ok === false &&
+				outC.execution.reason === "comments_check_incomplete" &&
+				postCalls.length === beforeC &&
+				getFinding(fC.id).status === "approved" &&
+				auditFor(fC.id).some((x) => x.result === "failed" && x.reason === "comments_check_incomplete"),
+			`out=${JSON.stringify(outC.execution)} posts=${postCalls.length - beforeC} status=${getFinding(fC.id).status}`,
+		);
+	}
+
+	// 19. 绕过断言：除 gateway.mjs 外，lib 与 server 没有任何文件构造 GitHub 评论写端点；
 	//     扫描与对话层文件不得同时出现 api.github.com 与 POST 写调用。
 	{
 		const libFiles = readdirSync(join(APP_DIR, "lib")).filter((f) => f.endsWith(".mjs"));
@@ -330,15 +581,83 @@ try {
 			`withComments=${withComments.join(",")}`,
 		);
 	}
+
+	// 20. COMMENTED 不撤销批准——网关同源判定（F4，第二轮返工）：审查人 APPROVED
+	//     （针对当前 head）后又提交一条 COMMENTED（回复行内评论即产生）——网关复检与
+	//     扫描共用 evaluateReviews，必须同样判「已批准」→ failed/precondition_changed、
+	//     写 API 0 次。旧实现按「最新一条」取到 COMMENTED 判 no_approval，会误发评论。
+	{
+		const f = makeFinding({ subject: "120" });
+		pullReviews = [
+			{ state: "APPROVED", user: { login: "rev" }, commit_id: "head-sha-1" },
+			{ state: "COMMENTED", user: { login: "rev" }, commit_id: "head-sha-1" },
+		];
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullReviews = [];
+		check(
+			"F4 网关同源：批准后同人 COMMENTED → 仍判已批准，failed/precondition_changed，写 API 0 次，保持 approved",
+			out.execution.ok === false &&
+				out.execution.result === "failed" &&
+				out.execution.reason === "precondition_changed" &&
+				postCalls.length === before &&
+				getFinding(f.id).status === "approved" &&
+				auditFor(f.id).some((x) => x.result === "failed" && x.reason === "precondition_changed"),
+			JSON.stringify(out.execution),
+		);
+	}
+
+	// 21. draft 复检（F5②，第二轮返工）：Finding 批准后 PR 变 draft → 网关执行前复检
+	//     failed/precondition_changed、写 API 0 次、保持 approved。去掉网关的 draft
+	//     复检本项即变红（会一路走到 POST）。
+	{
+		const f = makeFinding({ subject: "121" });
+		pullDraft = true;
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullDraft = false;
+		check(
+			"F5 draft 复检：批准后 PR 变 draft → failed/precondition_changed，写 API 0 次，保持 approved，审计有该原因",
+			out.execution.ok === false &&
+				out.execution.result === "failed" &&
+				out.execution.reason === "precondition_changed" &&
+				postCalls.length === before &&
+				getFinding(f.id).status === "approved" &&
+				auditFor(f.id).some((x) => x.result === "failed" && x.reason === "precondition_changed"),
+			JSON.stringify(out.execution),
+		);
+	}
+
+	// 22. 陈旧批准在网关仍判待审（F5③，第二轮返工）：批准所针对的 commit（old-sha-999）
+	//     与当前 head（head-sha-1）不一致——按锁定口径陈旧批准 = 仍待审（扫描侧同一场景
+	//     由夹具 pr-approved-then-new-commits 钉住应报），网关与扫描共用同一判定，前提
+	//     未变，照常发送并 executed。本项钉住「网关复检把当前 head 传进判定」：复检不传
+	//     head 时陈旧无从判定、会误判已批准 → 本项变红。
+	{
+		const f = makeFinding({ subject: "122" });
+		pullReviews = [{ state: "APPROVED", user: { login: "rev" }, commit_id: "old-sha-999" }];
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullReviews = [];
+		check(
+			"F5 陈旧批准仍待审：批准 commit 与当前 head 不一致 → 同一判定仍待审，网关照常发送（写 API 1 次）并 executed",
+			out.execution.ok === true && postCalls.length === before + 1 && getFinding(f.id).status === "executed",
+			`out=${JSON.stringify(out.execution)} posts=${postCalls.length - before}`,
+		);
+	}
 } finally {
 	globalThis.fetch = realFetch;
+	delete process.env.PIPER_DATA_DIR;
 	delete process.env.PIPER_FINDINGS_FILE;
 	delete process.env.PIPER_AUDIT_FILE;
+	delete process.env.PIPER_APPROVALS_FILE;
 	delete process.env.PIPER_NOTIFICATIONS_FILE;
-	if (!hasSettingsToken) delete process.env.GITHUB_TOKEN;
+	delete process.env.GITHUB_TOKEN;
 	rmSync(tmp, { recursive: true, force: true });
 }
 
-const failed = results.filter((r) => !r.ok);
-console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);
+const passedCount = results.filter((r) => r.status === "pass").length;
+const skippedCount = results.filter((r) => r.status === "skip").length;
+const failed = results.filter((r) => r.status === "fail");
+console.log(`\n结果：${passedCount}/${results.length} 通过，${skippedCount} 跳过（单列，不计通过），${failed.length} 失败`);
 if (failed.length) process.exit(1);

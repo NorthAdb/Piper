@@ -3,12 +3,22 @@
 // 校验在写入边界完成：没有 evidenceUrl 的对象不准存成有效 Finding；type / status /
 // writeIntent 只接受本批已定的枚举，非法值抛带 status 的 Error（路由层转 4xx）。
 // 文件路径可用环境变量 PIPER_FINDINGS_FILE 覆盖（仅供单元测试 / 评测隔离数据，缺省走 data/）。
-import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData } from "./store.mjs";
+import { DATA_DIR, ensureData, writeFileAtomicSync } from "./store.mjs";
 
 export const FINDING_TYPES = ["ci_failed", "pr_needs_review"];
-export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed"];
+export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed", "executing"];
+// 显式状态迁移表（R1）：updateFinding 强制执行，表外迁移一律抛错。
+// executing 是批准执行在途态（网关领取后、落终态前）；executing→approved 是执行失败退回。
+export const FINDING_TRANSITIONS = {
+	open: ["approved", "rejected", "expired"],
+	approved: ["executing", "rejected", "expired"],
+	executing: ["executed", "approved"],
+	rejected: [],
+	expired: [],
+	executed: [],
+};
 // 本批只允许一种写意图（P1-6 网关放行）：给指定 PR 发表一条评论。
 export const FINDING_WRITE_INTENT_KINDS = ["pr_comment"];
 
@@ -36,9 +46,11 @@ function readAll() {
 		.filter(Boolean);
 }
 
+// 整表重写走临时文件 + rename（R10）：状态迁移写一半崩溃不会把 findings.jsonl
+// 截成半截文件，下次启动读到的要么是旧全表、要么是新全表。
 function rewriteAll(all) {
 	ensureData();
-	writeFileSync(findingsFile(), all.map((f) => JSON.stringify(f)).join("\n") + (all.length ? "\n" : ""), "utf8");
+	writeFileAtomicSync(findingsFile(), all.map((f) => JSON.stringify(f)).join("\n") + (all.length ? "\n" : ""), "utf8");
 }
 
 function requireNonEmptyString(value, field) {
@@ -108,6 +120,11 @@ function buildFinding(input) {
 		expiresAt: validateExpiresAt(input.expiresAt),
 		status,
 		botId: requireNonEmptyString(input.botId, "botId"),
+		// 头部提交（R5，去重冷却的比较基准，开单时刻的取证事实、不可改）：
+		// pr_needs_review 取 PR 的 head.sha，ci_failed 取 run 的 head_sha；缺失为 null。
+		headSha: typeof input.headSha === "string" && input.headSha ? input.headSha : null,
+		// ci_failed 所属工作流名（R5 对账按工作流退役用）；其他类型为 null。
+		workflow: typeof input.workflow === "string" && input.workflow ? input.workflow : null,
 	};
 }
 
@@ -145,14 +162,45 @@ export function findOpenFinding(repo, type, subject) {
 	return readAll().find((f) => f.repo === repo && f.type === type && f.subject === String(subject) && f.status === "open") ?? null;
 }
 
-// 可改字段：status / title / summary / suggestedAction / writeIntent / expiresAt。
-// 其余字段（repo/type/subject/evidenceUrl/botId）是取证事实，立住后不许改。
-const PATCHABLE = ["status", "title", "summary", "suggestedAction", "writeIntent", "expiresAt"];
+// 去重冷却（R5，口径已锁定）：去重键 repo+type+subject。返回「挡住新开」的既有 Finding，
+// 没有则 null。规则：
+//   open / approved / executing：未关闭，不得另开一条；
+//   rejected：头部提交未变且距上次状态变更（updatedAt，近似驳回时刻）未满 14 天 → 挡住；
+//     头部变化或满 14 天 → 不挡（可重开）；
+//   executed：头部提交未变 → 挡住（已留过言，不以满 14 天自动再催）；头部变化 → 不挡；
+//   expired：从不挡住。
+// 头部比较：任一侧 headSha 缺失时按「未变」处理（取证不足不重开、不再催，保守口径）。
+export const REJECTED_COOLDOWN_MS = 14 * 24 * 3600 * 1000;
+
+export function findBlockingFinding(repo, type, subject, { headSha = null, now = new Date() } = {}) {
+	const same = readAll().filter((f) => f.repo === repo && f.type === type && f.subject === String(subject));
+	const active = same.find((f) => f.status === "open" || f.status === "approved" || f.status === "executing");
+	if (active) return active;
+	const headSame = (f) => !headSha || !f.headSha || f.headSha === headSha;
+	for (const f of same) {
+		if (f.status === "executed" && headSame(f)) return f;
+		if (f.status === "rejected" && headSame(f) && now.getTime() - Date.parse(f.updatedAt) < REJECTED_COOLDOWN_MS) return f;
+	}
+	return null;
+}
+
+// 可改字段：status / title / summary / suggestedAction / expiresAt。
+// 其余字段（repo/type/subject/evidenceUrl/botId/headSha/workflow）是取证事实，立住后不许改；writeIntent 自
+// R1 起同样不可改——批准的是用户看到的那份内容，批准后以批准记录的意图快照为准执行。
+const PATCHABLE = ["status", "title", "summary", "suggestedAction", "expiresAt"];
 
 export function updateFinding(id, patch) {
 	const all = readAll();
 	const idx = all.findIndex((f) => f.id === id);
 	if (idx < 0) return null;
+	// 状态迁移强制（R1）：status 真正变化且目标是合法枚举时必须落在迁移表内，否则抛 409；
+	// 枚举外的 status 仍由 buildFinding 按非法值拒绝（报错口径不变）。
+	if (patch && patch.status !== undefined && patch.status !== all[idx].status && FINDING_STATUSES.includes(patch.status)) {
+		const allowed = FINDING_TRANSITIONS[all[idx].status] ?? [];
+		if (!allowed.includes(patch.status)) {
+			throw Object.assign(new Error(`Finding 状态迁移非法：${all[idx].status} → ${patch.status}`), { status: 409 });
+		}
+	}
 	const merged = { ...all[idx] };
 	for (const key of PATCHABLE) {
 		if (patch && patch[key] !== undefined) merged[key] = patch[key];
@@ -165,6 +213,8 @@ export function updateFinding(id, patch) {
 	return next;
 }
 
+// 注意（R1 核查）：deleteFinding 没有生产路径调用——server / scan / approvals / gateway
+// 均不删 Finding（关闭走状态迁移），仅存储层单测使用。不要在生产路径里接它。
 export function deleteFinding(id) {
 	const all = readAll();
 	const next = all.filter((f) => f.id !== id);

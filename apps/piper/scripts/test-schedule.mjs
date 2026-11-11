@@ -3,7 +3,16 @@
 // 覆盖：下一次运行计算（时区换算）、到点只触发一次、失败有限补跑、成功后同周期不再跑、
 // 启动补跑判定（已过点未成功补一次 / 已成功不补 / 未到点不补）、并发重入防护、
 // schedule 字段解析与旧文本迁移。时区固定 Asia/Hong_Kong（UTC+8，无夏令时）。
-import { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } from "../lib/schedule.mjs";
+// R4：schedule 经 settings 间接引用数据目录，PIPER_DATA_DIR 先指向临时目录再 import，
+// 与其他脚本统一隔离口径（本脚本用注入的 timezoneFn，不实际读写数据文件）。
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const tmp = mkdtempSync(join(tmpdir(), "piper-schedule-"));
+process.env.PIPER_DATA_DIR = join(tmp, "data");
+
+const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../lib/schedule.mjs");
 
 const results = [];
 let seq = 0;
@@ -227,6 +236,62 @@ check(
 	);
 }
 
+// ---- R3：timezoneFn 抛错时 tick 不抛（外层 try/catch + onError 失败通知钩子） ----
+{
+	let broken = true;
+	let calls = 0;
+	const errors = [];
+	const state = { lastRunAt: null, lastStatus: null };
+	const sched = createScheduler({
+		run: async () => {
+			calls += 1;
+			return "ok";
+		},
+		getRoutineState: () => state,
+		timezoneFn: () => {
+			if (broken) throw new Error("Invalid time zone specified: Foo/Bar");
+			return TZ;
+		},
+		timeFn: () => TIME,
+		onError: (err) => errors.push(err),
+	});
+	let threw = false;
+	let res = null;
+	try {
+		res = await sched.tick(T_0800);
+	} catch {
+		threw = true;
+	}
+	// 不带 onError 的调度器同样不得把异常抛给调用方（server 是 void tick(...)）。
+	const schedBare = createScheduler({
+		run: async () => "ok",
+		getRoutineState: () => state,
+		timezoneFn: () => {
+			throw new Error("Invalid time zone specified: Foo/Bar");
+		},
+		timeFn: () => TIME,
+	});
+	let threwBare = false;
+	try {
+		await schedBare.tick(T_0800);
+	} catch {
+		threwBare = true;
+	}
+	check(
+		"R3 timezoneFn 抛错：tick 不抛、返回 error 结果、onError 收到一次通知（无 onError 亦不抛）",
+		!threw && res?.action === "error" && errors.length === 1 && !threwBare && calls === 0,
+		`threw=${threw} res=${JSON.stringify(res)} errors=${errors.length} threwBare=${threwBare} calls=${calls}`,
+	);
+
+	broken = false;
+	const after = await sched.tick(T_0800);
+	check(
+		"R3 timezoneFn 恢复后调度器未楔死：running 已复位，到点能真正执行",
+		after.action === "ran" && after.result === "ok" && calls === 1 && errors.length === 1,
+		`after=${JSON.stringify(after)} calls=${calls}`,
+	);
+}
+
 // ---- 状态端点形状 ----
 {
 	const state = { lastRunAt: "2026-11-10T00:01:00.000Z", lastStatus: "ok" };
@@ -248,6 +313,8 @@ check(
 		JSON.stringify(st),
 	);
 }
+
+rmSync(tmp, { recursive: true, force: true });
 
 const failed = results.filter((r) => !r.ok);
 console.log(`\n结果：${results.length - failed.length}/${results.length} 通过`);
