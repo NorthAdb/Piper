@@ -168,7 +168,7 @@ await new Promise((r) => ghStub.listen(0, "127.0.0.1", r));
 const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
 
 // ---- 起被截实例 ----
-const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE, PIPER_WEB_FETCH_TEST_ALLOW: `127.0.0.1:${FIXTURE_PORT}` };
+const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE, PIPER_WEB_FETCH_TEST_ALLOW: `127.0.0.1:${FIXTURE_PORT}`, PIPER_TEST_MODE: "1" };
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
 const serverProc = spawn("node", ["server.mjs"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });

@@ -9,8 +9,9 @@
 //     解析到的私网 IP（那些是内网拓扑信息）。
 // 上限写死：总超时 10 秒、下载最多 1MB（超限断流并标明）、注入上下文的
 // 可见文本最多 8000 字（超限截断并标明）。
-// 测试缝：环境变量 PIPER_WEB_FETCH_TEST_ALLOW 是逗号分隔的 host:port 白名单，
-// 只供本地夹具测试在测试进程内放行夹具地址；生产环境不设即无任何放行。
+// 测试缝（双开关，F9）：PIPER_TEST_MODE=1 且 PIPER_WEB_FETCH_TEST_ALLOW
+// （逗号分隔的 host:port 白名单，只认 host:port）同时满足才放行夹具地址，
+// 缺一不可；生产环境两个变量都不设，即无任何放行。
 import { lookup as dnsLookupCallback } from "node:dns";
 import { request as httpRequest } from "node:http";
 import { request as httpsRequest } from "node:https";
@@ -56,23 +57,56 @@ function isBlockedV4(ip) {
 	return false;
 }
 
-function isBlockedV6(ip) {
-	if (ip === "::" || ip === "::1") return true; // 未指定 / 回环
-	if (ip.startsWith("::ffff:")) {
-		const mapped = ip.slice("::ffff:".length);
-		if (isIP(mapped) === 4) return isBlockedV4(mapped);
-		return true;
+// 把 IPv6 字面量展开成 8 组 16 位整数（处理 :: 压缩与尾部点分 IPv4）；非法返回 null。
+function expandV6Groups(ip) {
+	let s = ip;
+	const v4 = /(\d{1,3}(?:\.\d{1,3}){3})$/.exec(s);
+	if (v4) {
+		const b = v4[1].split(".").map(Number);
+		if (b.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+		s = `${s.slice(0, s.length - v4[1].length)}${(((b[0] << 8) | b[1]) >>> 0).toString(16)}:${(((b[2] << 8) | b[3]) >>> 0).toString(16)}`;
 	}
-	const head = ip.split(":")[0];
-	const headVal = Number.parseInt(head || "0", 16);
-	if (Number.isNaN(headVal)) return true;
-	if (headVal >= 0xfe80 && headVal <= 0xfebf) return true; // 链路本地 fe80::/10
-	if (headVal >= 0xfc00 && headVal <= 0xfdff) return true; // 唯一本地 fc00::/7
-	if (headVal >= 0xff00) return true; // 组播
+	const halves = s.split("::");
+	if (halves.length > 2) return null;
+	const left = halves[0] ? halves[0].split(":") : [];
+	const right = halves.length === 2 ? (halves[1] ? halves[1].split(":") : []) : null;
+	let parts;
+	if (right === null) {
+		if (left.length !== 8) return null;
+		parts = left;
+	} else {
+		const missing = 8 - left.length - right.length;
+		if (missing < 1) return null;
+		parts = [...left, ...Array(missing).fill("0"), ...right];
+	}
+	const groups = parts.map((g) => Number.parseInt(g, 16));
+	if (groups.some((n) => !Number.isInteger(n) || n < 0 || n > 0xffff)) return null;
+	return groups;
+}
+
+// 隧道/映射前缀的判定看内嵌 IPv4：取第 hiIndex、hiIndex+1 组拼成点分地址再走 V4 判定。
+function embeddedV4Blocked(groups, hiIndex) {
+	const hi = groups[hiIndex];
+	const lo = groups[hiIndex + 1];
+	return isBlockedV4(`${hi >> 8}.${hi & 0xff}.${lo >> 8}.${lo & 0xff}`);
+}
+
+function isBlockedV6(ip) {
+	const g = expandV6Groups(ip);
+	if (!g) return true; // 展开不了：一律按不安全处理
+	const [g0, g1, g2, g3, g4, g5] = g;
+	if ((g0 & 0xffc0) === 0xfe80) return true; // 链路本地 fe80::/10
+	if ((g0 & 0xfe00) === 0xfc00) return true; // 唯一本地 fc00::/7
+	if ((g0 & 0xff00) === 0xff00) return true; // 组播 ff00::/8
+	if (g0 === 0x2001 && g1 === 0) return true; // Teredo 2001::/32 整段封（F8）
+	if (g0 === 0x2002) return embeddedV4Blocked(g, 1); // 6to4 2002::/16：内嵌 IPv4 在第 2、3 组（F8）
+	if (g0 === 0x0064 && g1 === 0xff9b && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) return embeddedV4Blocked(g, 6); // NAT64 64:ff9b::/96（F8）
+	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0xffff) return embeddedV4Blocked(g, 6); // IPv4 映射 ::ffff:0:0/96
+	if (g0 === 0 && g1 === 0 && g2 === 0 && g3 === 0 && g4 === 0 && g5 === 0) return embeddedV4Blocked(g, 6); // IPv4 兼容 ::/96（含 :: 与 ::1，F8）
 	return false;
 }
 
-// ---------- 测试缝（仅测试进程设置；生产不设即不存在） ----------
+// ---------- 测试缝（双开关；仅测试进程设置，生产不设即不存在） ----------
 function testAllowSet() {
 	const raw = process.env.PIPER_WEB_FETCH_TEST_ALLOW;
 	if (!raw) return null;
@@ -85,10 +119,11 @@ function testAllowSet() {
 }
 
 function isTestAllowed(url) {
+	if (process.env.PIPER_TEST_MODE !== "1") return false; // 第二道开关（F9）
 	const set = testAllowSet();
 	if (!set) return false;
 	const port = url.port || (url.protocol === "https:" ? "443" : "80");
-	return set.has(`${url.hostname.toLowerCase()}:${port}`) || set.has(url.hostname.toLowerCase());
+	return set.has(`${url.hostname.toLowerCase()}:${port}`); // 只认 host:port，只写主机名不命中（F9）
 }
 
 // ---------- 解析与校验 ----------
@@ -123,32 +158,38 @@ async function assertUrlAllowed(url, lookupAll) {
 }
 
 // ---------- 传输（默认实现：把已校验地址钉给 socket） ----------
+// 建请求选项（纯函数，导出供测试直接钉住，F6）：pinnedAddresses 非空时带上
+// lookup 钉住回调——socket 只连校验过的地址、连接阶段不再解析，请求时传入什么
+// 主机名都只返回钉住的地址。SNI/证书仍按 URL 主机名（Node 以 hostname 为准）。
+export function buildFetchRequestOptions(url, pinnedAddresses, { signal } = {}) {
+	const options = {
+		method: "GET",
+		headers: {
+			"User-Agent": "Piper web.fetch (read-only)",
+			Accept: "text/html, text/plain, application/json;q=0.8, */*;q=0.5",
+		},
+		signal,
+	};
+	if (pinnedAddresses?.length) {
+		options.lookup = (hostname, lookupOptions, callback) => {
+			if (lookupOptions?.all) {
+				callback(
+					null,
+					pinnedAddresses.map((address) => ({ address, family: isIP(address) })),
+				);
+			} else {
+				callback(null, pinnedAddresses[0], isIP(pinnedAddresses[0]));
+			}
+		};
+	}
+	return options;
+}
+
 function defaultTransport(url, pinnedAddresses, { signal } = {}) {
 	return new Promise((resolvePromise, rejectPromise) => {
 		const isHttps = url.protocol === "https:";
 		const requestFn = isHttps ? httpsRequest : httpRequest;
-		const options = {
-			method: "GET",
-			headers: {
-				"User-Agent": "Piper web.fetch (read-only)",
-				Accept: "text/html, text/plain, application/json;q=0.8, */*;q=0.5",
-			},
-			signal,
-		};
-		if (pinnedAddresses?.length) {
-			// lookup 钉住：socket 只连校验过的地址；返回什么由我们决定，
-			// 连接阶段不再重新解析。SNI/证书仍按 URL 主机名（Node 以 hostname 为准）。
-			options.lookup = (hostname, lookupOptions, callback) => {
-				if (lookupOptions?.all) {
-					callback(
-						null,
-						pinnedAddresses.map((address) => ({ address, family: isIP(address) })),
-					);
-				} else {
-					callback(null, pinnedAddresses[0], isIP(pinnedAddresses[0]));
-				}
-			};
-		}
+		const options = buildFetchRequestOptions(url, pinnedAddresses, { signal });
 		let settled = false;
 		let downloadTruncated = false;
 		const chunks = [];
@@ -270,7 +311,8 @@ export async function webSearch(query, { endpoint, apiKey }) {
 
 // ---------- 主入口 ----------
 // 返回 { url（最终地址）, status, text（≤8000）, truncated, downloadTruncated }。
-// deps 可注入 lookupAll / transport（测试替身用，生产不传）。
+// deps 可注入 lookupAll / transport（测试替身用，生产不传）；deps.timeoutMs 仅供
+// 测试注入更短的超时，生产不传、恒用 WEB_FETCH_TIMEOUT_MS（常量另有测试钉住 ≤10s）。
 export async function webFetch(rawUrl, deps = {}) {
 	const lookupAll = deps.lookupAll ?? defaultLookupAll;
 	const transport = deps.transport ?? defaultTransport;
@@ -280,7 +322,7 @@ export async function webFetch(rawUrl, deps = {}) {
 	} catch {
 		throw blockedError();
 	}
-	const deadline = AbortSignal.timeout(WEB_FETCH_TIMEOUT_MS);
+	const deadline = AbortSignal.timeout(deps.timeoutMs ?? WEB_FETCH_TIMEOUT_MS);
 	for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
 		const pinned = await assertUrlAllowed(current, lookupAll);
 		let res;
