@@ -10,13 +10,26 @@
 //      → 批准后又推了新提交，视为陈旧批准、仍待审（stale_approval）。
 //      head SHA 或 commit_id 缺失时不判陈旧（取证不足不误报，按其余规则判定）。
 // 返回 { approved, reason }：approved=true 仅当 reason==="approved"。
+// GitHub reviews 接口条目的相关字段（外部 API 响应，只取判定用到的三个）。
+export interface GithubReview {
+	state?: string;
+	user?: { login?: string } | null;
+	commit_id?: string;
+}
+
+export type ReviewReason = "approved" | "changes_requested" | "no_approval" | "stale_approval";
+export interface ReviewVerdict {
+	approved: boolean;
+	reason: ReviewReason;
+}
+
 const STANCE_STATES = new Set(["APPROVED", "CHANGES_REQUESTED", "DISMISSED"]);
-export function evaluateReviews(reviews, headSha) {
-	const list = Array.isArray(reviews) ? reviews : [];
-	const latestByUser = new Map();
+export function evaluateReviews(reviews: unknown, headSha?: string | null): ReviewVerdict {
+	const list: GithubReview[] = Array.isArray(reviews) ? reviews : [];
+	const latestByUser = new Map<string, GithubReview>();
 	for (const r of list) {
 		if (!r || typeof r !== "object") continue;
-		if (!STANCE_STATES.has(r.state)) continue;
+		if (typeof r.state !== "string" || !STANCE_STATES.has(r.state)) continue;
 		latestByUser.set(r.user?.login ?? "?", r);
 	}
 	const latest = [...latestByUser.values()];
@@ -31,6 +44,6 @@ export function evaluateReviews(reviews, headSha) {
 }
 
 // PR 是否仍待审（扫描的 pr_needs_review 规则与网关执行前复检共用）。
-export function prNeedsReview(reviews, headSha) {
+export function prNeedsReview(reviews: unknown, headSha?: string | null): boolean {
 	return !evaluateReviews(reviews, headSha).approved;
 }

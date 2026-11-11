@@ -20,11 +20,39 @@
 // 老文件里的未脱敏文本不出接口）；tool 的 args/result 沿用落盘的已脱敏
 // 版本，再过一遍 redactDeep 兜底，不在接口层产生任何新明文。
 import { redact, redactDeep } from "./redact.js";
+import type { SessionEntry } from "./store.js";
 
 const PREVIEW_MAX_CHARS = 200;
 
+export interface TraceEvent {
+	kind: string;
+	subKind: string | null;
+	ts: number | null;
+	durationMs: number | null;
+	seq: number | null;
+	textChars: number | null;
+	textPreview: string | null;
+	level?: string | null;
+	truncated?: boolean;
+	name?: string | null;
+	status?: string | null;
+	toolCallId?: string | null;
+	startedAt?: number | null;
+	endedAt?: number | null;
+	args?: unknown;
+	result?: unknown;
+}
+
+export interface TraceTurn {
+	index: number;
+	startedAt: number | null;
+	endedAt: number | null;
+	durationMs: number | null;
+	events: TraceEvent[];
+}
+
 // 毫秒数原样、ISO 字符串解析、其余（缺失/坏值）回 null。
-function toMs(value) {
+function toMs(value: unknown): number | null {
 	if (typeof value === "number" && Number.isFinite(value)) return value;
 	if (typeof value === "string") {
 		const ms = Date.parse(value);
@@ -33,20 +61,22 @@ function toMs(value) {
 	return null;
 }
 
-function numOrNull(value) {
+function numOrNull(value: unknown): number | null {
 	return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function traceEvent(entry) {
+function traceEvent(entry: SessionEntry): TraceEvent {
 	const kind = typeof entry?.role === "string" && entry.role ? entry.role : "unknown";
 	// tool/thinking 的事件时刻优先用事件字段 startedAt（毫秒数）
 	const eventStartedAt = kind === "tool" || kind === "thinking" ? numOrNull(entry?.startedAt) : null;
-	const ev = {
+	const ev: TraceEvent = {
 		kind,
 		subKind: typeof entry?.kind === "string" ? entry.kind : null,
 		ts: eventStartedAt ?? toMs(entry?.ts),
 		durationMs: numOrNull(entry?.durationMs),
 		seq: numOrNull(entry?.seq),
+		textChars: null,
+		textPreview: null,
 	};
 	if (typeof entry?.text === "string") {
 		ev.textChars = entry.text.length;
@@ -72,20 +102,22 @@ function traceEvent(entry) {
 }
 
 // 会话条目数组 -> { turns: [{ index, startedAt, endedAt, durationMs, events }] }
-export function buildTrace(entries) {
-	const turns = [];
-	let current = null;
+export function buildTrace(entries: unknown): { turns: TraceTurn[] } {
+	const turns: TraceTurn[] = [];
+	let current: TraceTurn | null = null;
 	for (const entry of Array.isArray(entries) ? entries : []) {
 		if (!entry || typeof entry !== "object") continue;
-		if (entry.role === "user" || !current) {
-			current = { index: turns.length, startedAt: null, endedAt: null, durationMs: null, events: [] };
-			turns.push(current);
+		let cur: TraceTurn | null = current;
+		if (entry.role === "user" || !cur) {
+			cur = { index: turns.length, startedAt: null, endedAt: null, durationMs: null, events: [] };
+			current = cur;
+			turns.push(cur);
 		}
-		current.events.push(traceEvent(entry));
+		cur.events.push(traceEvent(entry));
 	}
 	for (const turn of turns) {
 		const userEv = turn.events.find((e) => e.kind === "user");
-		const stamps = turn.events.map((e) => e.ts).filter((v) => v !== null);
+		const stamps = turn.events.map((e) => e.ts).filter((v): v is number => v !== null);
 		turn.startedAt = userEv ? userEv.ts : stamps.length ? stamps[0] : null;
 		turn.endedAt = stamps.length ? Math.max(...stamps) : null;
 		turn.durationMs = turn.startedAt !== null && turn.endedAt !== null && turn.endedAt >= turn.startedAt ? turn.endedAt - turn.startedAt : null;

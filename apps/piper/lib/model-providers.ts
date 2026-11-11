@@ -31,31 +31,55 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { APP_DIR } from "./store.js";
 import { THINKING_LEVELS } from "./settings.js";
+import type { ModelSettings } from "./settings.js";
 import { redact, REDACTED } from "./redact.js";
+import type { Api, Model } from "@earendil-works/pi-ai";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
 
 export const COMPATIBLE_MODEL_API = "openai-completions";
 
-export const CUSTOM_PROVIDER = { id: "custom", name: "自定义端点", baseUrl: "", models: [] };
+export interface ModelProviderEntry {
+	id: string;
+	name: string;
+	baseUrl: string;
+	models: Array<{ id: string; supportedThinkingLevels: string[] }>;
+}
 
-let catalogPromise = null;
+export const CUSTOM_PROVIDER: ModelProviderEntry = { id: "custom", name: "自定义端点", baseUrl: "", models: [] };
+
+export type FetchModelsResult = { ok: true; status: number; models: string[] } | { ok: false; status: number; error: string };
+
+// 动态加载的 pi-ai dist 模块在编译期无法按文件路径解析类型（运行时仍走
+// pathToFileURL 动态 import，保持原加载方式），故按实际用到的最小面标注；
+// 成员形状与 packages/ai/dist 的 .d.ts 核对一致（builtinProviders /
+// getBuiltinModels / getSupportedThinkingLevels），Model 本身是 pi-ai 真实类型。
+interface PiAiProvidersModule {
+	builtinProviders(): Array<{ id: string; name: string }>;
+	getBuiltinModels(id: string): Array<Model<Api>>;
+}
+
+interface PiAiIndexModule {
+	getSupportedThinkingLevels(model: Model<Api>): string[];
+}
+
+let catalogPromise: Promise<ModelProviderEntry[]> | null = null;
 // 目录原始模型索引（providerId -> Map(modelId -> pi-ai Model)）：只含兼容子集，
 // 供内核按 (provider, modelId) 取回原始 Model（reasoning / thinkingLevelMap 是
 // pi-ai 做挡位吸附与厂商参数翻译的依据，见 lib/kernel.ts）。
-let catalogModelIndex = new Map();
+let catalogModelIndex = new Map<string, Map<string, Model<Api>>>();
 
-async function buildCatalog() {
+async function buildCatalog(): Promise<ModelProviderEntry[]> {
 	const allPath = join(REPO_ROOT, "packages", "ai", "dist", "providers", "all.js");
 	const indexPath = join(REPO_ROOT, "packages", "ai", "dist", "index.js");
 	if (!existsSync(allPath) || !existsSync(indexPath)) return [{ ...CUSTOM_PROVIDER }];
 	try {
-		const all = await import(pathToFileURL(allPath).href);
+		const all = (await import(pathToFileURL(allPath).href)) as PiAiProvidersModule;
 		// getSupportedThinkingLevels 在 pi-ai 主入口（models.ts）：挡位支持集一律
 		// 用它对每个目录模型现算，不在 Piper 侧另维护挡位表。
-		const ai = await import(pathToFileURL(indexPath).href);
-		const providers = [];
-		const index = new Map();
+		const ai = (await import(pathToFileURL(indexPath).href)) as PiAiIndexModule;
+		const providers: ModelProviderEntry[] = [];
+		const index = new Map<string, Map<string, Model<Api>>>();
 		for (const provider of all.builtinProviders()) {
 			const compat = all.getBuiltinModels(provider.id).filter((m) => m.api === COMPATIBLE_MODEL_API);
 			if (!compat.length) continue;
@@ -77,31 +101,31 @@ async function buildCatalog() {
 }
 
 // 目录（含末尾的 custom）只算一次：派生要 import 整个 pi-ai 目录，进程内缓存。
-export function loadModelProviders() {
+export function loadModelProviders(): Promise<ModelProviderEntry[]> {
 	if (!catalogPromise) catalogPromise = buildCatalog();
 	return catalogPromise;
 }
 
-export async function getModelProvider(id) {
+export async function getModelProvider(id: string): Promise<ModelProviderEntry | null> {
 	const providers = await loadModelProviders();
 	return providers.find((p) => p.id === id) ?? null;
 }
 
-export async function isKnownModelProvider(id) {
+export async function isKnownModelProvider(id: unknown): Promise<boolean> {
 	return typeof id === "string" && Boolean(await getModelProvider(id));
 }
 
 // 一份已保存的模型设置归属哪个服务商：文件里的 provider 是派生目录中的
 // id 就用它；没有该字段、或 id 已不在目录里（例如上一版手写的 moonshot /
 // zhipu）一律按 custom 读——不猜、不丢原值。
-export async function resolveModelProviderId(saved) {
+export async function resolveModelProviderId(saved: ModelSettings | null | undefined): Promise<string> {
 	const id = saved && typeof saved.provider === "string" ? saved.provider : "";
 	return (await isKnownModelProvider(id)) ? id : "custom";
 }
 
 // 按 (providerId, modelId) 取目录里的 pi-ai 原始 Model（仅兼容子集）；
 // 查不到（自定义端点、目录外模型名）回 null。
-export async function getCatalogModel(providerId, modelId) {
+export async function getCatalogModel(providerId: string, modelId: string): Promise<Model<Api> | null> {
 	await loadModelProviders();
 	return catalogModelIndex.get(providerId)?.get(modelId) ?? null;
 }
@@ -110,7 +134,7 @@ export async function getCatalogModel(providerId, modelId) {
 // getSupportedThinkingLevels 现算的结果（与目录接口下发的同一份）；目录里
 // 查不到的自定义模型无元数据可依，回落完整七挡词表（内核对这类模型把挡位
 // 原样传给 Agent，服务商不认时错误走既有脱敏出口）。
-export async function thinkingLevelsFor(providerId, modelId) {
+export async function thinkingLevelsFor(providerId: string, modelId: string): Promise<string[]> {
 	const providers = await loadModelProviders();
 	const entry = providers.find((p) => p.id === providerId)?.models.find((m) => m.id === modelId);
 	return entry ? [...entry.supportedThinkingLevels] : [...THINKING_LEVELS];
@@ -123,16 +147,16 @@ export const FETCH_MODELS_MAX_BYTES = 1_000_000;
 
 // 错误文本先抹掉当次候选 Key 本身（它可能还没保存进设置文件，redact 的
 // 已知秘密集合里没有它），再过统一 redact，最后截断。
-function sanitizeFetchError(text, apiKey) {
+function sanitizeFetchError(text: unknown, apiKey?: string): string {
 	let out = String(text ?? "");
 	if (apiKey && apiKey.length >= 6 && out.includes(apiKey)) out = out.split(apiKey).join(REDACTED);
 	return redact(out).slice(0, 300);
 }
 
-async function readBodyCapped(res, maxBytes) {
+async function readBodyCapped(res: Response, maxBytes: number): Promise<{ text: string; tooLarge: boolean }> {
 	if (!res.body) return { text: await res.text(), tooLarge: false };
 	const reader = res.body.getReader();
-	const chunks = [];
+	const chunks: Uint8Array[] = [];
 	let total = 0;
 	for (;;) {
 		const { done, value } = await reader.read();
@@ -151,11 +175,14 @@ async function readBodyCapped(res, maxBytes) {
 // （data[].id 去重、排序）；失败回 { ok:false, status, error }，status 为
 // 上游 HTTP 状态码，网络/超时/解析失败时为 0。deps.timeoutMs / deps.maxBytes
 // 只供测试注入更小的值，生产恒用上面的常量。
-export async function fetchUpstreamModels({ baseUrl, apiKey } = {}, deps = {}) {
+export async function fetchUpstreamModels(
+	{ baseUrl, apiKey }: { baseUrl?: unknown; apiKey?: string } = {},
+	deps: { timeoutMs?: number; maxBytes?: number } = {},
+): Promise<FetchModelsResult> {
 	const timeoutMs = deps.timeoutMs ?? FETCH_MODELS_TIMEOUT_MS;
 	const maxBytes = deps.maxBytes ?? FETCH_MODELS_MAX_BYTES;
 	const root = String(baseUrl ?? "").trim().replace(/\/+$/, "");
-	let url;
+	let url: URL;
 	try {
 		url = new URL(`${root}/models`);
 	} catch {
@@ -164,7 +191,7 @@ export async function fetchUpstreamModels({ baseUrl, apiKey } = {}, deps = {}) {
 	if (url.protocol !== "http:" && url.protocol !== "https:") {
 		return { ok: false, status: 0, error: "baseUrl 必须是 http/https 地址" };
 	}
-	let res;
+	let res: Response;
 	try {
 		res = await fetch(url, {
 			headers: { Accept: "application/json", ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}) },
@@ -172,18 +199,20 @@ export async function fetchUpstreamModels({ baseUrl, apiKey } = {}, deps = {}) {
 			redirect: "follow",
 		});
 	} catch (err) {
-		const timedOut = err?.name === "TimeoutError" || err?.name === "AbortError";
+		const e = err as { name?: string; message?: unknown } | null | undefined;
+		const timedOut = e?.name === "TimeoutError" || e?.name === "AbortError";
 		return {
 			ok: false,
 			status: 0,
-			error: sanitizeFetchError(`拉取模型列表${timedOut ? "超时" : "失败"}：${err?.message ?? err}`, apiKey),
+			error: sanitizeFetchError(`拉取模型列表${timedOut ? "超时" : "失败"}：${e?.message ?? err}`, apiKey),
 		};
 	}
-	let body;
+	let body: { text: string; tooLarge: boolean };
 	try {
 		body = await readBodyCapped(res, maxBytes);
 	} catch (err) {
-		return { ok: false, status: res.status, error: sanitizeFetchError(`读取模型列表响应失败：${err?.message ?? err}`, apiKey) };
+		const e = err as { message?: unknown } | null | undefined;
+		return { ok: false, status: res.status, error: sanitizeFetchError(`读取模型列表响应失败：${e?.message ?? err}`, apiKey) };
 	}
 	if (body.tooLarge) {
 		return { ok: false, status: res.status, error: `端点 /models 响应超过 ${maxBytes} 字节上限，已中止` };
@@ -195,7 +224,8 @@ export async function fetchUpstreamModels({ baseUrl, apiKey } = {}, deps = {}) {
 			error: sanitizeFetchError(`端点返回 ${res.status}${body.text ? `：${body.text}` : ""}`, apiKey),
 		};
 	}
-	let parsed;
+	// 上游 /models 响应是外部边界：形状在下方按契约（data 数组）检查后逐字段取用。
+	let parsed: any;
 	try {
 		parsed = JSON.parse(body.text);
 	} catch {
@@ -204,6 +234,6 @@ export async function fetchUpstreamModels({ baseUrl, apiKey } = {}, deps = {}) {
 	if (!Array.isArray(parsed?.data)) {
 		return { ok: false, status: res.status, error: "端点 /models 响应缺少 data 数组" };
 	}
-	const models = [...new Set(parsed.data.map((d) => (typeof d?.id === "string" ? d.id : "")).filter(Boolean))].sort();
+	const models = [...new Set<string>(parsed.data.map((d: any) => (typeof d?.id === "string" ? d.id : "")).filter(Boolean))].sort();
 	return { ok: true, status: res.status, models };
 }

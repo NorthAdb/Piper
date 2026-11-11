@@ -6,10 +6,51 @@ import { chmodSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, ensureData, listBots, writeFileAtomicSync } from "./store.js";
 
+// ---------- 设置文件形状（各文件的属主口径） ----------
+
+export interface ModelSettings {
+	provider?: string;
+	baseUrl?: string;
+	modelId?: string;
+	thinkingLevel?: string;
+	apiKey?: string;
+}
+
+export interface ProfileSettings {
+	displayName: string;
+	timezone: string;
+}
+
+export interface GithubSettings {
+	token?: string;
+}
+
+export interface WebSettings {
+	fetchEnabled?: boolean;
+	searchEndpoint?: string;
+	searchApiKey?: string;
+}
+
+export interface Connector {
+	id: string;
+	name: string;
+	purpose: string;
+	status: string;
+	statusNote: string;
+	bots: string[];
+	access: string;
+	configurable: boolean;
+	tokenHint?: string;
+	fetchEnabled?: boolean;
+	searchConfigured?: boolean;
+	searchEndpoint?: string;
+	searchKeyHint?: string;
+}
+
 // 设置文件含秘密（模型 Key、GitHub 令牌）：写盘权限钉死 0600（R7）。mode 作用于
 // 临时文件、rename 后即为目标文件权限；随后的 chmodSync 再兜一层。落盘走临时文件
 // + rename（R10），写一半崩溃不会把设置文件截成坏 JSON。
-function writeSettingsFile(file, data) {
+function writeSettingsFile(file: string, data: unknown): void {
 	ensureData();
 	writeFileAtomicSync(file, JSON.stringify(data, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
 	chmodSync(file, 0o600);
@@ -17,7 +58,7 @@ function writeSettingsFile(file, data) {
 
 // 秘密读回掩码的唯一口径：≤8 位的短秘密回固定掩码——末四位掩码在短秘密上等于
 // 暴露大半（如 8 位 Key 暴露 4 位），不许回真实末位（R7）；长秘密仍给末四位便于辨认。
-export function secretHint(secret) {
+export function secretHint(secret?: string | null): string {
 	if (!secret) return "";
 	if (secret.length <= 8) return "••••••••";
 	return `••••${secret.slice(-4)}`;
@@ -25,11 +66,11 @@ export function secretHint(secret) {
 
 const MODEL_SETTINGS_FILE = join(DATA_DIR, "settings-model.json");
 
-export function readModelSettingsFile() {
+export function readModelSettingsFile(): ModelSettings {
 	if (!existsSync(MODEL_SETTINGS_FILE)) return {};
 	try {
-		const parsed = JSON.parse(readFileSync(MODEL_SETTINGS_FILE, "utf8"));
-		return parsed && typeof parsed === "object" ? parsed : {};
+		const parsed: unknown = JSON.parse(readFileSync(MODEL_SETTINGS_FILE, "utf8"));
+		return parsed && typeof parsed === "object" ? (parsed as ModelSettings) : {};
 	} catch {
 		return {};
 	}
@@ -38,17 +79,18 @@ export function readModelSettingsFile() {
 // 思考挡位词表：与 pi-ai / pi-agent-core 的 ThinkingLevel 完全一致（七挡），
 // 不自造。每款模型实际支持哪几挡由 pi-ai 目录元数据决定（见
 // lib/model-providers.ts 的 supportedThinkingLevels），这里只管词表合法性。
-export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
-export function isThinkingLevel(value) {
-	return typeof value === "string" && THINKING_LEVELS.includes(value);
+export function isThinkingLevel(value: unknown): value is ThinkingLevel {
+	return typeof value === "string" && (THINKING_LEVELS as readonly string[]).includes(value);
 }
 
 // 部分更新：字段出现才改；apiKey 传空字符串表示清除已保存的 Key。
 // provider 是服务商归属标记（目录 id，见 lib/model-providers.ts）；合法性由
 // server 路由校验，本函数只落盘字符串。旧文件没有该字段，读回按 custom 处理。
 // thinkingLevel 同理：路由先校验词表，本函数只落盘；旧文件无此字段，读回按 off。
-export function saveModelSettingsFile(patch) {
+export function saveModelSettingsFile(patch: ModelSettings): ModelSettings {
 	const next = { ...readModelSettingsFile() };
 	if (patch.provider !== undefined) next.provider = String(patch.provider).trim();
 	if (patch.baseUrl !== undefined) next.baseUrl = String(patch.baseUrl).trim();
@@ -68,7 +110,7 @@ const PROFILE_SETTINGS_FILE = join(DATA_DIR, "settings-profile.json");
 export const DEFAULT_TIMEZONE = "Asia/Hong_Kong";
 
 // IANA 时区合法性：以 Intl 试构造为准（与 lib/schedule.ts 的实际用法同一判据）。
-export function isValidTimezone(timezone) {
+export function isValidTimezone(timezone: unknown): boolean {
 	if (typeof timezone !== "string" || !timezone) return false;
 	try {
 		new Intl.DateTimeFormat(undefined, { timeZone: timezone });
@@ -79,14 +121,14 @@ export function isValidTimezone(timezone) {
 }
 
 // 手改文件写入的非法时区只提示一次（按坏值去重），避免每次读设置都刷日志。
-const warnedBadTimezones = new Set();
+const warnedBadTimezones = new Set<string>();
 
-export function readProfileSettings() {
-	let saved = {};
+export function readProfileSettings(): ProfileSettings {
+	let saved: { displayName?: unknown; timezone?: unknown } = {};
 	if (existsSync(PROFILE_SETTINGS_FILE)) {
 		try {
-			const parsed = JSON.parse(readFileSync(PROFILE_SETTINGS_FILE, "utf8"));
-			if (parsed && typeof parsed === "object") saved = parsed;
+			const parsed: unknown = JSON.parse(readFileSync(PROFILE_SETTINGS_FILE, "utf8"));
+			if (parsed && typeof parsed === "object") saved = parsed as { displayName?: unknown; timezone?: unknown };
 		} catch {
 			saved = {};
 		}
@@ -110,15 +152,13 @@ export function readProfileSettings() {
 
 // 部分更新：字段出现才改。时区传空串视为恢复缺省；非空时区必须合法，非法抛 400
 // 且不写文件——错别字不能落盘，更不能让常驻进程下次启动时崩在坏时区上（审计 B3）。
-export function saveProfileSettings(patch) {
-	const next = { ...readProfileSettings() };
+export function saveProfileSettings(patch: { displayName?: unknown; timezone?: unknown }): ProfileSettings {
+	const next: ProfileSettings = { ...readProfileSettings() };
 	if (patch.displayName !== undefined) next.displayName = String(patch.displayName).trim().slice(0, 40);
 	if (patch.timezone !== undefined) {
 		const tz = String(patch.timezone).trim();
 		if (tz && !isValidTimezone(tz)) {
-			const err = new Error(`时区无效："${tz}" 不是合法的 IANA 时区名，未保存`);
-			err.status = 400;
-			throw err;
+			throw Object.assign(new Error(`时区无效："${tz}" 不是合法的 IANA 时区名，未保存`), { status: 400 });
 		}
 		next.timezone = tz || DEFAULT_TIMEZONE;
 	}
@@ -130,18 +170,18 @@ export function saveProfileSettings(patch) {
 
 const GITHUB_SETTINGS_FILE = join(DATA_DIR, "settings-github.json");
 
-export function readGithubSettingsFile() {
+export function readGithubSettingsFile(): GithubSettings {
 	if (!existsSync(GITHUB_SETTINGS_FILE)) return {};
 	try {
-		const parsed = JSON.parse(readFileSync(GITHUB_SETTINGS_FILE, "utf8"));
-		return parsed && typeof parsed === "object" ? parsed : {};
+		const parsed: unknown = JSON.parse(readFileSync(GITHUB_SETTINGS_FILE, "utf8"));
+		return parsed && typeof parsed === "object" ? (parsed as GithubSettings) : {};
 	} catch {
 		return {};
 	}
 }
 
 // token 传空字符串表示清除已保存的令牌。
-export function saveGithubSettingsFile(patch) {
+export function saveGithubSettingsFile(patch: GithubSettings): GithubSettings {
 	const next = { ...readGithubSettingsFile() };
 	if (patch.token !== undefined) {
 		if (patch.token) next.token = String(patch.token);
@@ -153,7 +193,7 @@ export function saveGithubSettingsFile(patch) {
 
 // GitHub 令牌的唯一读取入口：设置文件优先，缺失时回退 GITHUB_TOKEN 环境变量。
 // scan、（后续）网关写调用都只能经这里取令牌，不许再有第二套入口。
-export function githubToken() {
+export function githubToken(): string {
 	return readGithubSettingsFile().token || process.env.GITHUB_TOKEN || "";
 }
 
@@ -161,18 +201,18 @@ export function githubToken() {
 
 const WEB_SETTINGS_FILE = join(DATA_DIR, "settings-web.json");
 
-export function readWebSettingsFile() {
+export function readWebSettingsFile(): WebSettings {
 	if (!existsSync(WEB_SETTINGS_FILE)) return {};
 	try {
-		const parsed = JSON.parse(readFileSync(WEB_SETTINGS_FILE, "utf8"));
-		return parsed && typeof parsed === "object" ? parsed : {};
+		const parsed: unknown = JSON.parse(readFileSync(WEB_SETTINGS_FILE, "utf8"));
+		return parsed && typeof parsed === "object" ? (parsed as WebSettings) : {};
 	} catch {
 		return {};
 	}
 }
 
 // 部分更新：字段出现才改；searchApiKey 传空字符串表示清除已保存的密钥。
-export function saveWebSettingsFile(patch) {
+export function saveWebSettingsFile(patch: WebSettings): WebSettings {
 	const next = { ...readWebSettingsFile() };
 	if (patch.fetchEnabled !== undefined) next.fetchEnabled = Boolean(patch.fetchEnabled);
 	if (patch.searchEndpoint !== undefined) next.searchEndpoint = String(patch.searchEndpoint).trim();
@@ -184,12 +224,12 @@ export function saveWebSettingsFile(patch) {
 	return next;
 }
 
-export function webFetchEnabled() {
+export function webFetchEnabled(): boolean {
 	return readWebSettingsFile().fetchEnabled === true;
 }
 
 // 搜索配置：端点与密钥都齐才算可用，缺一即未配置（工具不注册、对话里如实说没有）。
-export function webSearchConfig() {
+export function webSearchConfig(): { endpoint: string; apiKey: string } | null {
 	const saved = readWebSettingsFile();
 	const endpoint = typeof saved.searchEndpoint === "string" ? saved.searchEndpoint.trim() : "";
 	const apiKey = typeof saved.searchApiKey === "string" ? saved.searchApiKey : "";
@@ -199,7 +239,7 @@ export function webSearchConfig() {
 
 // 网页查询的可用范围：默认只有主 bot；其他 bot 须在自己的 tools 里声明
 // web.fetch / web.search 才进范围。连接器卡的 bots 与内核注册工具都用这一份。
-export function webToolBots() {
+export function webToolBots(): string[] {
 	const declared = listBots()
 		.filter((b) => (b.tools ?? []).some((t) => t === "web.fetch" || t === "web.search" || t.startsWith("web.")))
 		.map((b) => b.id);
@@ -209,7 +249,7 @@ export function webToolBots() {
 // 连接器统一形状：id / name / purpose / status(placeholder|unconfigured|connected) /
 // statusNote（点开看的口径）/ bots（可用范围）/ access（读写级别）/ configurable。
 // tokenHint 只出现在 GitHub 卡上，且只有末四位掩码。
-export function listConnectors() {
+export function listConnectors(): Connector[] {
 	const token = githubToken();
 	const web = { fetchEnabled: webFetchEnabled(), search: webSearchConfig() };
 	const githubBots = listBots()

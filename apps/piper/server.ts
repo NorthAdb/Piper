@@ -65,6 +65,7 @@
 // error {code, message} code=MODEL_NOT_CONFIGURED 时 message 明确写「未配置模型」
 // done {botId} 本轮结束
 import { createServer} from "node:http";
+import type { IncomingMessage, ServerResponse} from "node:http";
 import { randomBytes} from "node:crypto";
 import { existsSync, readFileSync} from "node:fs";
 import { join, extname} from "node:path";
@@ -89,6 +90,10 @@ readArtifact,
 readBotMemory,
 } from "./lib/store.js";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.js";
+import type { ChatEvent} from "./lib/kernel.js";
+import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.js";
+import type { Finding} from "./lib/findings.js";
+import type { ModelSettings} from "./lib/settings.js";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.js";
 import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.js";
 import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.js";
@@ -108,9 +113,9 @@ const TOKEN = process.env.PIPER_TOKEN || DEFAULT_TOKEN;
 // 显式 PIPER_TOKEN=piper-dev 都算默认口令——只看变量有没有设会让显式写出默认值
 // 的部署绕过下面的非回环拒启。
 const USING_DEFAULT_TOKEN = TOKEN === DEFAULT_TOKEN;
-const sessions = new Set();
+const sessions = new Set<string>();
 
-function isLoopbackHost(host) {
+function isLoopbackHost(host: string): boolean {
 return host === "127.0.0.1" || host === "::1" || host === "localhost";
 }
 
@@ -124,17 +129,17 @@ process.exit(1);
 // 常驻进程底线（R3）：未处理的 Promise 拒绝只记日志、不退出——调度 tick、扫描等
 // 后台路径的一次异常不该把整个服务带走。同步异常仍走各路径自己的 try/catch。
 process.on("unhandledRejection", (err) => {
-console.error(`[piper] unhandledRejection（已记录，进程继续运行）：${err?.stack ?? err}`);
+console.error(`[piper] unhandledRejection（已记录，进程继续运行）：${(err as { stack?: string } | null | undefined)?.stack ?? err}`);
 });
 
 // 登录限速（R2）：同一来源连续错口令超过 10 次后锁定 60 秒，锁定期间一律 429；
 // 登录成功清零计数。来源以 TCP 对端地址计（单用户单进程，内存态即可）。
-const loginAttempts = new Map();
-function loginLocked(source) {
+const loginAttempts = new Map<string, { fails: number; lockedUntil: number }>();
+function loginLocked(source: string): boolean {
 const entry = loginAttempts.get(source);
 return Boolean(entry && entry.lockedUntil > Date.now());
 }
-function noteLoginFailure(source) {
+function noteLoginFailure(source: string): void {
 const entry = loginAttempts.get(source) || { fails: 0, lockedUntil: 0 };
 entry.fails += 1;
 if (entry.fails > 10) entry.lockedUntil = Date.now() + 60 * 1000;
@@ -145,7 +150,7 @@ loginAttempts.set(source, entry);
 // Host 同源（不符 403）；Content-Type 必须是 application/json（不符 415）。
 // 无 Origin 的非浏览器客户端（curl、脚本、回归）不受影响。
 const WRITE_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
-function writeGuardViolation(req) {
+function writeGuardViolation(req: IncomingMessage): { status: number; error: string } | null {
 const origin = req.headers.origin;
 if (origin) {
 let originHost = null;
@@ -165,11 +170,11 @@ ensureData();
 
 // 双进程防护（R10）：同一数据目录只允许一个服务进程（锁在 lib/store.ts）。
 // 已有存活进程时拒绝启动；持有者退出（含信号）时释放，陈旧锁自动接管。
-let releaseDataLock;
+let releaseDataLock: () => void;
 try {
 releaseDataLock = acquireDataLock();
 } catch (err) {
-console.error(`拒绝启动：${err.message}`);
+console.error(`拒绝启动：${(err as Error).message}`);
 process.exit(1);
 }
 process.on("exit", () => releaseDataLock());
@@ -188,14 +193,14 @@ const recovered = recoverInterruptedExecutions({ olderThanMs: 0 });
 if (recovered > 0) console.log(`[piper] 启动恢复：${recovered} 条卡在 executing 的 Finding 已退回 approved（审计 failed/interrupted）`);
 }
 
-function sendJson(res, status, obj) {
+function sendJson(res: ServerResponse, status: number, obj: unknown): void {
 const body = JSON.stringify(obj);
 res.writeHead(status, { "Content-Type": "application/json; charset=utf-8"});
 res.end(body);
 }
 
-function parseCookies(req) {
-const out = {};
+function parseCookies(req: IncomingMessage): Record<string, string> {
+const out: Record<string, string> = {};
 for (const part of String(req.headers.cookie || "").split(";")) {
 const i = part.indexOf("=");
 if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
@@ -203,14 +208,15 @@ if (i > 0) out[part.slice(0, i).trim()] = part.slice(i + 1).trim();
 return out;
 }
 
-function isAuthed(req) {
+function isAuthed(req: IncomingMessage): boolean {
 const cookie = parseCookies(req).piper_session;
 if (cookie && sessions.has(cookie)) return true;
 return req.headers.authorization === `Bearer ${TOKEN}`;
 }
 
-async function readBody(req) {
-const chunks = [];
+// 请求体是 wire 边界：解析结果以 any 交给各路由逐字段校验（全仓统一口径）。
+async function readBody(req: IncomingMessage): Promise<any> {
+const chunks: Buffer[] = [];
 for await (const c of req) chunks.push(c);
 const raw = Buffer.concat(chunks).toString("utf8");
 return raw? JSON.parse(raw): {};
@@ -234,12 +240,12 @@ thinkingLevels: await thinkingLevelsFor(provider, cfg.modelId),
 };
 }
 
-function sse(res) {
+function sse(res: ServerResponse): (event: string, data: unknown) => boolean {
 res.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive"});
 return (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
 }
 
-async function handleChat(req, res) {
+async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
 const { botId, message} = await readBody(req);
 const bot = getBot(String(botId || ""));
 if (!bot) return sendJson(res, 404, { error: "bot 不存在"});
@@ -256,12 +262,13 @@ appendSession(bot.id, { role: "system", kind: "draft", text: `生成 Bot 草案�
 emit("system", { kind: "draft", text: `已按你的描述生成 Bot 草案卡（来源：${draft.source === "model"? "模型抽取": "规则兜底"}），确认后才会创建。`});
 emit("draft", { draft});
 emit("done", { botId: bot.id});
-return res.end();
+res.end();
+return;
 }
 
 // 工具调用落盘前的深脱敏：会话 JSONL 是秘密禁入面，appendSession 只脱 text 字段，
 // tool 条目的 args/result 是结构化字段，落盘前逐个字符串过 redact()（复用统一出口）。
-function redactDeep(value) {
+function redactDeep(value: unknown): unknown {
 if (typeof value === "string") return redact(value);
 if (Array.isArray(value)) return value.map(redactDeep);
 if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
@@ -271,7 +278,7 @@ return value;
 // 本轮的思考段与工具条目共用一个递增 seq：条目定型时按事件发生顺序领号，
 // 回合结束按 seq 排序一并落盘，前端刷新回来据此还原与直播一致的交错顺序。
 let leadSeq = 0;
-const leadThinkingEntries = [];
+const leadThinkingEntries: SessionEntry[] = [];
 
 // 本轮工具调用按 toolCallId 收集：直播事件只透传不落盘，回合结束时把最终态逐条写进
 // 会话流水、排在 assistant（或 error）条目之前，前端刷新/切 bot 回来据此还原工具卡。
@@ -280,15 +287,26 @@ const leadThinkingEntries = [];
 // （call 阶段）的时刻，startedAt 是 start 阶段（工具开始执行）的时刻，
 // endedAt 是 end 阶段的时刻；落盘时在 persistLead 里定型为
 // startedAt/endedAt/durationMs（缺失回落口径见那里）。
-const toolCalls = new Map();
-const collectTool = (e) => {
+interface ToolRec {
+toolCallId: string;
+name: string;
+args: unknown;
+status: string;
+result: unknown;
+seq: number | undefined;
+firstSeenAt: number | undefined;
+startedAt: number | undefined;
+endedAt: number | undefined;
+}
+const toolCalls = new Map<string, ToolRec>();
+const collectTool = (e: ChatEvent & { type: "tool" }): void => {
 const id = e.toolCallId || `${e.name}:${toolCalls.size}`;
-const rec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined, firstSeenAt: undefined, startedAt: undefined, endedAt: undefined };
+const rec: ToolRec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined, firstSeenAt: undefined, startedAt: undefined, endedAt: undefined };
 if (rec.firstSeenAt === undefined) rec.firstSeenAt = Date.now();
 if (e.name) rec.name = e.name;
 if (e.phase === "start" && rec.startedAt === undefined) rec.startedAt = Date.now();
 if (e.phase === "end") {
-rec.status = e.detail?.isError ? "error" : "complete";
+rec.status = (e.detail as { isError?: unknown } | null | undefined)?.isError ? "error" : "complete";
 rec.result = e.detail ?? null;
 rec.endedAt = Date.now();
 if (rec.seq === undefined) rec.seq = leadSeq++;
@@ -308,9 +326,9 @@ toolCalls.set(id, rec);
 // 秘密禁入面）。思考不回喂模型（kernel 的 toPiMessages 只取 user/assistant
 // 条目）。旧落盘形状（整轮一条、无 seq/durationMs/level）由前端读回兼容。
 const THINKING_PERSIST_MAX_CHARS = 16_000;
-let openSeg = null;
+let openSeg: { text: string; startedAt: number; level: string; index: number } | null = null;
 let segIndex = 0;
-const closeThinkingSeg = () => {
+const closeThinkingSeg = (): void => {
 if (!openSeg) return;
 const seg = openSeg;
 openSeg = null;
@@ -330,9 +348,9 @@ sessionId,
 
 // 回合收尾落盘：先关掉仍开着的思考段，再把思考段与工具条目按 seq 合并排序
 // 逐条写进会话流水（排在 assistant 或 error 条目之前）。
-const persistLead = () => {
+const persistLead = (): void => {
 closeThinkingSeg();
-const toolEntries = [];
+const toolEntries: SessionEntry[] = [];
 for (const rec of toolCalls.values()) {
 if (rec.seq === undefined) rec.seq = leadSeq++;
 // 轨迹时间定型（PR-D）：endedAt 取 end 事件时刻；回合结束仍无 end 的中断
@@ -356,7 +374,7 @@ durationMs: Math.max(0, endedAt - startedAt),
 sessionId,
 });
 }
-for (const entry of [...leadThinkingEntries, ...toolEntries].sort((a, b) => a.seq - b.seq)) {
+for (const entry of [...leadThinkingEntries, ...toolEntries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
 appendSession(bot.id, entry);
 }
 };
@@ -394,9 +412,10 @@ appendSession(bot.id, { role: "assistant", text, sessionId});
 persistLead();
 // 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
 // 这里是其余错误路径的兜底出口。
-const safeMessage = redact(String(err?.message?? err)).slice(0, 300);
-appendSession(bot.id, { role: "system", kind: "error", text: safeMessage, code: err.code?? "ERROR"});
-emit("error", { code: err.code?? "ERROR", message: safeMessage});
+const e = err as { message?: unknown; code?: string } | null | undefined;
+const safeMessage = redact(String(e?.message?? err)).slice(0, 300);
+appendSession(bot.id, { role: "system", kind: "error", text: safeMessage, code: e?.code?? "ERROR"});
+emit("error", { code: e?.code?? "ERROR", message: safeMessage});
 }
 emit("done", { botId: bot.id});
 res.end();
@@ -408,7 +427,17 @@ res.end();
 // 意料外抛错同样记 failed + 通知后把错误回传（手动路由保持原 500 行为）。
 let scanInFlight = false;
 
-async function executeMorningScan() {
+interface MorningScanResult {
+skipped?: boolean;
+failed?: boolean;
+partial?: boolean;
+artifact?: ArtifactMeta;
+report?: string;
+findings?: Finding[];
+error?: unknown;
+}
+
+async function executeMorningScan(): Promise<MorningScanResult> {
 if (scanInFlight) return { skipped: true};
 scanInFlight = true;
 // 过期清理的显式触发点之一（R10）：扫描开始前把已过期的 open Finding 转 expired
@@ -416,7 +445,7 @@ scanInFlight = true;
 try {
 sweepExpiredFindings();
 } catch (err) {
-console.error(`[piper] 扫描前过期清理失败（继续扫描）：${err?.message ?? err}`);
+console.error(`[piper] 扫描前过期清理失败（继续扫描）：${(err as { message?: unknown } | null | undefined)?.message ?? err}`);
 }
 try {
 const routine = listRoutines().find((r) => r.id === "morning-scan");
@@ -448,7 +477,7 @@ if (bot) appendSession(bot.id, { role: "system", kind: "routine", text: `晨间�
 return { failed: false, artifact, report, findings};
 } catch (err) {
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastStatus: "failed"});
-addNotification({ type: "routine.failed", title: `${routineName}失败`, body: String(err.message?? err), routineId: "morning-scan"});
+addNotification({ type: "routine.failed", title: `${routineName}失败`, body: String((err as Error).message?? err), routineId: "morning-scan"});
 return { failed: true, error: err};
 }
 } finally {
@@ -458,7 +487,7 @@ scanInFlight = false;
 
 // ---------- 定时调度（P1-4）：进程内，启动时迁移旧版 schedule 文本并装配 ----------
 
-function morningRoutine() {
+function morningRoutine(): Routine | null {
 return listRoutines().find((r) => r.id === "morning-scan")?? null;
 }
 
@@ -477,19 +506,21 @@ return result.skipped? "skipped": result.failed? "failed": "ok";
 },
 getRoutineState: () => morningRoutine()?? {},
 timezoneFn: () => profileTimezone(),
-timeFn: () => parseScheduleTime(morningRoutine()?.schedule)?? parseScheduleTime("08:00"),
+// "08:00" 恒可解析（与 lib/schedule.ts migrate 的兜底同口径），字面量仅为类型完备。
+timeFn: () => parseScheduleTime(morningRoutine()?.schedule)?? { hour: 8, minute: 0 },
 // 调度自身异常（如时区换算失败）不杀进程：记日志并落一条 routine.failed 通知（R3）。
 onError: (err) => {
-console.error(`[piper] 调度 tick 异常（已拦截，进程继续运行）：${err?.stack ?? err}`);
-addNotification({ type: "routine.failed", title: "晨间仓库扫描调度异常", body: String(err?.message?? err), routineId: "morning-scan"});
+const e = err as { stack?: string; message?: unknown } | null | undefined;
+console.error(`[piper] 调度 tick 异常（已拦截，进程继续运行）：${e?.stack ?? err}`);
+addNotification({ type: "routine.failed", title: "晨间仓库扫描调度异常", body: String(e?.message?? err), routineId: "morning-scan"});
 },
 });
 
 const server = createServer(async (req, res) => {
-const url = new URL(req.url, `http://${req.headers.host}`);
+const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
 const path = url.pathname;
 try {
-if (path.startsWith("/api/") && WRITE_METHODS.has(req.method)) {
+if (path.startsWith("/api/") && WRITE_METHODS.has(req.method ?? "")) {
 const violation = writeGuardViolation(req);
 if (violation) return sendJson(res, violation.status, { error: violation.error});
 }
@@ -517,7 +548,7 @@ if (path === "/api/model-providers" && req.method === "GET") return sendJson(res
 if (path === "/api/settings/model" && req.method === "GET") return sendJson(res, 200, await modelSettingsView());
 if (path === "/api/settings/model" && req.method === "PUT") {
 const body = await readBody(req);
-const patch = {};
+const patch: ModelSettings = {};
 if (body.provider !== undefined) {
 if (typeof body.provider !== "string" || !(await isKnownModelProvider(body.provider))) return sendJson(res, 400, { error: `未知服务商：${String(body.provider)}（须为服务商目录中的 id）`});
 patch.provider = body.provider;
@@ -540,7 +571,7 @@ const hasApiKey = typeof body.apiKey === "string" && Boolean(body.apiKey);
 // 指定的地址，等于一个现成的 Key 外送口。baseUrl 本身也只许 http/https。
 if (hasBaseUrl && !hasApiKey) return sendJson(res, 400, { error: "指定 baseUrl 时必须同时提供 apiKey（不会把已保存的 Key 发往请求体给定的地址）"});
 if (hasBaseUrl && !/^https?:\/\//i.test(body.baseUrl.trim())) return sendJson(res, 400, { error: "baseUrl 必须是 http/https 地址"});
-const overrides = {};
+const overrides: { apiKey?: string; baseUrl?: string; modelId?: string } = {};
 if (hasBaseUrl) overrides.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string" && body.modelId) overrides.modelId = body.modelId;
 if (hasApiKey) overrides.apiKey = body.apiKey;
@@ -557,7 +588,7 @@ if (!apiKey) {
 // 配置的 baseUrl 完全一致（忽略末尾斜杠）——否则等于把已保存 Key 发往请求体
 // 另给的地址。不满足回 400，且不发出任何上游请求。
 const saved = readModelSettingsFile();
-const norm = (u) => String(u ?? "").trim().replace(/\/+$/, "");
+const norm = (u: unknown) => String(u ?? "").trim().replace(/\/+$/, "");
 if (!saved.apiKey || norm(saved.baseUrl) !== norm(baseUrl)) {
 return sendJson(res, 400, { error: "未提供 apiKey，且端点与已保存配置不一致：不会把已保存的 Key 发往该地址，请填入 API Key 后再拉取"});
 }
@@ -579,7 +610,7 @@ const body = await readBody(req);
 // 搜索端点只许 http/https（与 R7 模型端点同一口径）：非法直接 400，不落盘。
 if (body.searchEndpoint!== undefined && typeof body.searchEndpoint!== "string") return sendJson(res, 400, { error: "searchEndpoint 须为字符串"});
 if (typeof body.searchEndpoint === "string" && body.searchEndpoint.trim()) {
-let parsed;
+let parsed: URL;
 try { parsed = new URL(body.searchEndpoint.trim()); } catch { return sendJson(res, 400, { error: "searchEndpoint 不是合法 URL"}); }
 if (parsed.protocol!== "http:" && parsed.protocol!== "https:") return sendJson(res, 400, { error: "searchEndpoint 只支持 http/https"});
 }
@@ -620,7 +651,7 @@ return sendJson(res, 200, { markdown: writeAboutMe(body.markdown)});
 if (path === "/api/settings/profile" && req.method === "GET") return sendJson(res, 200, readProfileSettings());
 if (path === "/api/settings/profile" && req.method === "PUT") {
 const body = await readBody(req);
-const patch = {};
+const patch: { displayName?: string; timezone?: string } = {};
 if (typeof body.displayName === "string") patch.displayName = body.displayName;
 if (typeof body.timezone === "string") patch.timezone = body.timezone;
 return sendJson(res, 200, saveProfileSettings(patch));
@@ -632,7 +663,7 @@ const status = scheduler.status(new Date());
 return sendJson(res, 200, {
 routines: listRoutines().map((r) => {
 if (r.id!== "morning-scan") return r;
-const time = parseScheduleTime(r.schedule)?? parseScheduleTime("08:00");
+const time = parseScheduleTime(r.schedule)?? { hour: 8, minute: 0 };
 return { ...r, scheduleText: formatScheduleText(time, tz), nextRunAt: status.nextRunAt};
 }),
 });
@@ -679,8 +710,8 @@ const findingId = url.searchParams.get("findingId");
 return sendJson(res, 200, { records: listAudit(findingId? { findingId}: {})});
 }
 if (path === "/api/findings" && req.method === "GET") {
-const filters = {};
-for (const key of ["status", "repo", "botId"]) {
+const filters: { status?: string; repo?: string; botId?: string } = {};
+for (const key of ["status", "repo", "botId"] as const) {
 const v = url.searchParams.get(key);
 if (v) filters[key] = v;
 }
@@ -701,11 +732,12 @@ return sendJson(res, 404, { error: "接口不存在"});
 // 静态：单页前端
 const file = path === "/"? join(APP_DIR, "public", "index.html"): join(APP_DIR, "public", path);
 if (!file.startsWith(join(APP_DIR, "public")) ||!existsSync(file)) return sendJson(res, 404, { error: "not found"});
-const types = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript"};
+const types: Record<string, string> = { ".html": "text/html; charset=utf-8", ".css": "text/css", ".js": "text/javascript"};
 res.writeHead(200, { "Content-Type": types[extname(file)] || "application/octet-stream"});
 return res.end(readFileSync(file));
 } catch (err) {
-return sendJson(res, err.status || 500, { error: redact(String(err?.message?? err))});
+const e = err as { status?: number; message?: unknown } | null | undefined;
+return sendJson(res, e?.status || 500, { error: redact(String(e?.message?? err))});
 }
 });
 
@@ -718,14 +750,14 @@ const timer = setInterval(() => {
 try {
 sweepExpiredFindings();
 } catch (err) {
-console.error(`[piper] 过期清理失败（下个周期重试）：${err?.message ?? err}`);
+console.error(`[piper] 过期清理失败（下个周期重试）：${(err as { message?: unknown } | null | undefined)?.message ?? err}`);
 }
 // executing 超时恢复（F1）：运行中进程自身异常残留的 executing 超过阈值同样退回。
 try {
 const recovered = recoverInterruptedExecutions();
 if (recovered > 0) console.log(`[piper] 周期恢复：${recovered} 条超时的 executing Finding 已退回 approved（审计 failed/interrupted）`);
 } catch (err) {
-console.error(`[piper] executing 恢复失败（下个周期重试）：${err?.message ?? err}`);
+console.error(`[piper] executing 恢复失败（下个周期重试）：${(err as { message?: unknown } | null | undefined)?.message ?? err}`);
 }
 void scheduler.tick(new Date());
 }, 30 * 1000);

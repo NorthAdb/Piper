@@ -8,14 +8,107 @@
 //   routines.json             routine 定义 + 上次运行结果
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import type { WriteFileOptions } from "node:fs";
 import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redact } from "./redact.js";
 
+// ---------- 共享数据形状（落盘 JSON 的属主口径，其他模块一律引用这里） ----------
+
+export interface Bot {
+	id: string;
+	name: string;
+	systemPrompt: string;
+	tools: string[];
+	memoryScope: string;
+	repos: string[];
+	routines: string[];
+	isMain: boolean;
+	canManageBots: boolean;
+	createdAt: string;
+}
+
+// 建 bot 入参：来自请求体（wire 输入），字段在 createBot 内逐个收窄，
+// 这里只钉住「可能出现哪些键」。
+export interface BotInput {
+	id?: string;
+	name?: unknown;
+	systemPrompt?: unknown;
+	tools?: unknown;
+	memoryScope?: unknown;
+	repos?: unknown;
+	routines?: unknown;
+	canManageBots?: unknown;
+}
+
+export interface BotPatch {
+	name?: string;
+	systemPrompt?: string;
+	tools?: string[];
+	memoryScope?: string;
+	repos?: string[];
+	routines?: string[];
+	canManageBots?: boolean;
+}
+
+export interface Routine {
+	id: string;
+	botId: string;
+	name: string;
+	description: string;
+	schedule: string;
+	scheduleText: string;
+	lastRunAt: string | null;
+	lastArtifactId: string | null;
+	lastStatus: string | null;
+	[key: string]: unknown;
+}
+
+// 会话流水条目：一行一条 JSON。已知字段逐个钉住，其余（system 条目的
+// 结构化载荷等）经索引签名保留，与 appendSession 的透传语义一致。
+export interface SessionEntry {
+	role: string;
+	text?: string;
+	kind?: string;
+	code?: string;
+	sessionId?: string;
+	draft?: unknown;
+	toolCallId?: string;
+	name?: string;
+	args?: unknown;
+	result?: unknown;
+	status?: string;
+	seq?: number;
+	startedAt?: number;
+	endedAt?: number;
+	durationMs?: number;
+	level?: string;
+	truncated?: boolean;
+	ts?: string;
+	[key: string]: unknown;
+}
+
+export interface ArtifactMeta {
+	id: string;
+	botId: string | null;
+	kind: string;
+	title: string;
+	createdAt: string | null;
+}
+
+export interface ArtifactDetail {
+	id: string;
+	body: string;
+	botId?: string | null;
+	kind?: string;
+	title?: string;
+	createdAt?: string | null;
+}
+
 // 应用根目录（apps/piper）：本文件在源码布局下位于 lib/、构建后位于 dist/lib/，
 // 两处到应用根的层数不同，固定层数推导必然有一处错位——改为从本文件目录向上
 // 逐级找 package.json 所在目录（apps/piper/package.json 先于仓库根命中）。
-function findAppDir() {
+function findAppDir(): string {
 	let dir = dirname(fileURLToPath(import.meta.url));
 	for (;;) {
 		if (existsSync(join(dir, "package.json"))) return dir;
@@ -32,7 +125,7 @@ const BOTS_FILE = join(DATA_DIR, "bots.json");
 const ROUTINES_FILE = join(DATA_DIR, "routines.json");
 const ABOUT_ME_FILE = join(DATA_DIR, "about-me.md");
 
-const SEED_BOTS = [
+const SEED_BOTS: Bot[] = [
 	{
 		id: "piper-main",
 		name: "Piper",
@@ -61,7 +154,7 @@ const SEED_BOTS = [
 	},
 ];
 
-const SEED_ROUTINES = [
+const SEED_ROUTINES: Routine[] = [
 	{
 		id: "morning-scan",
 		botId: "repo-keeper",
@@ -83,27 +176,28 @@ const SEED_ABOUT_ME = `# 关于我
 - 作息：待补充。
 `;
 
-function ensureDir(p) {
+function ensureDir(p: string): void {
 	mkdirSync(p, { recursive: true });
 }
 
-function readJson(file, fallback) {
+function readJson<T>(file: string, fallback: T): T {
 	if (!existsSync(file)) return fallback;
 	try {
-		return JSON.parse(readFileSync(file, "utf8"));
+		// 落盘 JSON 是本进程自己写的属主数据，形状由调用方给出的 T 断言。
+		return JSON.parse(readFileSync(file, "utf8")) as T;
 	} catch {
 		return fallback;
 	}
 }
 
-function writeJson(file, data) {
+function writeJson(file: string, data: unknown): void {
 	writeFileSync(file, JSON.stringify(data, null, 2) + "\n", "utf8");
 }
 
 // 整表重写走临时文件 + rename（R10）：写一半进程崩溃不会留下截断的文件，读者要么
 // 看到旧内容、要么看到新内容（rename 在同一文件系统内是原子替换）。tmp 名带 pid，
 // 避免并发写者踩同一个临时文件。设置文件与 findings.jsonl 的整表重写都经这里。
-export function writeFileAtomicSync(file, content, options) {
+export function writeFileAtomicSync(file: string, content: string, options?: WriteFileOptions): void {
 	const tmp = `${file}.tmp-${process.pid}`;
 	writeFileSync(tmp, content, options);
 	renameSync(tmp, file);
@@ -115,23 +209,23 @@ export function writeFileAtomicSync(file, content, options) {
 // 只存持有者 pid；启动时若已有存活进程持有则拒绝启动，pid 不存在则视为陈旧锁接管。
 const LOCK_FILE = join(DATA_DIR, "piper.lock");
 
-function pidAlive(pid) {
+function pidAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
 		return true;
 	} catch (err) {
-		return err?.code === "EPERM";
+		return (err as NodeJS.ErrnoException | undefined)?.code === "EPERM";
 	}
 }
 
 // 抢锁成功返回释放函数（只删自己持有的锁）；已有存活进程时抛错，调用方拒绝启动。
-export function acquireDataLock() {
+export function acquireDataLock(): () => void {
 	ensureDir(DATA_DIR);
 	const writeOwn = () => writeFileSync(LOCK_FILE, `${process.pid}\n`, { flag: "wx" });
 	try {
 		writeOwn();
 	} catch (err) {
-		if (err?.code !== "EEXIST") throw err;
+		if ((err as NodeJS.ErrnoException | undefined)?.code !== "EEXIST") throw err;
 		let holder = NaN;
 		try {
 			holder = Number(readFileSync(LOCK_FILE, "utf8").trim());
@@ -157,11 +251,11 @@ export function acquireDataLock() {
 	};
 }
 
-export function botWorkspace(botId) {
+export function botWorkspace(botId: string): string {
 	return join(DATA_DIR, "workspaces", botId);
 }
 
-export function ensureData() {
+export function ensureData(): void {
 	ensureDir(DATA_DIR);
 	ensureDir(join(DATA_DIR, "workspaces"));
 	ensureDir(join(DATA_DIR, "sessions"));
@@ -174,21 +268,21 @@ export function ensureData() {
 
 // ---------- bots ----------
 
-export function listBots() {
-	const { bots } = readJson(BOTS_FILE, { bots: [] });
+export function listBots(): Bot[] {
+	const { bots } = readJson<{ bots: Bot[] }>(BOTS_FILE, { bots: [] });
 	// 主 bot 置顶，其余按创建时间
 	return [...bots].sort((a, b) => Number(b.isMain) - Number(a.isMain) || String(a.createdAt).localeCompare(String(b.createdAt)));
 }
 
-export function getBot(id) {
+export function getBot(id: string): Bot | null {
 	return listBots().find((b) => b.id === id) ?? null;
 }
 
-export function createBot(input) {
+export function createBot(input: BotInput): Bot {
 	const bots = listBots();
 	const id = input.id || `bot-${Date.now().toString(36)}`;
 	if (bots.some((b) => b.id === id)) throw Object.assign(new Error(`bot id 已存在: ${id}`), { status: 409 });
-	const bot = {
+	const bot: Bot = {
 		id,
 		name: String(input.name ?? "未命名 Bot").slice(0, 60),
 		systemPrompt: String(input.systemPrompt ?? ""),
@@ -205,7 +299,7 @@ export function createBot(input) {
 	return bot;
 }
 
-export function updateBot(id, patch) {
+export function updateBot(id: string, patch: BotPatch): Bot | null {
 	const bots = listBots();
 	const idx = bots.findIndex((b) => b.id === id);
 	if (idx < 0) return null;
@@ -227,7 +321,7 @@ export function updateBot(id, patch) {
 	return next;
 }
 
-export function deleteBot(id) {
+export function deleteBot(id: string): boolean {
 	const bots = listBots();
 	const bot = bots.find((b) => b.id === id);
 	if (!bot) return false;
@@ -242,13 +336,13 @@ export function deleteBot(id) {
 // 「关于我」会注入每一轮对话的 system prompt，体积必须有上限（L0-3）。
 export const ABOUT_ME_MAX_CHARS = 20000;
 
-export function readAboutMe() {
+export function readAboutMe(): string {
 	return existsSync(ABOUT_ME_FILE) ? readFileSync(ABOUT_ME_FILE, "utf8") : "";
 }
 
 // 写入唯一的 about-me.md（设置页、右栏记忆、对话注入三处同源，只此一份）。
 // 超限在落盘前拒绝，原文件不动；落盘走临时文件 + rename，避免写一半损坏。
-export function writeAboutMe(markdown) {
+export function writeAboutMe(markdown: unknown): string {
 	const text = String(markdown ?? "");
 	if (text.length > ABOUT_ME_MAX_CHARS) {
 		throw Object.assign(new Error(`「关于我」超过 ${ABOUT_ME_MAX_CHARS} 字符上限（当前 ${text.length}）`), { status: 413 });
@@ -262,11 +356,11 @@ export function writeAboutMe(markdown) {
 
 // ---------- sessions ----------
 
-function sessionFile(botId) {
+function sessionFile(botId: string): string {
 	return join(DATA_DIR, "sessions", `${botId}.jsonl`);
 }
 
-export function appendSession(botId, entry) {
+export function appendSession(botId: string, entry: SessionEntry): void {
 	ensureDir(join(DATA_DIR, "sessions"));
 	// 会话 JSONL 是秘密禁入面（切片共同约束）：text 落盘前统一脱敏（R7），厂商错误
 	// 回显 Key、用户误粘贴的令牌都不进流水。draft 等结构化字段不走文本脱敏。
@@ -274,7 +368,7 @@ export function appendSession(botId, entry) {
 	appendFileSync(sessionFile(botId), JSON.stringify({ ts: new Date().toISOString(), ...safe }) + "\n", "utf8");
 }
 
-export function readSession(botId) {
+export function readSession(botId: string): SessionEntry[] {
 	const file = sessionFile(botId);
 	if (!existsSync(file)) return [];
 	return readFileSync(file, "utf8")
@@ -287,16 +381,16 @@ export function readSession(botId) {
 				return null;
 			}
 		})
-		.filter(Boolean);
+		.filter((e): e is SessionEntry => Boolean(e));
 }
 
 // ---------- routines ----------
 
-export function listRoutines() {
-	return readJson(ROUTINES_FILE, { routines: [] }).routines;
+export function listRoutines(): Routine[] {
+	return readJson<{ routines: Routine[] }>(ROUTINES_FILE, { routines: [] }).routines;
 }
 
-export function updateRoutine(id, patch) {
+export function updateRoutine(id: string, patch: Partial<Routine>): Routine | null {
 	const routines = listRoutines();
 	const idx = routines.findIndex((r) => r.id === id);
 	if (idx < 0) return null;
@@ -307,7 +401,7 @@ export function updateRoutine(id, patch) {
 
 // ---------- artifacts ----------
 
-export function saveArtifact({ botId, kind, title, body }) {
+export function saveArtifact({ botId, kind, title, body }: { botId: string; kind: string; title?: unknown; body?: unknown }): ArtifactMeta {
 	ensureDir(join(DATA_DIR, "artifacts"));
 	const ts = new Date();
 	// id 的时间戳部分只有毫秒精度：同 kind 在同一毫秒连写会同 id 互相覆盖（第二轮
@@ -315,12 +409,12 @@ export function saveArtifact({ botId, kind, title, body }) {
 	// 日期与 kind 前缀不变，按 id 读取/引用的既有路径不受影响。
 	const id = `${ts.toISOString().slice(0, 10)}-${kind}-${ts.getTime().toString(36)}-${randomBytes(3).toString("hex")}`;
 	// 产物正文拼外部数据（GitHub 响应、错误原文等），落盘前统一脱敏（R7）。
-	const meta = { id, botId, kind, title: redact(String(title ?? "")), createdAt: ts.toISOString() };
+	const meta: ArtifactMeta = { id, botId, kind, title: redact(String(title ?? "")), createdAt: ts.toISOString() };
 	writeFileSync(join(DATA_DIR, "artifacts", `${id}.md`), `<!-- piper-artifact ${JSON.stringify(meta)} -->\n${redact(String(body ?? ""))}`, "utf8");
 	return meta;
 }
 
-export function listArtifacts() {
+export function listArtifacts(): ArtifactMeta[] {
 	const dir = join(DATA_DIR, "artifacts");
 	if (!existsSync(dir)) return [];
 	return readdirSync(dir)
@@ -340,7 +434,7 @@ export function listArtifacts() {
 		.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
-export function readArtifact(id) {
+export function readArtifact(id: string): ArtifactDetail | null {
 	if (!/^[\w.-]+$/.test(id)) return null;
 	const file = join(DATA_DIR, "artifacts", `${id}.md`);
 	if (!existsSync(file)) return null;
@@ -351,7 +445,7 @@ export function readArtifact(id) {
 
 // ---------- memory ----------
 
-export function readBotMemory(botId) {
+export function readBotMemory(botId: string): string {
 	const file = join(botWorkspace(botId), "memory.md");
 	return existsSync(file) ? readFileSync(file, "utf8") : "";
 }

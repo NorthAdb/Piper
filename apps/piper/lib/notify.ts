@@ -7,13 +7,26 @@ import { join } from "node:path";
 import { DATA_DIR, ensureData } from "./store.js";
 import { redact } from "./redact.js";
 
-export const NOTIFICATION_TYPES = ["routine.completed", "routine.failed", "approval.pending", "approval.executed", "approval.failed"];
+export const NOTIFICATION_TYPES = ["routine.completed", "routine.failed", "approval.pending", "approval.executed", "approval.failed"] as const;
+export type NotificationType = (typeof NOTIFICATION_TYPES)[number];
 
-function notificationsFile() {
+export interface NotificationEntry {
+	id: string;
+	type: string;
+	title: string;
+	body: string;
+	routineId: string | null;
+	artifactId: string | null;
+	findingId: string | null;
+	read: boolean;
+	createdAt: string;
+}
+
+function notificationsFile(): string {
 	return process.env.PIPER_NOTIFICATIONS_FILE || join(DATA_DIR, "notifications.jsonl");
 }
 
-function readAll() {
+function readAll(): NotificationEntry[] {
 	const file = notificationsFile();
 	if (!existsSync(file)) return [];
 	return readFileSync(file, "utf8")
@@ -26,12 +39,26 @@ function readAll() {
 				return null;
 			}
 		})
-		.filter(Boolean);
+		.filter((n): n is NotificationEntry => Boolean(n));
 }
 
-export function addNotification({ type, title, body = "", routineId = null, artifactId = null, findingId = null }) {
-	if (!NOTIFICATION_TYPES.includes(type)) throw new Error(`未知通知类型: ${type}`);
-	const entry = {
+export function addNotification({
+	type,
+	title,
+	body = "",
+	routineId = null,
+	artifactId = null,
+	findingId = null,
+}: {
+	type: string;
+	title: unknown;
+	body?: unknown;
+	routineId?: string | null;
+	artifactId?: string | null;
+	findingId?: string | null;
+}): NotificationEntry {
+	if (!(NOTIFICATION_TYPES as readonly string[]).includes(type)) throw new Error(`未知通知类型: ${type}`);
+	const entry: NotificationEntry = {
 		id: `n-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
 		type,
 		// 通知正文常拼外部错误原文，落盘前统一脱敏（R7，出口在 lib/redact.ts）。
@@ -49,16 +76,16 @@ export function addNotification({ type, title, body = "", routineId = null, arti
 }
 
 // 新在前
-export function listNotifications() {
+export function listNotifications(): NotificationEntry[] {
 	return readAll().sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
-export function countUnread() {
+export function countUnread(): number {
 	return readAll().filter((n) => !n.read).length;
 }
 
 // ids 给数组则只标记这些；不给（undefined）则全部标记已读。整表重写落盘，已读状态持久。
-export function markNotificationsRead(ids) {
+export function markNotificationsRead(ids?: unknown): number {
 	const all = readAll();
 	const wanted = Array.isArray(ids) ? new Set(ids.map(String)) : null;
 	let changed = 0;

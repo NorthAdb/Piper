@@ -24,20 +24,20 @@ export const REDACTED = "[REDACTED]";
 // 太短的值不做精确替换，避免把普通词误伤（前缀模式另有长度下限）。
 const MIN_EXACT_LENGTH = 6;
 
-const knownSecrets = new Set();
+const knownSecrets = new Set<string>();
 
-function readSettingsJson(name) {
+function readSettingsJson(name: string): Record<string, unknown> {
 	const file = join(DATA_DIR, name);
 	if (!existsSync(file)) return {};
 	try {
-		const parsed = JSON.parse(readFileSync(file, "utf8"));
-		return parsed && typeof parsed === "object" ? parsed : {};
+		const parsed: unknown = JSON.parse(readFileSync(file, "utf8"));
+		return parsed && typeof parsed === "object" ? (parsed as Record<string, unknown>) : {};
 	} catch {
 		return {};
 	}
 }
 
-function collectSecrets() {
+function collectSecrets(): Set<string> {
 	const model = readSettingsJson("settings-model.json");
 	if (typeof model.apiKey === "string" && model.apiKey.length >= MIN_EXACT_LENGTH) knownSecrets.add(model.apiKey);
 	const github = readSettingsJson("settings-github.json");
@@ -56,7 +56,7 @@ const SECRET_PATTERNS = [
 	/sk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{12,}/g,
 ];
 
-export function redact(text) {
+export function redact(text: unknown): string {
 	if (typeof text !== "string" || !text) return typeof text === "string" ? text : "";
 	let out = text;
 	// 长的先替换，避免短秘密是长秘密子串时留下残段。
@@ -70,7 +70,7 @@ export function redact(text) {
 // 结构化字段的深脱敏：逐个字符串过 redact()，非字符串原样保留。会话 tool
 // 条目的 args/result 落盘前在 server.ts 里有一份同口径的本地实现；轨迹接口
 // 出参（lib/trace.ts）用这一份，对老文件里未脱敏的结构化字段兜底。
-export function redactDeep(value) {
+export function redactDeep(value: unknown): unknown {
 	if (typeof value === "string") return redact(value);
 	if (Array.isArray(value)) return value.map(redactDeep);
 	if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
@@ -78,7 +78,7 @@ export function redactDeep(value) {
 }
 
 // 文本是否含秘密（精确值或前缀模式）——网关发送前检查用。
-export function containsSecret(text) {
+export function containsSecret(text: unknown): boolean {
 	if (typeof text !== "string" || !text) return false;
 	return redact(text) !== text;
 }
