@@ -1832,3 +1832,73 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
 - 明确不做：未改任何 API、SSE 事件、消息组装（model.ts /
   historyToMessages）、折叠展开与发送等交互语义；未动文案；
   未动左栏与右栏组件；未改 `packages/`；未加新依赖。
+
+### 轨迹数据层实测（2026-11-11，分支 feat/trace-data）
+
+纯数据层，为轨迹视图（PR-E）备数据：会话落盘补事件时刻 + 新增只读
+轨迹接口。不动前端、不改 SSE 事件名与既有接口形状。
+
+- 审计结论（动手前以代码为准）：会话 JSONL 条目种类为 user /
+  assistant / tool / thinking / system（system 带 kind 子类：draft /
+  bot-created / error / routine）。每条条目落盘时已被
+  `appendSession` 统一盖 `ts` 落盘戳（ISO 字符串，前端
+  `HistoryEntry.ts` 亦声明为 string）——所以本轮**不改 ts 的格式与
+  语义**，只新增事件时刻字段；轨迹接口负责把两类时间归一化为
+  epoch 毫秒输出。handleChat 的事件时序：tool 事件经 kernel 转发
+  call / start / end 三段，服务端在 onEvent 里同步可见；thinking
+  增量逐段到达、段在工具事件/正文 delta/回合结束时关闭。
+- 落盘新增字段（只增不改，既有字段语义不变）：
+
+  | 条目 | 新增字段 | 口径 |
+  |---|---|---|
+  | tool | `startedAt` / `endedAt` / `durationMs`（epoch 毫秒） | startedAt 取 start 阶段（工具开始执行）事件时刻，缺失回落首次观察时刻（call 阶段），再缺失回落 endedAt；endedAt 取 end 事件时刻；回合结束仍无 end 的中断调用（落盘 status=error）以收尾落盘时刻为 endedAt，即「至少持续到回合结束」；durationMs 恒为 endedAt − startedAt（不为负） |
+  | thinking | `startedAt`（epoch 毫秒） | 段首个 thinking 事件的时刻（段内计时原本已有内部值，本轮起落盘）；durationMs 原已落盘 |
+  | user / assistant / system | 无新增 | ts 落盘戳即收到/完成时刻，轨迹接口解析为毫秒 |
+
+- 轨迹接口：`GET /api/bots/:id/trace`（与会话读取
+  `GET /api/bots/:id/messages` 同风格，需登录，bot 不存在回 404
+  `{error:"bot 不存在"}`，与 `/api/memory/:botId` 同口径）。归一化在
+  `lib/trace.mjs` 的 `buildTrace`（纯函数，只读不回写）：
+
+  ```json
+  { "turns": [ {
+      "index": 0, "startedAt": 1794390000000, "endedAt": 1794390006500, "durationMs": 6500,
+      "events": [
+        { "kind": "user", "subKind": null, "ts": 1794390000000, "durationMs": null, "seq": null, "textChars": 12, "textPreview": "…" },
+        { "kind": "thinking", "subKind": null, "ts": 1794390001000, "durationMs": 1200, "seq": 0, "textChars": 30, "textPreview": "…", "level": "high", "truncated": false },
+        { "kind": "tool", "subKind": null, "ts": 1794390003000, "durationMs": 1500, "seq": 1, "textChars": null, "textPreview": null,
+          "name": "web_fetch", "status": "complete", "toolCallId": "call_…", "startedAt": 1794390003000, "endedAt": 1794390004500,
+          "args": { "url": "https://…" }, "result": { "isError": false, "status": 200 } },
+        { "kind": "assistant", "subKind": null, "ts": 1794390006500, "durationMs": null, "seq": null, "textChars": 42, "textPreview": "…" }
+      ] } ] }
+  ```
+
+  - 分组：一条 user 条目开启一轮，直到下一条 user 条目之前；首条
+    user 之前的条目（bot 创建确认、扫描播报等）自成一组（无 user
+    事件）。事件顺序为文件顺序（与 seq 一致），kind 取条目 role
+    原值，未知 role 原样映射；system 条目的 kind 子类放 `subKind`。
+  - 事件时刻 `ts`：tool 取 startedAt、thinking 取段首 startedAt，
+    缺失回落条目 ts；其余取条目 ts。轮 startedAt 取 user 事件的
+    ts（无 user 的组取首个有时刻的事件），endedAt 取本轮事件时刻
+    最大值，durationMs 两者可算且非负才给。
+  - 摘要字段：正文类（user/assistant/system/thinking 等带 text 的
+    条目）给 `textChars`（全文长度）与 `textPreview`（过 redact
+    脱敏后截断 200 字）；thinking 另带 level/truncated；tool 带
+    name/status/toolCallId/startedAt/endedAt 与 args/result（沿用
+    落盘的已脱敏版本，接口层再过一遍 redactDeep 兜底）。
+- 老文件兼容：无 ts 的极老条目、无时间字段的老 tool/thinking 条目
+  对应输出一律 null，不编造、不用文件 mtime 冒充；带 ISO 落盘戳的
+  条目解析为真实毫秒。读路径（trace 与 messages）不回写会话文件，
+  有测试钉住字节不变。
+- 测试：新增 `scripts/test-trace.mjs`（`npm run test:trace`，已进
+  聚合 `test` 链），24 条断言：buildTrace 分组/归一化/老形状容忍/
+  预览脱敏与截断（单元）+ 真 server 对话落盘时间字段与交错时序、
+  轨迹接口分轮结构、401/404、无会话文件回空 turns（子进程）+ 手工
+  种子老文件读出 null 且文件字节不变。先红 6/24 → 后绿 24/24
+  （红阶段唯一非预期项：第 15 条起初拿 repo-keeper 当空样本，但它
+  起服时会被调度补跑写 system 播报，改用新建 bot 后绿——属测试
+  样本修正，非实现问题）。聚合 `npm run test` 退出码 0，各套只增
+  不减；check、build:web 过；shots 全套不变全过。
+- 明确不做：未动前端（含 HistoryEntry 类型）；未改 SSE 事件名与
+  既有接口形状（轨迹为新增接口）；未改 `packages/`；未加新依赖；
+  未迁移 ts 落盘戳格式（ISO 字符串是存量契约，归一化在接口层）。
