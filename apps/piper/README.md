@@ -1597,3 +1597,78 @@ r10 22、webfetch 48、eval:scan 21、regression 72（全部不低于基线）�
 截图同轮字节抖动已还原。
 明确不做：未改 `packages/`、未改 SSE 事件类型名、未加新依赖、未动
 web 抓取安全口径与 8000 字注入上限、未动 thinkingLevel。
+
+### 思考链实测（2026-11-11，分支 feat/thinking-levels，堆叠在 feat/tool-cards-status 上）
+
+思考挡位与推理过程展示，全链照 Pi 自带 `/thinking` 选择器的做法，不
+自造挡位表：
+
+- **挡位来源**：词表是 pi-ai / pi-agent-core 统一的七挡
+  `off / minimal / low / medium / high / xhigh / max`。每款模型支持哪几
+  挡由 pi-ai 目录元数据决定，服务端在 `GET /api/model-providers` 的每个
+  模型条目上用 pi-ai 的 `getSupportedThinkingLevels(目录模型)` 现算后
+  下发（`supportedThinkingLevels`）；模型设置视图
+  （`GET /api/settings/model`）另带 `thinkingLevel`（当前选择）与当前
+  provider+模型名的挡位列表。实测目录值：`deepseek-flash` →
+  `[off, low, high, max]`，`deepseek-v4-pro` → `[off, high, max]`；注意
+  支持集不保证含 `off`——常开思考的模型（如 gpt-oss、GLM、Kimi 系列，
+  其 `thinkingLevelMap.off` 为 null）pi-ai 合法地不给 off 挡。
+- **存储**：模型设置文件新增 `thinkingLevel`，缺省 `off`（与本轮之前
+  内核写死 off 的行为一致）；`PUT /api/settings/model` 只接受七挡词表
+  内的值，非法回 400 且文件不变；旧文件无此字段按 off 读。
+- **内核生效**：`streamChat` 不再写死 off。生效值 = 当前 provider +
+  modelId 能在 pi-ai 目录里命中目录模型时
+  `clampThinkingLevel(目录模型, 已存挡位)`，且构造的 Model 带上目录
+  模型的 `reasoning` 与 `thinkingLevelMap`，pi-ai 才能把挡位翻译成厂
+  商参数（openai-completions 通用分支发 `reasoning_effort`，deepseek
+  按其 compat 发同名字段；map 里没有 off 键时 off 不发任何参数）。目
+  录查不到的自定义模型：挡位原样传给 Agent，构造的 Model 按支持
+  reasoning（`reasoning: true`）处理，厂商不认参数时错误走现有脱敏
+  出口。clamp 只决定生效值，不改写已存的设置值。
+- **推理转发（事件契约刻意扩展）**：pi-ai 已把端点的
+  `reasoning_content` 等字段解析为 thinking 内容，内核把
+  pi-agent-core `message_update` 的 `thinking_delta` 转发为**新增** SSE
+  事件 `thinking`（data `{text}`）。原有七个事件名
+  （session / delta / tool / system / draft / error / done）一律未动。
+  前端 ChatPane 把 thinking 增量拼成独立的 reasoning part：折叠区
+  「思考过程」默认展开、流式追加，回合结束后保持可折叠回顾；与正文、
+  工具卡按事件到达顺序排列（思考区与工具卡的相对次序与真实执行一
+  致）。进行时状态行口径微调：最后一个 part 是思考区时显示「正在思
+  考…」。
+- **落盘**：回合结束在 assistant 条目之前落盘一条
+  `{role:"thinking", text, truncated, sessionId}`（与工具条目同口径：
+  字符串过 `redact()` 脱敏；上限 16,000 字符，超出截断并标
+  `truncated:true`）；无思考文本的回合不落盘。`historyToMessages` 把
+  thinking 条目还原为 reasoning part，按流水顺序与工具条目一起挂到紧
+  随的 assistant 消息开头；已存思考不回喂模型（`toPiMessages` 仍只取
+  user/assistant 文本）。旧会话读回不变。
+- **设置页**：「思考挡位」下拉的选项 = 当前所选模型名在所选服务商目
+  录条目中的 `supportedThinkingLevels`（与是否从端点拉取过模型名单无
+  关）；手输的自定义模型名命中目录模型则用其挡位，命中不了回落完整
+  七挡。已选挡位不被当前模型支持时：下拉里把它作为额外选项标注
+  「当前值，该模型不支持」，并提示内核 clamp 后的实际生效挡位；保存
+  仍提交原值，不静默改存量。
+
+测试：`scripts/test-model-providers.mjs` 新增 16 条断言（先红 33/50，
+后绿 50/50）——目录条目带 `supportedThinkingLevels` 且 deepseek 两款
+与 pi-ai 实算一致；设置视图带挡位字段且无配置时默认 off；存
+`thinkingLevel=high` 后本地 stub 记录的请求体带
+`reasoning_effort:"high"`；SSE 出现 `thinking` 事件且拼合等于 stub 的
+`reasoning_content` 全文、正文 delta 完整；回合后历史接口能还原思考
+条目；clamp 用例：`deepseek-v4-pro` + 存挡 `low` → 请求体生效
+`reasoning_effort:"high"`；非法挡位保存回 400 且设置文件逐字节不
+变；默认 off 时请求体不带任何 reasoning 字段且无 thinking 事件。
+`npm run test` 聚合退出码 0：build:web、check、findings 27、scan 10、
+pr-review 16、schedule 14、gateway 27、recovery 7、listen 9、badtz 4、
+secrets 21、model-stub 10、model-providers 50、r10 22、webfetch 48、
+eval:scan 21、regression 72（全部不低于工具卡分支基线）。
+截图：新增 `docs/screens/14-settings-thinking-levels.png`（DeepSeek
+服务商下打开思考挡位下拉，选项恰为 off / low / high / max，high 为当
+前值；Key 只显示末四位掩码）与
+`docs/screens/15-chat-thinking.png`（对话里独立的「思考过程」折叠区
+展开显示推理文本，正文在其后）；`04` / `12` 设置页截图因表单新增字
+段同步更新，`11` / `13` 工具卡截图同轮复跑更新。均已目检，无真实秘
+密；无关截图的字节抖动已还原。
+明确不做：未改 `packages/` 源码（只用 pi-ai / pi-agent-core 的既有导
+出）、未改现有 SSE 事件名（只新增 `thinking`）、未加新依赖、未动
+web 抓取与工具卡口径。

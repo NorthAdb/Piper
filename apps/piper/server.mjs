@@ -32,8 +32,10 @@
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
 // GET /api/model-providers 模型服务商目录只读（派生自 pi-ai 内置目录，只含内核兼容的 openai-completions 服务商 + custom）
 // GET /api/settings/model 模型设置读回（configured/provider/baseUrl/modelId/apiKeyHint，绝无 Key 全文；
-//   旧文件无 provider、或 provider 已不在目录中，按 custom 读回）
-// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除；provider 须为目录 id，未知回 400），保存即热生效
+//   旧文件无 provider、或 provider 已不在目录中，按 custom 读回；另带 thinkingLevel 已存挡位
+//   与 thinkingLevels 当前模型可选挡位，派生自 pi-ai 目录，目录外模型回落全词表）
+// PUT /api/settings/model 保存模型设置（部分字段可单独更新；apiKey 传空串清除；provider 须为目录 id、
+//   thinkingLevel 须为七挡词表内的值，未知均回 400 且文件不变），保存即热生效
 // POST /api/settings/model/test 用已保存或请求体候选配置打一次最小请求，回 {ok} 或 {ok:false,error}
 // POST /api/settings/model/fetch-models 用表单端点与 Key 拉取端点 /models 的模型名单；缺省 Key 时只许端点
 //   与已保存配置完全一致时复用已保存 Key（R7 守卫），回 {ok:true,models} 或 {ok:false,status,error}
@@ -51,7 +53,9 @@
 // POST /api/chat 的 SSE 事件（event 名 + JSON data）：
 // session {botId, sessionId} 本轮开始
 // delta {text} 模型流式增量文本
-// tool {phase, name, detail} 工具/内核事件（前端折叠卡渲染）
+// thinking {text} 思考链增量（刻意扩展的新事件；思考挡位非 off 且服务商回传推理时才有，
+//   与正文 delta 分开，前端渲染为独立的「思考过程」折叠区）
+// tool {phase, name, toolCallId, detail} 工具/内核事件（前端折叠卡渲染）
 // system {kind, text} 系统提示（如草案已生成、兜底说明）
 // draft {draft} Bot 草案卡：{name, systemPrompt, tools, repos, memoryScope, source}
 // error {code, message} code=MODEL_NOT_CONFIGURED 时 message 明确写「未配置模型」
@@ -82,8 +86,8 @@ readBotMemory,
 } from "./lib/store.mjs";
 import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.mjs";
 import { addNotification, countUnread, listNotifications, markNotificationsRead} from "./lib/notify.mjs";
-import { listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
-import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId} from "./lib/model-providers.mjs";
+import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSettings, saveGithubSettingsFile, saveModelSettingsFile, saveProfileSettings, saveWebSettingsFile, secretHint} from "./lib/settings.mjs";
+import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.mjs";
 import { redact } from "./lib/redact.mjs";
 import { runMorningScan} from "./lib/scan.mjs";
 import { getFinding, listFindings} from "./lib/findings.mjs";
@@ -208,15 +212,20 @@ return raw? JSON.parse(raw): {};
 }
 
 // 模型设置对外视图：只暴露是否已配置、端点、模型名与 Key 末四位掩码，绝不含 Key 全文。
-// provider 归属要查 pi-ai 派生目录（异步加载），所以本函数是 async。
+// provider 归属与思考挡位支持集要查 pi-ai 派生目录（异步加载），所以本函数是 async。
+// thinkingLevel 是已存的选择（存量不因模型支持集而改写，生效值由内核 clamp）；
+// thinkingLevels 是当前 (provider, modelId) 可选的挡位（目录外模型回落全词表）。
 async function modelSettingsView() {
 const cfg = modelConfig();
+const provider = await resolveModelProviderId(readModelSettingsFile());
 return {
 configured: cfg.configured,
-provider: await resolveModelProviderId(readModelSettingsFile()),
+provider,
 baseUrl: cfg.baseUrl,
 modelId: cfg.modelId,
 apiKeyHint: secretHint(cfg.apiKey),
+thinkingLevel: cfg.thinkingLevel,
+thinkingLevels: await thinkingLevelsFor(provider, cfg.modelId),
 };
 }
 
@@ -284,6 +293,25 @@ sessionId,
 }
 };
 
+// 思考链落盘：直播时逐段透传 SSE thinking 事件，本轮文本收集起来，回合结束时
+// 落一条 role:"thinking"（排在 tool 条目与 assistant 条目之前，与事件到达顺序
+// 一致），前端刷新回来据此还原「思考过程」区。思考文本可能很长，落盘上限
+// THINKING_PERSIST_MAX_CHARS，超出截断并以 truncated 标明；text 字段由
+// appendSession 统一过 redact（与 tool 条目同一秘密禁入面）。思考不回喂模型
+// （kernel 的 toPiMessages 只取 user/assistant 条目）。
+const THINKING_PERSIST_MAX_CHARS = 16_000;
+let thinkingText = "";
+const persistThinking = () => {
+if (!thinkingText) return;
+const truncated = thinkingText.length > THINKING_PERSIST_MAX_CHARS;
+appendSession(bot.id, {
+role: "thinking",
+text: truncated ? thinkingText.slice(0, THINKING_PERSIST_MAX_CHARS) : thinkingText,
+truncated,
+sessionId,
+});
+};
+
 const history = readSession(bot.id);
 try {
 const { text} = await streamChat({
@@ -293,15 +321,21 @@ message,
 tools: webToolsForBot(bot),
 onEvent: (e) => {
 if (e.type === "delta") emit("delta", { text: e.text});
+else if (e.type === "thinking") {
+thinkingText += e.text;
+emit("thinking", { text: e.text});
+}
 else if (e.type === "tool") {
 collectTool(e);
 emit("tool", { phase: e.phase, name: e.name, toolCallId: e.toolCallId, detail: e.detail});
 }
 },
 });
+persistThinking();
 persistToolCalls();
 appendSession(bot.id, { role: "assistant", text, sessionId});
 } catch (err) {
+persistThinking();
 persistToolCalls();
 // 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
 // 这里是其余错误路径的兜底出口。
@@ -436,6 +470,10 @@ patch.provider = body.provider;
 if (typeof body.baseUrl === "string") patch.baseUrl = body.baseUrl;
 if (typeof body.modelId === "string") patch.modelId = body.modelId;
 if (typeof body.apiKey === "string") patch.apiKey = body.apiKey;
+if (body.thinkingLevel !== undefined) {
+if (!isThinkingLevel(body.thinkingLevel)) return sendJson(res, 400, { error: `未知思考挡位：${String(body.thinkingLevel)}（须为 off/minimal/low/medium/high/xhigh/max 之一）`});
+patch.thinkingLevel = body.thinkingLevel;
+}
 saveModelSettingsFile(patch);
 return sendJson(res, 200, await modelSettingsView());
 }

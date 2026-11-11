@@ -35,14 +35,25 @@ export function readModelSettingsFile() {
 	}
 }
 
+// 思考挡位词表：与 pi-ai / pi-agent-core 的 ThinkingLevel 完全一致（七挡），
+// 不自造。每款模型实际支持哪几挡由 pi-ai 目录元数据决定（见
+// lib/model-providers.mjs 的 supportedThinkingLevels），这里只管词表合法性。
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export function isThinkingLevel(value) {
+	return typeof value === "string" && THINKING_LEVELS.includes(value);
+}
+
 // 部分更新：字段出现才改；apiKey 传空字符串表示清除已保存的 Key。
 // provider 是服务商归属标记（目录 id，见 lib/model-providers.mjs）；合法性由
 // server 路由校验，本函数只落盘字符串。旧文件没有该字段，读回按 custom 处理。
+// thinkingLevel 同理：路由先校验词表，本函数只落盘；旧文件无此字段，读回按 off。
 export function saveModelSettingsFile(patch) {
 	const next = { ...readModelSettingsFile() };
 	if (patch.provider !== undefined) next.provider = String(patch.provider).trim();
 	if (patch.baseUrl !== undefined) next.baseUrl = String(patch.baseUrl).trim();
 	if (patch.modelId !== undefined) next.modelId = String(patch.modelId).trim();
+	if (patch.thinkingLevel !== undefined) next.thinkingLevel = String(patch.thinkingLevel).trim();
 	if (patch.apiKey !== undefined) {
 		if (patch.apiKey) next.apiKey = String(patch.apiKey);
 		else delete next.apiKey;

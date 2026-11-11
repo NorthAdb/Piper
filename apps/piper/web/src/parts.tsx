@@ -3,7 +3,7 @@
 // 草案/系统/错误卡用 shadcn Card/Badge/Button 与设计系统色调实现。
 import type { DataMessagePartComponent, TextMessagePartComponent, ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import { BotIcon, CheckIcon, InfoIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { BotIcon, BrainIcon, CheckIcon, ChevronDownIcon, InfoIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { createContext, useContext, useState } from "react";
 import remarkGfm from "remark-gfm";
 import { Tool, ToolContent, ToolHeader, ToolInput, ToolOutput } from "@/components/ai-elements/tool";
@@ -79,6 +79,39 @@ export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, arg
 				) : null}
 			</ToolContent>
 		</Tool>
+	);
+};
+
+// ---- 思考过程（reasoning part：独立折叠区，与正文、工具卡分开） ----
+// 内容是服务商回传的推理文本（SSE thinking 事件流式拼入，或历史流水还原）。
+// 默认展开，流式期间与回合结束后都可手动折叠回顾；落盘被截断的历史条目
+// 带 truncated 标记，展开时在末尾注明只保留了前一部分。
+
+export type ReasoningPartData = { text: string; truncated?: boolean };
+
+export const ReasoningCard: DataMessagePartComponent<ReasoningPartData> = ({ data, status }) => {
+	const [open, setOpen] = useState(true);
+	const streaming = status?.type === "running";
+	return (
+		<div className="rounded-lg border border-border bg-muted/30">
+			<button
+				type="button"
+				className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-muted-foreground"
+				onClick={() => setOpen((v) => !v)}
+				aria-expanded={open}
+			>
+				<BrainIcon className="size-4 shrink-0" />
+				<span className="font-medium">思考过程</span>
+				{streaming ? <span className="text-xs">思考中…</span> : null}
+				<ChevronDownIcon className={`ml-auto size-4 shrink-0 transition-transform ${open ? "" : "-rotate-90"}`} />
+			</button>
+			{open ? (
+				<div className="border-t border-border/60 px-3 py-2.5">
+					<p className="text-sm break-words whitespace-pre-wrap text-muted-foreground">{data.text}</p>
+					{data.truncated ? <p className="mt-2 text-xs text-muted-foreground">（内容过长，历史中仅保留前一部分）</p> : null}
+				</div>
+			) : null}
+		</div>
 	);
 };
 

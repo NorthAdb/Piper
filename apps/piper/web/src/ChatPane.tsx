@@ -20,7 +20,7 @@ import { cn } from "@/lib/utils";
 import type { Bot, ChatMessage, ChatPart } from "./model";
 import { historyToMessages, nextId } from "./model";
 import type { DraftActions } from "./parts";
-import { DraftActionsContext, DraftCard, ErrorCard, MarkdownText, PlainText, SystemCard, ToolCard } from "./parts";
+import { DraftActionsContext, DraftCard, ErrorCard, MarkdownText, PlainText, ReasoningCard, SystemCard, ToolCard } from "./parts";
 
 type LikePart = Exclude<ThreadMessageLike["content"], string>[number];
 
@@ -28,6 +28,8 @@ function partToLike(part: ChatPart): LikePart {
 	switch (part.type) {
 		case "text":
 			return { type: "text", text: part.text };
+		case "reasoning":
+			return { type: "data-reasoning", data: { text: part.text, truncated: part.truncated ?? false } };
 		case "tool":
 			return {
 				type: "tool-call",
@@ -85,7 +87,7 @@ function AssistantMessage() {
 						Text: MarkdownText,
 						Empty: TypingDots,
 						tools: { Fallback: ToolCard },
-						data: { by_name: { draft: DraftCard, system: SystemCard, error: ErrorCard } },
+						data: { by_name: { draft: DraftCard, reasoning: ReasoningCard, system: SystemCard, error: ErrorCard } },
 					}}
 				/>
 			</div>
@@ -183,6 +185,17 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 							return [...parts, { type: "text", text: e.data.text }];
 						});
 						break;
+					case "thinking":
+						// 思考增量拼进同一个 reasoning part（与正文分开的折叠区）；
+						// 中间隔了工具卡等其他 part 时另起一段，按到达顺序排列。
+						patchParts(asstId, (parts) => {
+							const last = parts[parts.length - 1];
+							if (last?.type === "reasoning") {
+								return [...parts.slice(0, -1), { type: "reasoning", text: last.text + e.data.text }];
+							}
+							return [...parts, { type: "reasoning", text: e.data.text }];
+						});
+						break;
 					case "tool": {
 						// 一次调用一张卡：call/start/end 按 toolCallId 合并到同一个 part，
 						// phase 推进状态，call/start 的 detail 是参数、end 的 detail 是结果摘要。
@@ -259,17 +272,21 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		},
 	};
 
-	// 进行时状态行口径（由现有 SSE 事件与本地状态推导，不新增事件类型）：
-	// 有未 end 的工具 → 正在调用该工具；已有文本在流出 → 正在生成回答；其余 → 正在思考。
+	// 进行时状态行口径（由现有 SSE 事件与本地状态推导）：
+	// 有未 end 的工具 → 正在调用该工具；最后一个 part 是思考区（推理正在流出）
+	// 或尚无任何产出 → 正在思考；已有文本在流出 → 正在生成回答。
 	const activeMessage = running ? messages[messages.length - 1] : undefined;
 	const runningToolPart = activeMessage?.parts
 		.filter((p): p is Extract<ChatPart, { type: "tool" }> => p.type === "tool" && p.phase !== "end")
 		.at(-1);
+	const lastPart = activeMessage?.parts[activeMessage.parts.length - 1];
 	const statusLabel = runningToolPart
 		? `正在调用 ${runningToolPart.name}…`
-		: activeMessage?.parts.some((p) => p.type === "text" && p.text.length > 0)
-			? "正在生成回答…"
-			: "正在思考…";
+		: lastPart?.type === "reasoning"
+			? "正在思考…"
+			: activeMessage?.parts.some((p) => p.type === "text" && p.text.length > 0)
+				? "正在生成回答…"
+				: "正在思考…";
 	const elapsedSec = runStartedAt ? Math.max(0, Math.floor((tickNow - runStartedAt) / 1000)) : 0;
 
 	const runtime = useExternalStoreRuntime<ChatMessage>({

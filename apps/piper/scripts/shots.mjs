@@ -121,6 +121,14 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots", type: "function", function: { name: "web_fetch", arguments: "" } }] }));
 			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
 			resHttp.write(chunk({}, "tool_calls"));
+		} else if (typeof body.reasoning_effort === "string" && body.reasoning_effort) {
+			// 思考链截图（15）用：请求带 reasoning_effort 时先回两段 reasoning_content
+			// 增量、再回正文（模拟真服务商的思考流）。必须放在 web_fetch 分支之后：
+			// 11 号图的抓取首请求也带着挡位参数（种子已存 high），要先命中工具分支。
+			resHttp.write(chunk({ reasoning_content: "先拆解问题：" }));
+			resHttp.write(chunk({ reasoning_content: "1 加 1 是最基础的加法，结果为 2。" }));
+			resHttp.write(chunk({ content: "1 加 1 等于 2。" }));
+			resHttp.write(chunk({}, "stop"));
 		} else {
 			resHttp.write(chunk({ content: "好的。" }));
 			resHttp.write(chunk({}, "stop"));
@@ -384,6 +392,28 @@ console.log("截图 12 用配置已写入（provider=deepseek，端点=本地 st
 		await clickPoint(centerOf("#model-id-select"), "再次点击模型触发器收起下拉");
 		await waitFor(`document.querySelectorAll('[role="option"]').length === 0`, "模型下拉已收起");
 	}
+	// 思考挡位截图（14）：把已保存配置换成目录模型 deepseek-flash + 挡位 high
+	// （端点仍是本地 stub、Key 仍是种子假 Key），重载后在模型组打开思考挡位
+	// 下拉——选项应恰为 pi-ai 给该模型的支持集 off / low / high / max。
+	runSeed(`
+import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+saveModelSettingsFile({ provider: "deepseek", baseUrl: "${SHOTS_MODEL_BASE}", modelId: "deepseek-flash", apiKey: "${FAKE_KEY}", thinkingLevel: "high" });
+console.log("截图 14 用配置已写入（deepseek-flash + thinkingLevel=high）");
+`);
+	await cdp("Page.navigate", { url: `${BASE}/` }, sessionId);
+	await waitFor(bodyHas("待批收件箱"), "重载后主界面出现（思考挡位截图）");
+	await clickText("设置", { maxX: 264 });
+	await waitFor(bodyHas("思考挡位"), "设置-模型组出现思考挡位");
+	await evaluate(`document.querySelector('#model-thinking-level')?.scrollIntoView({ block: 'center' })`);
+	await clickPoint(centerOf("#model-thinking-level"), "打开思考挡位下拉");
+	await waitFor(
+		`(() => { const opts = [...document.querySelectorAll('[role="option"]')].map((el) => (el.textContent || '').trim()); return ['off', 'low', 'high', 'max'].every((l) => opts.includes(l)); })()`,
+		"思考挡位下拉出现 off/low/high/max",
+	);
+	await shot("14-settings-thinking-levels.png");
+	await cdp("Input.dispatchKeyEvent", { type: "rawKeyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	await cdp("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 }, sessionId);
+	await waitFor(`document.querySelectorAll('[role="option"]').length === 0`, "思考挡位下拉已收起");
 	await clickText("基础资料");
 	await waitFor(bodyHas("关于我"), "设置-基础资料组出现");
 	await shot("05-settings-profile.png");
@@ -475,6 +505,19 @@ console.log("种子（待批 Finding）已写入");
 	await waitFor(bodyHas("HTTP 200"), "刷新后展开工具卡仍看到结果摘要 HTTP 200", 30000);
 	await new Promise((r) => setTimeout(r, 800));
 	await shot("13-chat-tool-card-after-reload.png");
+
+	// 思考链（15）：当前已保存配置是 deepseek-flash + thinkingLevel=high（截图 14
+	// 的种子），向主 bot 问一个会触发 stub reasoning 分支的问题——对话里应出现
+	// 独立的「思考过程」折叠区（默认展开、含 stub 的推理文本），正文在思考区之后。
+	await waitFor(`document.querySelector('textarea') !== null`, "主 bot 对话输入框出现（思考截图）");
+	await evaluate(`document.querySelector('textarea').focus()`);
+	await cdp("Input.insertText", { text: "先想一想：1 加 1 等于多少？" }, sessionId);
+	await clickText("发送");
+	await waitFor(bodyHas("思考过程"), "对话里出现思考过程折叠区", 30000);
+	await waitFor(bodyHas("结果为 2"), "思考区里出现 stub 推理文本", 30000);
+	await waitFor(bodyHas("1 加 1 等于 2"), "思考之后出现正文回答", 30000);
+	await new Promise((r) => setTimeout(r, 800));
+	await shot("15-chat-thinking.png");
 
 	console.log(`\n截图完成：${shots.length} 张，目录 ${SCREENS_DIR}`);
 	console.log("注意：脚本不做内容断言，请逐张目检 Key 区为掩码、无真实秘密。");
