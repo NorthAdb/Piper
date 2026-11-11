@@ -47,6 +47,7 @@ const realFetch = globalThis.fetch;
 const postCalls = [];
 const commentsByKey = new Map();
 let pullState = "open";
+let pullDraft = false;
 let pullReviews = [];
 let postShouldFail = false;
 let pullShouldFail = false;
@@ -82,7 +83,7 @@ globalThis.fetch = async (url, init = {}) => {
 	}
 	if (method === "GET" && /\/pulls\/\d+$/.test(u.pathname)) {
 		if (pullShouldFail) return { ok: false, status: 500, json: async () => ({}) };
-		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: false, head: { sha: "head-sha-1" } }) };
+		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: pullDraft, head: { sha: "head-sha-1" } }) };
 	}
 	return { ok: false, status: 599, json: async () => ({}) };
 };
@@ -578,6 +579,70 @@ try {
 			"无绕过：只有 gateway.mjs 构造 /comments 写端点；scan/kernel/approvals/findings 无 GitHub POST 写调用",
 			JSON.stringify(withComments) === JSON.stringify(["gateway.mjs"]) && readLayerClean,
 			`withComments=${withComments.join(",")}`,
+		);
+	}
+
+	// 20. COMMENTED 不撤销批准——网关同源判定（F4，第二轮返工）：审查人 APPROVED
+	//     （针对当前 head）后又提交一条 COMMENTED（回复行内评论即产生）——网关复检与
+	//     扫描共用 evaluateReviews，必须同样判「已批准」→ failed/precondition_changed、
+	//     写 API 0 次。旧实现按「最新一条」取到 COMMENTED 判 no_approval，会误发评论。
+	{
+		const f = makeFinding({ subject: "120" });
+		pullReviews = [
+			{ state: "APPROVED", user: { login: "rev" }, commit_id: "head-sha-1" },
+			{ state: "COMMENTED", user: { login: "rev" }, commit_id: "head-sha-1" },
+		];
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullReviews = [];
+		check(
+			"F4 网关同源：批准后同人 COMMENTED → 仍判已批准，failed/precondition_changed，写 API 0 次，保持 approved",
+			out.execution.ok === false &&
+				out.execution.result === "failed" &&
+				out.execution.reason === "precondition_changed" &&
+				postCalls.length === before &&
+				getFinding(f.id).status === "approved" &&
+				auditFor(f.id).some((x) => x.result === "failed" && x.reason === "precondition_changed"),
+			JSON.stringify(out.execution),
+		);
+	}
+
+	// 21. draft 复检（F5②，第二轮返工）：Finding 批准后 PR 变 draft → 网关执行前复检
+	//     failed/precondition_changed、写 API 0 次、保持 approved。去掉网关的 draft
+	//     复检本项即变红（会一路走到 POST）。
+	{
+		const f = makeFinding({ subject: "121" });
+		pullDraft = true;
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullDraft = false;
+		check(
+			"F5 draft 复检：批准后 PR 变 draft → failed/precondition_changed，写 API 0 次，保持 approved，审计有该原因",
+			out.execution.ok === false &&
+				out.execution.result === "failed" &&
+				out.execution.reason === "precondition_changed" &&
+				postCalls.length === before &&
+				getFinding(f.id).status === "approved" &&
+				auditFor(f.id).some((x) => x.result === "failed" && x.reason === "precondition_changed"),
+			JSON.stringify(out.execution),
+		);
+	}
+
+	// 22. 陈旧批准在网关仍判待审（F5③，第二轮返工）：批准所针对的 commit（old-sha-999）
+	//     与当前 head（head-sha-1）不一致——按锁定口径陈旧批准 = 仍待审（扫描侧同一场景
+	//     由夹具 pr-approved-then-new-commits 钉住应报），网关与扫描共用同一判定，前提
+	//     未变，照常发送并 executed。本项钉住「网关复检把当前 head 传进判定」：复检不传
+	//     head 时陈旧无从判定、会误判已批准 → 本项变红。
+	{
+		const f = makeFinding({ subject: "122" });
+		pullReviews = [{ state: "APPROVED", user: { login: "rev" }, commit_id: "old-sha-999" }];
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullReviews = [];
+		check(
+			"F5 陈旧批准仍待审：批准 commit 与当前 head 不一致 → 同一判定仍待审，网关照常发送（写 API 1 次）并 executed",
+			out.execution.ok === true && postCalls.length === before + 1 && getFinding(f.id).status === "executed",
+			`out=${JSON.stringify(out.execution)} posts=${postCalls.length - before}`,
 		);
 	}
 } finally {

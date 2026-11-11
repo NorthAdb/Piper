@@ -1254,3 +1254,58 @@ PA—design 复审 tip `e42f3a0` 后的第二轮返工，本批做 F1、F2、F3�
 - 明确不做核对：只做 F1/F2/F3，未碰 F4–F13；未改 `packages/`、未改 SSE
   事件名、未加第二种写意图、未加新依赖；恢复不自动重发评论；查重取不尽时
   宁可不发，不放宽幂等口径。
+
+### 第二轮返工 F4–F5 实测（2026-11-11，分支 fix/round2-f4-f5，堆叠在 F1–F3 上）
+
+本批做 F4、F5（两项 MAJOR，均属 R5「已批准」判定）。
+
+- **F4 COMMENTED 不得撤销已有批准**：`lib/pr-review.mjs` 的 `evaluateReviews`
+  原来按每位审查人「最新一条审查」取状态，同一人 APPROVED 后再提交一条
+  COMMENTED（回复行内评论就会产生）即被判 `no_approval`。改为取「最新一条
+  表态」：只有 APPROVED、CHANGES_REQUESTED、DISMISSED 改变该人状态，
+  COMMENTED 与 PENDING 忽略；DISMISSED 顶掉先前表态（清掉先前批准或要求
+  修改）；陈旧批准判定不变（看最新一条 APPROVED 的 commit_id 与当前 head）。
+  验收：新增冻结夹具 `pr-approved-then-commented`（A 批准、A 再 COMMENTED、
+  head 未变 → 不报）；新增 `scripts/test-pr-review.mjs`（`npm run
+  test:pr-review`，已纳入聚合）**16/16**，覆盖批准后 COMMENTED（仍已批准）、
+  要求修改后 COMMENTED（仍待审）、DISMISSED 清掉批准/清掉要求修改、仅
+  COMMENTED、PENDING 忽略、陈旧不被 COMMENTED 干扰、head 缺失不判陈旧；
+  `test:gateway` 第 25 项钉住网关同源（批准后同人 COMMENTED → 仍判已批准、
+  `failed/precondition_changed`、写 0 次）。先红：改前夹具误开 1 条、
+  test:pr-review 4 项红（03/04/06/14）、网关第 25 项红（评论被实际发出、
+  转 executed）。
+- **F5 补齐被变异绕过的三处测试**：① 新增夹具
+  `pr-approved-by-a-changes-by-b`（A 批准、B 要求修改 → 应报）+
+  test:pr-review 第 11/12 项；② `test:gateway` 第 26 项：批准后 PR 变
+  draft → `failed/precondition_changed`、写 0 次；③ 第 27 项：批准所针对
+  commit 与当前 head 不一致（陈旧批准）→ 网关按与扫描同一判定仍属待审、
+  照常发送并 executed。**与返工稿字面预期的分歧（如实声明，请复审裁定）**：
+  返工稿 F5③ 写「→ failed/precondition_changed、写 0 次」，但其验收又要求
+  「复检不传 head 时对应用例必须变红」——这两点逻辑上互斥：不传 head 只会
+  让判定更宽松地判「已批准」（陈旧无从判定），变异结果恰好就是
+  precondition_changed 本身，任何期待 precondition_changed 的用例都不可能
+  因此变红；且按 R5 锁定口径陈旧批准 = 仍待审（扫描侧同一场景由夹具
+  `pr-approved-then-new-commits` 钉住应报），网关若拒发则与扫描判定分家。
+  本批按锁定口径与变异验收实现第 27 项；若复审认定网关应对陈旧批准拒发，
+  那是判定行为变更，需先改锁定口径再改实现。
+  变异验证（逐个改坏、逐个留档、改后还原）：去掉「任一人最新
+  CHANGES_REQUESTED 即待审」→ 夹具① 变红、单测 11/12 变红；去掉网关
+  draft 复检 → 第 26 项变红（评论被实际发出）；网关复检不传 head →
+  第 27 项变红（误判已批准、`precondition_changed`、0 发送）。
+- **F5 末段：缺 headSha 按「未变」保留 + 日报说明 + 用例**：`evaluateReviews`
+  在 head 缺失时不判陈旧、`findBlockingFinding` 在任一侧 headSha 缺失时按
+  同头部处理（行为保留，审计已同意）。`lib/scan.mjs` 新增：非 draft PR 取
+  证缺 head（`head.sha` 缺失）时，该仓日报「其余观察」写一行「PR #N 取证
+  缺 head（head.sha 缺失），按头部未变处理：不判陈旧批准，去重冷却按
+  未变」。新增夹具 `pr-missing-head-treated-as-unchanged` 钉住：缺 head +
+  APPROVED 针对旧 commit → 不判陈旧、不报，且日报含该说明行；单测第
+  15/16 项钉住 head 为 null/undefined 时不判陈旧。先红：夹具因日报缺该行
+  变红。
+- 全套：`npm run test` 聚合退出码 0——eval:scan **21/21**（18 → 21，本批
+  +3 夹具）、test:pr-review **16/16**（新增）、test:gateway **27/27**
+  （24 → 27）、test:scan **10/10**、regression **72/72**（基线不变），
+  其余各套与 build:web、check 均通过。
+- 明确不做核对：只做 F4/F5，未碰 F1–F3（已交付）、F6–F13；未改
+  `packages/`、未改 SSE 事件名、未加第二种写意图、未加新依赖；未改锁定
+  口径本身（陈旧批准仍按最新一条 APPROVED 的 commit_id 判定、缺 head 仍
+  按未变）；未在网关新增 head 移动检查（理由见 F5③ 分歧说明）。

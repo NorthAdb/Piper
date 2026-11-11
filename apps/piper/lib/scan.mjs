@@ -161,6 +161,13 @@ async function scanRepo(repo, botId, now) {
 	// ---- 阶段一：取证 ----
 	const data = await fetchRepoData(repo);
 	const notes = data.notes;
+	// 取证缺 head 的 PR（pulls 条目无 head.sha）：陈旧批准无从判定、去重头部比较也
+	// 无从比对，统一按「头部未变」处理（F5 末段，审计已同意保留）——日报写明，不许静默。
+	for (const p of data.pulls) {
+		if (!p.draft && !p.head?.sha) {
+			notes.push(`PR #${p.number} 取证缺 head（head.sha 缺失），按头部未变处理：不判陈旧批准，去重冷却按未变`);
+		}
+	}
 	// 审查结果在对账与规则之间共用一轮取证，避免同一 PR 重复拉 reviews。
 	const reviewsCache = new Map();
 	const fetchReviewsCached = async (prNumber) => {
