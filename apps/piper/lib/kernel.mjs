@@ -146,8 +146,19 @@ export function modelErrorMessage(raw) {
 
 // ---------- 网页查询工具（L0-6）：注册与否由连接器状态 + bot 可用范围决定 ----------
 // 工具只在「网页查询已启用且 bot 在可用范围内」时才被注册进 Agent——不在范围
-// 的 bot 的模型根本看不到这个工具，直接调用无从发生。web.search 还要求搜索
+// 的 bot 的模型根本看不到这个工具，直接调用无从发生。搜索工具还要求搜索
 // 端点与密钥已配置，未配置时不注册，对话里问起就如实说没有搜索服务。
+//
+// 两套命名不要改混（真机 bug 的根因）：
+//   - 能力声明用点名 web.fetch / web.search——那是 Piper 内部的能力/范围标识
+//     （bot.tools、webToolBots() 的判定），只活在 Piper 内部，不发给模型，
+//     已有用户数据就是这套，零迁移；
+//   - 模型侧 function name 用下划线名 web_fetch / web_search——OpenAI 兼容
+//     服务商要求 function name 匹配 ^[a-zA-Z0-9_-]+$，点名发出去会被严格
+//     校验的服务商（DeepSeek 等）整轮 400 拒绝。SSE tool 事件里带的也是
+//     模型侧名（实际被调用的函数名），不做映射。
+export const WEB_FETCH_TOOL_NAME = "web_fetch";
+export const WEB_SEARCH_TOOL_NAME = "web_search";
 function toolTextResult(text, details) {
 	return { content: [{ type: "text", text }], details };
 }
@@ -160,7 +171,7 @@ export function webToolsForBot(bot) {
 	if (!webToolBots().includes(bot.id)) return [];
 	const tools = [
 		{
-			name: "web.fetch",
+			name: WEB_FETCH_TOOL_NAME,
 			label: "打开网页（只读）",
 			description:
 				"只读打开一个公开网页并返回其可见文本（已截断）。只能访问公开地址；本机、私网与云元数据地址会被拒绝。用户给出链接、让你看某篇文档或网页内容时使用。",
@@ -186,9 +197,9 @@ export function webToolsForBot(bot) {
 	const search = webSearchConfig();
 	if (search) {
 		tools.push({
-			name: "web.search",
+			name: WEB_SEARCH_TOOL_NAME,
 			label: "搜索网页",
-			description: "按关键词搜索网页，返回前几条结果的标题、链接与摘要。需要引用具体页面时再用 web.fetch 打开。",
+			description: `按关键词搜索网页，返回前几条结果的标题、链接与摘要。需要引用具体页面时再用 ${WEB_FETCH_TOOL_NAME} 打开。`,
 			parameters: {
 				type: "object",
 				properties: { query: { type: "string", description: "搜索关键词" } },
