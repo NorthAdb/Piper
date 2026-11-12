@@ -433,7 +433,12 @@ describe("tool approval gate", () => {
 			"no such tool call in the current run",
 		);
 
-		await agent.resolveToolCall("call-1", { decision: "allow" });
+		// A duplicate resolve issued in the same task window as the delivery is stale too:
+		// the first decision wins and the second one throws instead of silently no-oping.
+		const delivered = agent.resolveToolCall("call-1", { decision: "allow" });
+		const duplicate = agent.resolveToolCall("call-1", { decision: "deny" });
+		await expect(duplicate).rejects.toThrow("already been settled");
+		await delivered;
 		await waitForEvent(events, (event) => event.type === "tool_approval_pending" && event.toolCallId === "call-2");
 		expect(executedArgs).toEqual([{ value: "a" }]);
 		// call-1 is settled by now; a second resolution for it in the same run is stale.

@@ -462,6 +462,10 @@ export class Agent {
 		if (this.activeRun) {
 			const waiter = this.toolApprovalWaiters.get(toolCallId);
 			if (waiter) {
+				// Settle synchronously: a second resolve in the same task window must hit the
+				// settled check below, not find this waiter again and silently no-op.
+				this.toolApprovalWaiters.delete(toolCallId);
+				this.settledToolCallIds.add(toolCallId);
 				waiter(result);
 				return;
 			}
