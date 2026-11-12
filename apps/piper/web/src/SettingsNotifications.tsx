@@ -17,7 +17,13 @@ const TYPE_META: Record<NotificationEntry["type"], { label: string; icon: typeof
 	"approval.failed": { label: "写操作失败", icon: CircleAlertIcon },
 };
 
-export function NotificationsSettings({ onUnauthorized }: { onUnauthorized: () => void }) {
+export function NotificationsSettings({
+	onUnauthorized,
+	onOpenFinding,
+}: {
+	onUnauthorized: () => void;
+	onOpenFinding?: (findingId: string) => void;
+}) {
 	const [items, setItems] = useState<NotificationEntry[] | null>(null);
 	const [unread, setUnread] = useState(0);
 	const [loadError, setLoadError] = useState("");
@@ -85,12 +91,19 @@ export function NotificationsSettings({ onUnauthorized }: { onUnauthorized: () =
 										</div>
 										{n.body ? <p className="mt-0.5 text-sm text-muted-foreground">{n.body}</p> : null}
 									</div>
-									{n.read ? null : (
-										<Button type="button" size="sm" variant="ghost" onClick={() => void mark([n.id])}>
-											<CheckIcon />
-											标已读
-										</Button>
-									)}
+									<div className="flex shrink-0 flex-col items-end gap-1">
+										{n.findingId && onOpenFinding ? (
+											<Button type="button" size="sm" variant="ghost" onClick={() => onOpenFinding(n.findingId as string)}>
+												查看事项
+											</Button>
+										) : null}
+										{n.read ? null : (
+											<Button type="button" size="sm" variant="ghost" onClick={() => void mark([n.id])}>
+												<CheckIcon />
+												标已读
+											</Button>
+										)}
+									</div>
 								</div>
 							);
 						})}

@@ -10,6 +10,8 @@
 // 保持 approved、正文含令牌被拒、写接口失败保持 approved、并发批准互斥（替身 50ms 延迟下恰好
 // 一次写、第二个 409）、崩溃重放靠评论标记查重（总写次数仍 1）、审计正负两类齐全且不含令牌、
 // 以及「除网关外无人构造 GitHub 评论写端点」的源码绕过断言。
+// 失败可恢复切片新增：已关闭视图（终态 Finding 带关闭原因留痕、不混入待批列表、
+// 无 writeIntent 不入列）与 bot 自我事实（绑定清单如实、凭据红线在场）。
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ArtifactMeta } from "../lib/store.ts";
 import type { Finding } from "../lib/findings.ts";
@@ -109,14 +111,15 @@ try {
 	const { ensureData } = await import("../lib/store.ts");
 	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
 	const { createFinding, getFinding: getFindingRaw, updateFinding } = await import("../lib/findings.ts");
-	const { approveApproval: approveApprovalRaw, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.ts");
+	const { approveApproval: approveApprovalRaw, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.ts");
 	// 本套件的 Finding 均为刚写入必存在（原 JS 全程按此隐含假定写）：包一层非空断言收口，
 	// approveApproval 的 null（不存在→404）与 getFinding 的 null 在本套件语境下都不出现。
 	const getFinding = (id: string): Finding => getFindingRaw(id) as Finding;
 	const approveApproval = async (...args: Parameters<typeof approveApprovalRaw>) =>
 		(await approveApprovalRaw(...args)) as NonNullable<Awaited<ReturnType<typeof approveApprovalRaw>>>;
 	const { gatewayExecuteWrite } = await import("../lib/gateway.ts");
-	const { listAudit } = await import("../lib/audit.ts");
+	const { appendAudit, listAudit } = await import("../lib/audit.ts");
+	const { botSelfFacts } = await import("../lib/kernel.ts");
 	const { listNotifications } = await import("../lib/notify.ts");
 	const { githubToken } = await import("../lib/settings.ts");
 	const token = githubToken();
@@ -664,6 +667,91 @@ try {
 			"F5 陈旧批准仍待审：批准 commit 与当前 head 不一致 → 同一判定仍待审，网关照常发送（写 API 1 次）并 executed",
 			out.execution.ok === true && postCalls.length === before + 1 && getFinding(f.id).status === "executed",
 			`out=${JSON.stringify(out.execution)} posts=${postCalls.length - before}`,
+		);
+	}
+	// 23. 已关闭视图（失败可恢复切片）：终态 Finding 带关闭原因出现在 closed 里、
+	//     不再出现在待批列表；无 writeIntent 的 Finding 不入已关闭视图。
+	{
+		const rej = makeFinding({ subject: "123" });
+		rejectApproval(rej.id);
+		const expReconciled = makeFinding({ subject: "124" });
+		updateFinding(expReconciled.id, { status: "expired" });
+		appendAudit({ botId: "repo-keeper", intent: null, result: "expired", reason: "reconciled:pr_merged", findingId: expReconciled.id });
+		const expTtl = makeFinding({ subject: "125" });
+		updateFinding(expTtl.id, { status: "expired" });
+		const exe = makeFinding({ subject: "126" });
+		await approveApproval(exe.id, { intentHash: viewOf(exe.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		const noIntent = createFinding({
+			repo: "NorthAdb/LinkForge",
+			type: "ci_failed",
+			subject: "run-127",
+			botId: "repo-keeper",
+			title: "CI 失败（无写意图）",
+			summary: "",
+			evidenceUrl: "https://github.com/NorthAdb/LinkForge/actions",
+			suggestedAction: "",
+			writeIntent: null,
+			status: "rejected",
+		});
+		const closed = listClosedApprovals();
+		const closedOf = (id: string) => closed.find((a) => a.findingId === id);
+		check(
+			"已关闭视图：驳回项带 closeReason=rejected_by_user 与 closedAt，且不在待批列表",
+			closedOf(rej.id)?.status === "rejected" &&
+				closedOf(rej.id)?.closeReason === "rejected_by_user" &&
+				Boolean(closedOf(rej.id)?.closedAt) &&
+				!listApprovals().some((a) => a.findingId === rej.id),
+			JSON.stringify(closedOf(rej.id) ?? null),
+		);
+		check(
+			"已关闭视图：对账退役项带 closeReason=reconciled:pr_merged",
+			closedOf(expReconciled.id)?.status === "expired" && closedOf(expReconciled.id)?.closeReason === "reconciled:pr_merged",
+			JSON.stringify(closedOf(expReconciled.id) ?? null),
+		);
+		check(
+			"已关闭视图：无终态审计的过期项 closeReason 为 null（不编造原因）、closedAt 回落 updatedAt",
+			closedOf(expTtl.id)?.status === "expired" && closedOf(expTtl.id)?.closeReason === null && Boolean(closedOf(expTtl.id)?.closedAt),
+			JSON.stringify(closedOf(expTtl.id) ?? null),
+		);
+		check(
+			"已关闭视图：已执行项带 commentUrl；无 writeIntent 的终态 Finding 不入列；新关闭的排在前",
+			closedOf(exe.id)?.status === "executed" &&
+				Boolean(closedOf(exe.id)?.commentUrl) &&
+				!closedOf(noIntent.id) &&
+				closed.findIndex((a) => a.findingId === exe.id) < closed.findIndex((a) => a.findingId === rej.id),
+			`exe=${JSON.stringify(closedOf(exe.id) ?? null)}`,
+		);
+	}
+
+	// 24. bot 自我事实（失败可恢复切片）：绑定仓库如实列出、扫描取证边界与凭据
+	//     红线在场；无绑定时明说未绑定，不编造。
+	{
+		const base = {
+			id: "b-test",
+			name: "测试 bot",
+			systemPrompt: "",
+			tools: [] as string[],
+			memoryScope: "self",
+			routines: [] as string[],
+			isMain: false,
+			canManageBots: false,
+			createdAt: "2026-11-12T00:00:00.000Z",
+		};
+		const withRepos = botSelfFacts({ ...base, repos: ["NorthAdb/LinkForge", "NorthAdb/Loom"] }, { runsMorningScan: true });
+		const noRepos = botSelfFacts({ ...base, repos: [] });
+		check(
+			"bot 自我事实：绑定仓库逐个列出、含扫描例程说明、含凭据红线（只走设置页、拒绝在对话里接收）",
+			withRepos.includes("NorthAdb/LinkForge") &&
+				withRepos.includes("NorthAdb/Loom") &&
+				withRepos.includes("晨间仓库扫描例程挂在你名下") &&
+				withRepos.includes("只能由用户在「设置」页填写") &&
+				withRepos.includes("绝不要请用户在对话里把令牌或 Key 发给你"),
+			withRepos,
+		);
+		check(
+			"bot 自我事实：无绑定仓库时明说未绑定，且不出现扫描例程说明",
+			noRepos.includes("没有绑定任何 GitHub 仓库") && !noRepos.includes("晨间仓库扫描例程挂在你名下"),
+			noRepos,
 		);
 	}
 } finally {

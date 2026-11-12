@@ -2072,3 +2072,46 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
   跳 GitHub 查看，拍板信息不足）；PR 状态只能经扫描获得、无即席处理指定
   PR 的入口；对话中的 bot 不知自身绑定与扫描子系统、曾在对话中向用户
   索要 PAT（令牌只应走设置页）。
+
+### 失败可恢复切片实测（2026-11-12，分支 feat/s1-recovery-ux，堆叠在 docs/p1-7-record 上）
+
+- 缘起：P1-7 试用的故障链——执行失败后用户找不到重试入口、误点「驳回」把
+  事项打进 14 天冷却、事项在界面无声消失只能翻 JSONL 定性；另有对话中的
+  bot 不知自身绑定、向用户索要 PAT。本切片只修这四处，不动状态机与冷却口径。
+- 驳回两步确认（前端 Inbox）：点「驳回」先出确认条，明示后果（同一 PR 头部
+  未变时 14 天内不再开新事项、有新提交可重开；只是暂时不想处理不要驳回），
+  确认后才调驳回接口。批准/再次执行路径不变。
+- 已关闭视图（后端 + 前端）：lib/audit.ts 新增 latestTerminalAudit；
+  lib/approvals.ts 的 ApprovalView 加 closeReason / closedAt（终态审计的
+  reason 与时刻，无审计时 closedAt 回落 updatedAt、closeReason 留空不编造），
+  新增 listClosedApprovals（带 writeIntent 的 rejected / expired / executed，
+  按关闭时刻倒序、上限 50）；GET /api/approvals 同回 closed。前端收件箱底部
+  可折叠「已关闭」区：状态徽标 + 关闭原因人话映射（rejected_by_user、
+  reconciled 六因逐个映射、TTL 过期按状态说明），已执行项带评论链接。
+- 通知直达：通知记录本就带 findingId，本切片补前端链路——设置页通知条目
+  新增「查看事项」按钮 → App 切收件箱并传 focusId → 命中待批项滚动定位 +
+  高亮环，命中已关闭项先自动展开已关闭区再定位。从左栏进收件箱时 focusId
+  清空，不残留高亮。
+- bot 自我事实：lib/kernel.ts 新增 botSelfFacts（绑定仓库清单、无绑定时明说
+  未绑定；仓库动态的取证边界——对话里没有 GitHub 查询工具、以最近一轮扫描
+  日报为准、不编造 PR/CI 状态；晨间扫描例程归属说明，仅对挂例程的 bot 出现；
+  凭据红线——令牌/Key 只走设置页、绝不让用户在对话里发、用户要发时请其改去
+  设置页、不复述疑似密钥）。server.ts 每轮对话按 bot 当前配置现拼进
+  systemPrompt（bot 角色提示之后、「关于我」之前），绑定变更即时生效。
+- 测试：test:gateway 27 → 33（新增 6 项：已关闭视图 4——驳回带因、对账带因、
+  无审计过期不编造原因、已执行带评论链接且无 writeIntent 不入列且倒序；
+  bot 自我事实 2——绑定清单与红线在场、无绑定口径）；test:model-stub
+  10 → 11（新增 1 项：被测 server 真正发给 stub 模型的 system 内容含凭据
+  红线与取证边界；注 pi-ai 按模型 compat 把指令消息发成 role=developer，
+  捕获口径 system/developer 两收）；其余各套与基线逐项一致（findings 27、
+  scan 10、pr-review 16、schedule 14、recovery 7、listen 9、badtz 4、
+  secrets 21、model-providers 57、r10 22、webfetch 48、trace 24、
+  eval:scan 21、regression 72），聚合 npm run test 退出码 0；根级
+  npm run check 退出码 0（check:ts-imports 等根级链全过）；npm run shots
+  20 张全过——14 张出现字节差，逐张比对（07 通知页、09 收件箱页重点核）
+  均为种子数据时间戳抖动、无内容变化，已还原不入 PR（shots 种子数据里
+  没有已关闭事项，已关闭区未被截图覆盖，其数据面由 test:gateway 钉住、
+  渲染面待真实数据目检）。
+- 明确不做：不改 Finding 状态机、去重冷却（14 天）与网关任何口径；不加
+  「撤销驳回」入口（本切片以确认 + 留痕解决误点与无声消失，撤销入口如仍
+  需要另议）；通知文件结构不变（findingId 自 P1-6 起已有）。

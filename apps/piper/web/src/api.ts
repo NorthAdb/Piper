@@ -93,8 +93,8 @@ export async function getArtifact(id: string): Promise<Artifact> {
 	return (await api<{ artifact: Artifact }>(`/api/artifacts/${id}`)).artifact;
 }
 
-export async function listApprovals(): Promise<Approval[]> {
-	return (await api<{ approvals: Approval[] }>("/api/approvals")).approvals;
+export async function listApprovals(): Promise<{ approvals: Approval[]; closed: Approval[] }> {
+	return api<{ approvals: Approval[]; closed: Approval[] }>("/api/approvals");
 }
 
 export async function approveApproval(id: string, intentHash: string): Promise<{ approval: Approval; execution: ApprovalExecution }> {

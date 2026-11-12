@@ -24,7 +24,7 @@
 // 失败在 15 分钟内最多补跑 3 次；启动时今日已过点且未成功则补跑一次（lib/schedule.ts）
 // GET /api/artifacts 产物列表（支持 ?botId= 按 bot 过滤，桌面产物走服务端过滤，R10）
 // GET /api/artifacts/:id 产物正文
-// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved/executing Finding 的审批视图，含 approvalId 与 intentHash）；纯读无写副作用，过期清理由扫描开始与调度周期显式执行（R10）
+// GET /api/approvals 待批收件箱（读真实存储——带 writeIntent 的 open/approved/executing Finding 的审批视图，含 approvalId 与 intentHash；另带 closed：已终态 rejected/expired/executed 的历史视图，含关闭原因 closeReason 与关闭时刻 closedAt）；纯读无写副作用，过期清理由扫描开始与调度周期显式执行（R10）
 // POST /api/approvals/:id/approve {intentHash} 批准并经薄网关执行批准快照（P1-6 + R1）：回 { approval, execution }；
 //   intentHash 与当前内容不一致回 409「内容已变，请重新查看」；正在 executing 回 409；
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
@@ -89,7 +89,7 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.ts";
-import { modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { botSelfFacts, modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
 import type { ChatEvent} from "./lib/kernel.ts";
 import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.ts";
 import type { Finding} from "./lib/findings.ts";
@@ -102,7 +102,7 @@ import { buildTrace} from "./lib/trace.ts";
 import { runMorningScan} from "./lib/scan.ts";
 import { getFinding, listFindings} from "./lib/findings.ts";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.ts";
-import { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
+import { approveApproval, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
 import { listAudit} from "./lib/audit.ts";
 
 const PORT = Number(process.env.PORT || 4310);
@@ -382,7 +382,7 @@ appendSession(bot.id, entry);
 const history = readSession(bot.id);
 try {
 const { text} = await streamChat({
-systemPrompt: `${bot.systemPrompt}\n\n\n${readAboutMe()}`,
+systemPrompt: `${bot.systemPrompt}\n\n${botSelfFacts(bot, { runsMorningScan: morningRoutine()?.botId === bot.id })}\n\n\n${readAboutMe()}`,
 history,
 message,
 tools: webToolsForBot(bot),
@@ -694,7 +694,7 @@ if (artMatch && req.method === "GET") {
 const art = readArtifact(artMatch[1]);
 return art? sendJson(res, 200, { artifact: art}): sendJson(res, 404, { error: "产物不存在"});
 }
-if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: listApprovals()});
+if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: listApprovals(), closed: listClosedApprovals()});
 const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject)$/);
 if (approvalMatch && req.method === "POST") {
 if (approvalMatch[2] === "approve") {

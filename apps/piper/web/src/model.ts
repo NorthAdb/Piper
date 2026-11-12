@@ -168,6 +168,10 @@ export type Approval = {
 	// 来自审计（P1-6）：最近一次执行失败原因与已执行的评论链接
 	lastError: string | null;
 	commentUrl: string | null;
+	// 已关闭视图：关闭原因（rejected_by_user / reconciled:<原因>，无审计时为 null）
+	// 与关闭时刻；活动态恒为 null
+	closeReason: string | null;
+	closedAt: string | null;
 };
 
 // 批准执行的网关结果（POST /api/approvals/:id/approve 的 execution 字段，P1-6）

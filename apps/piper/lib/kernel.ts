@@ -231,6 +231,30 @@ function toolErrorResult(text: string): AgentToolResult<any> {
 	return { content: [{ type: "text", text }], details: { isError: true }, isError: true };
 }
 
+// Bot 自我事实（P1-7 试用暴露的问题）：对话里的 bot 不知道自己的绑定仓库与扫描
+// 子系统的存在，被问「你能看哪些仓库」时回答「什么都看不见」，还反过来向用户
+// 索要 PAT——用户真贴进对话，密钥就进了会话记录。本段由服务端在每轮对话时按
+// bot 的当前配置现拼（绑定变更即时生效），钉死三件事实：绑定清单、仓库动态的
+// 取证边界、凭据红线。
+export function botSelfFacts(bot: Bot, { runsMorningScan = false }: { runsMorningScan?: boolean } = {}): string {
+	const repos = bot.repos ?? [];
+	const lines = [
+		"## 关于你自己（系统事实，以本段为准）",
+		`- 你是 Piper 里的 bot「${bot.name}」。`,
+		repos.length
+			? `- 你绑定的 GitHub 仓库是：${repos.join("、")}。被问到你能看哪些仓库时，按这份清单回答。`
+			: "- 你当前没有绑定任何 GitHub 仓库。被问到时如实说未绑定，不要编造仓库名。",
+		"- 仓库的 PR 待审、CI 失败等动态由晨间扫描子系统取证，结果落在日报产物与「待批收件箱」里；你在对话里没有直接查询 GitHub 的工具，无法实时确认某个 PR 或 CI 的当前状态。被问到这类动态时，说明以最近一轮扫描的日报为准、指引用户去看日报或待批收件箱，不要凭记忆或猜测编造 PR/CI 状态。",
+	];
+	if (runsMorningScan) {
+		lines.push("- 晨间仓库扫描例程挂在你名下：到点（或用户手动触发）时系统自动扫描你绑定的仓库并生成日报，发现需要人拍板的写操作会开成待批事项进收件箱——扫描不是你在对话里手动做的，被问到时按此说明。");
+	}
+	lines.push(
+		"- 凭据红线：GitHub 令牌、模型 API Key 等凭据只能由用户在「设置」页填写。绝不要请用户在对话里把令牌或 Key 发给你；用户主动要在对话里提供时，明确请他改去设置页填写，不要复述、保存或使用他在对话中贴出的任何疑似密钥。",
+	);
+	return lines.join("\n");
+}
+
 export function webToolsForBot(bot: Bot | null | undefined): AgentTool<any>[] {
 	if (!bot || !webFetchEnabled()) return [];
 	if (!webToolBots().includes(bot.id)) return [];

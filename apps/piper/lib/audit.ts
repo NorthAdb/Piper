@@ -124,3 +124,11 @@ export function executedCommentUrl(findingId: string): string | null {
 	const done = listAudit({ findingId }).filter((r) => r.result === "executed");
 	return done.length ? done[done.length - 1].commentUrl : null;
 }
+
+// 终态审计（已关闭视图用）：某 Finding 最近一条终态记录（rejected / expired /
+// executed），给收件箱说明「它为什么没了、何时关闭的」。TTL 到期清理（sweep）不写
+// 审计，此类 expired 返回 null，界面按状态本身说明，不编造原因。
+export function latestTerminalAudit(findingId: string): AuditEntry | null {
+	const terminal = listAudit({ findingId }).filter((r) => r.result === "rejected" || r.result === "expired" || r.result === "executed");
+	return terminal.length ? terminal[terminal.length - 1] : null;
+}
