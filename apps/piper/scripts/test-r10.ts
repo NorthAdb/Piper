@@ -9,10 +9,8 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { APP_DIR } from "./app-dir.ts";
 
-const SCRIPT = fileURLToPath(import.meta.url);
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-r10-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 process.env.PIPER_DATA_DIR = TMP_DATA;

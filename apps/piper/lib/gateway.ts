@@ -1,7 +1,7 @@
 // 薄网关（P1-6 + R1 返工）：apps/piper 层所有对外写副作用的唯一入口。默认拒绝，本批只放行
 // 一种写意图 pr_comment（给指定 PR 发表一条评论）。通用形状：网关只认「批准记录 + 关联
 // Finding」，不认调用方是谁——扫描与对话层没有任何直达 GitHub 写接口的路径（绕过断言
-// 在 scripts/test-gateway.mjs 里以源码检索钉死）。
+// 在 scripts/test-gateway.ts 里以源码检索钉死）。
 // R1 起网关只执行批准时刻的意图快照（approvals 的批准记录），不执行 Finding 里现存的
 // writeIntent 本身：执行前拿快照与当前 writeIntent 逐字比对，不一致 denied/intent_changed，
 // 批准之后被改过的内容发不出去。

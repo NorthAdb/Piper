@@ -233,7 +233,7 @@ R1 起必须带回 intentHash（不一致回 409）且网关只执行批准时�
 ```bash
 cd apps/piper
 npm run build:web        # 脚本需要 public/ 已构建
-npm run regression       # 或 node scripts/regression.ts
+npm run regression       # 或 node dist/scripts/regression.js
 ```
 
 脚本以「无模型 Key」的默认环境在测试端口（4398，可用 `REGRESSION_PORT` 覆盖）启动一份
@@ -260,7 +260,7 @@ SIGINT/SIGTERM 时脚本先杀子进程、关桩、删临时目录再退出。
 打真实 GitHub 的检查拆在独立的非门禁套件（数据目录同样隔离）：
 
 ```bash
-npm run regression:live  # 或 node scripts/regression-live.ts
+npm run regression:live  # 或 node dist/scripts/regression-live.js
 ```
 
 它对绑定仓库跑一轮真实晨间扫描；遇 GitHub 403/429（限流）或网络不可达时输出
@@ -270,7 +270,7 @@ Finding 存储层的单元测试在 `scripts/test-findings.ts`（不走 HTTP、�
 
 ```bash
 cd apps/piper
-npm run test:findings    # 或 node scripts/test-findings.ts
+npm run test:findings    # 或 node dist/scripts/test-findings.js
 ```
 
 覆盖写入补齐字段、按 status/repo/botId 过滤、缺 evidenceUrl / 非法 status / 非法 type /
@@ -279,7 +279,7 @@ npm run test:findings    # 或 node scripts/test-findings.ts
 调度状态机另有假时钟测试 `scripts/test-schedule.ts`（注入 now 与运行函数，不等真实时间）：
 
 ```bash
-npm run test:schedule    # 或 node scripts/test-schedule.ts
+npm run test:schedule    # 或 node dist/scripts/test-schedule.js
 ```
 
 覆盖下一次运行的时区换算、到点只触发一次、失败 15 分钟内补跑 3 次后放弃、补跑成功即停、
@@ -289,7 +289,7 @@ npm run test:schedule    # 或 node scripts/test-schedule.ts
 notifications 文件，不打活网、不对真实仓库发评论）：
 
 ```bash
-npm run test:gateway    # 或 node scripts/test-gateway.ts
+npm run test:gateway    # 或 node dist/scripts/test-gateway.js
 ```
 
 覆盖拒绝路径（未批准直调、意图被改、仓库未绑定、不支持的意图、正文含令牌）与执行
@@ -299,7 +299,7 @@ npm run test:gateway    # 或 node scripts/test-gateway.ts
 扫描规则另有替身测试 `scripts/test-scan.ts`（进程内 fetch 替身 + 临时 findings 文件，不打活网）：
 
 ```bash
-npm run test:scan    # 或 node scripts/test-scan.ts
+npm run test:scan    # 或 node dist/scripts/test-scan.js
 ```
 
 覆盖两条规则的命中与证据链接、跳过进行中 run / 别分支 run / draft PR（且不查其审查）、
@@ -311,7 +311,7 @@ npm run test:scan    # 或 node scripts/test-scan.ts
 
 ```bash
 cd apps/piper
-npm run eval:scan    # 或 node scripts/eval-scan.ts
+npm run eval:scan    # 或 node dist/scripts/eval-scan.js
 ```
 
 - 夹具在 `test/fixtures/github/*.json`，一文件一用例。字段：`name` / `description` /
@@ -2026,3 +2026,8 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
   验证：根级 check-ts-relative-imports 0 违规、根 `npm run check` 整链退出码 0；
   piper 聚合 `npm run test` 退出码 0、各套计数与上文基线逐项一致；shots 20 张全过
   （字节抖动已还原不入 PR）。
+- 2026-11-12（PR #27 审计小修，PA—design 有条件通过后）：README 7 处现行命令由
+  `node scripts/x.ts` 改为 `node dist/scripts/x.js`（MINOR-1，不教直跑 .ts 源码）；
+  `lib/gateway.ts` 注释与 `.gitignore` 注释里的 `.mjs`/`server.mjs` 残留改现行口径
+  （MINOR-2）；删 `scripts/test-r10.ts` 未使用的 `SCRIPT` 常量（NOTE-1）。纯文档与
+  注释，不改行为；聚合 `npm run test` 计数与基线逐项一致（见 PR #27）。
