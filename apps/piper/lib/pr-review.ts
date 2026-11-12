@@ -47,3 +47,33 @@ export function evaluateReviews(reviews: unknown, headSha?: string | null): Revi
 export function prNeedsReview(reviews: unknown, headSha?: string | null): boolean {
 	return !evaluateReviews(reviews, headSha).approved;
 }
+
+// 每位审查人的最新表态（拍板详情展示用，与 evaluateReviews 同一迭代口径：只有
+// APPROVED / CHANGES_REQUESTED 算表态，DISMISSED 顶掉先前表态后该人不再列出，
+// COMMENTED / PENDING 不算）。stale 表示该人的 APPROVED 针对的 commit 不是当前
+// head（批准后又推了新提交）；head 或 commit_id 缺失时不判陈旧（与判定口径一致）。
+export interface ReviewStance {
+	login: string;
+	state: "APPROVED" | "CHANGES_REQUESTED";
+	stale: boolean;
+}
+
+export function latestReviewStances(reviews: unknown, headSha?: string | null): ReviewStance[] {
+	const list: GithubReview[] = Array.isArray(reviews) ? reviews : [];
+	const latestByUser = new Map<string, GithubReview>();
+	for (const r of list) {
+		if (!r || typeof r !== "object") continue;
+		if (typeof r.state !== "string" || !STANCE_STATES.has(r.state)) continue;
+		latestByUser.set(r.user?.login ?? "?", r);
+	}
+	const stances: ReviewStance[] = [];
+	for (const [login, r] of latestByUser) {
+		if (r.state !== "APPROVED" && r.state !== "CHANGES_REQUESTED") continue;
+		stances.push({
+			login,
+			state: r.state,
+			stale: r.state === "APPROVED" && Boolean(headSha) && Boolean(r.commit_id) && r.commit_id !== headSha,
+		});
+	}
+	return stances;
+}

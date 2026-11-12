@@ -154,8 +154,11 @@ try {
 		check("非法迁移 executed→open 被拒", throws(() => F.updateFinding(f1.id, { status: "open" }), /迁移/));
 		const g3 = mk("9103");
 		F.updateFinding(g3.id, { status: "approved" });
-		check("非法迁移 approved→open 被拒", throws(() => F.updateFinding(g3.id, { status: "open" }), /迁移/));
 		check("非法迁移 approved→executed 被拒（须经 executing）", throws(() => F.updateFinding(g3.id, { status: "executed" }), /迁移/));
+		// 拍板切片二起 approved→open 合法：已批准状态下改评论正文，原批准作废退回
+		// 待批（editApprovalBody 是唯一生产调用方，改文与退回在同一动作里成对出现）。
+		const backToOpen = attempt(() => F.updateFinding(g3.id, { status: "open" }));
+		check("合法迁移 approved→open（改文作废批准）", backToOpen?.status === "open", `实际 ${backToOpen?.status}`);
 		const g4 = mk("9104");
 		F.updateFinding(g4.id, { status: "expired" });
 		check("非法迁移 expired→open 被拒", throws(() => F.updateFinding(g4.id, { status: "open" }), /迁移/));

@@ -26,8 +26,8 @@
 // 「建议的写动作」（规则模板正文，P1-6），要等人在收件箱批准后才经网关真正发送。
 import { githubToken } from "./settings.ts";
 import { createFinding, findBlockingFinding, listFindings, updateFinding } from "./findings.ts";
-import type { Finding, FindingInput } from "./findings.ts";
-import { evaluateReviews, prNeedsReview } from "./pr-review.ts";
+import type { Finding, FindingDetail, FindingInput } from "./findings.ts";
+import { evaluateReviews, latestReviewStances, prNeedsReview } from "./pr-review.ts";
 import { appendAudit } from "./audit.ts";
 import type { ArtifactMeta } from "./store.ts";
 
@@ -151,6 +151,33 @@ async function fetchRepoData(repo: string): Promise<RepoData> {
 async function fetchReviews(repo: string, prNumber: number): Promise<{ reviews: any[]; truncated: boolean }> {
 	const page = await ghPage(`/repos/${repo}/pulls/${prNumber}/reviews`, PAGE_CAPS.reviews);
 	return { reviews: page.items, truncated: page.truncated };
+}
+
+// 拍板详情取证（切片二）：单查 PR 拿描述/分支/改动规模，再拉变更文件清单
+//（存前 20 个，总数以 PR 的 changed_files 为准）。详情不是规则输入——取不到
+// 时调用方降级为「无详情开单 + 日报注明」，不让展示层故障连坐开单主链。
+const DETAIL_FILES_CAP = 20;
+const DETAIL_BODY_CHARS = 500;
+
+async function fetchPrDetail(repo: string, prNumber: number, reviews: unknown, headSha: string | null): Promise<FindingDetail> {
+	const pr = await gh(`/repos/${repo}/pulls/${prNumber}`);
+	const filesPage = await ghPage(`/repos/${repo}/pulls/${prNumber}/files`, { perPage: 100, maxItems: 100 });
+	return {
+		bodyExcerpt: String(pr?.body ?? "").slice(0, DETAIL_BODY_CHARS),
+		baseRef: String(pr?.base?.ref ?? ""),
+		headRef: String(pr?.head?.ref ?? ""),
+		changedFiles: typeof pr?.changed_files === "number" ? pr.changed_files : filesPage.items.length,
+		additions: typeof pr?.additions === "number" ? pr.additions : 0,
+		deletions: typeof pr?.deletions === "number" ? pr.deletions : 0,
+		files: filesPage.items
+			.slice(0, DETAIL_FILES_CAP)
+			.map((f: any) => ({
+				filename: String(f?.filename ?? ""),
+				additions: typeof f?.additions === "number" ? f.additions : 0,
+				deletions: typeof f?.deletions === "number" ? f.deletions : 0,
+			})),
+		reviewers: latestReviewStances(reviews, headSha),
+	};
 }
 
 // ---- 扫描前对账（R5）：把已失效的 open/approved Finding 自动退役为 expired ----
@@ -307,6 +334,18 @@ async function scanRepo(repo: string, botId: string, now: Date): Promise<{ data:
 		});
 	}
 
+	// ---- 阶段二·五：拍板详情取证（只给本轮真要新开的 pr_needs_review 项拉详情；
+	// 失败降级为无详情 + 日报注明，不整仓失败——详情不是规则输入，见 fetchPrDetail） ----
+	for (const entry of createPlan) {
+		if (entry.type !== "pr_needs_review") continue;
+		const num = Number(entry.subject);
+		try {
+			entry.detail = await fetchPrDetail(repo, num, reviewsCache.get(num) ?? [], typeof entry.headSha === "string" ? entry.headSha : null);
+		} catch {
+			notes.push(`PR #${num} 拍板详情取证失败，事项照常开出但无详情（可点证据链接到 GitHub 查看）`);
+		}
+	}
+
 	// ---- 阶段三：落盘（先对账退役，再开新） ----
 	const reconciled: ReconciledItem[] = [];
 	for (const { finding: f, cause } of retirePlan) {
@@ -323,6 +362,55 @@ async function scanRepo(repo: string, botId: string, now: Date): Promise<{ data:
 	const created = createPlan.map((fields) => createFinding(fields));
 
 	return { data, created, reconciled };
+}
+
+// 即席开单（切片二）：用户在收件箱指定「仓库 + PR 号」即时开一条 pr_needs_review
+// 事项，不必等下一轮扫描。判定与扫描规则二同一套：PR 必须 open、非 draft、按
+// 锁定语义仍待审；已合并/已关闭/draft/已批准回结构化 refusal（路由转人话）；
+// 已有未关闭的同键事项或仍在冷却期的已关闭事项时返回既有项，不另开一条。
+// 评论正文先给模板，用户可在批准前改（approvals.editApprovalBody），批准后
+// 仍走同一网关——即席只改「事项从哪来」，不改「写要过闸」。
+export interface AdHocResult {
+	created: Finding | null;
+	existing: Finding | null;
+	refusal: "pr_merged" | "pr_closed" | "pr_draft" | "pr_approved" | null;
+}
+
+export async function createAdHocReviewFinding({ repo, prNumber, botId }: { repo: string; prNumber: number; botId: string }): Promise<AdHocResult> {
+	const now = new Date();
+	const pr = await gh(`/repos/${repo}/pulls/${prNumber}`);
+	if (pr.state !== "open") return { created: null, existing: null, refusal: pr.merged_at ? "pr_merged" : "pr_closed" };
+	if (pr.draft) return { created: null, existing: null, refusal: "pr_draft" };
+	const { reviews } = await fetchReviews(repo, prNumber);
+	const headSha: string | null = pr.head?.sha ?? null;
+	if (evaluateReviews(reviews, headSha).approved) return { created: null, existing: null, refusal: "pr_approved" };
+	const blocking = findBlockingFinding(repo, "pr_needs_review", prNumber, { headSha, now });
+	if (blocking) return { created: null, existing: blocking, refusal: null };
+	let detail: FindingDetail | null = null;
+	try {
+		detail = await fetchPrDetail(repo, prNumber, reviews, headSha);
+	} catch {
+		detail = null;
+	}
+	const created = createFinding({
+		repo,
+		type: "pr_needs_review",
+		subject: String(prNumber),
+		botId,
+		title: `PR 待审查：#${prNumber} ${pr.title}（${repo}）`,
+		summary: `PR #${prNumber} 由 ${pr.user?.login ?? "?"} 于 ${fmtDate(pr.created_at)} 打开，按每位审查人最新一条审查判定仍未获得批准。（即席开单：由你在收件箱手动指定）`,
+		evidenceUrl: pr.html_url,
+		suggestedAction: "请审查该 PR 并给出结论，或在下方把评论正文改成你想说的话，批准后由网关发到 PR 下。",
+		writeIntent: {
+			kind: "pr_comment",
+			prNumber,
+			body: `分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。\n\n（由 Piper 仓库管家按你的即席请求生成，经你批准后由网关发送。）`,
+		},
+		detail,
+		expiresAt: expiresAtFrom(now),
+		headSha,
+	});
+	return { created, existing: null, refusal: null };
 }
 
 // 「其余观察」：统计与列表只进这里，不进拍板清单。

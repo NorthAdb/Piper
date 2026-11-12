@@ -13,9 +13,11 @@ export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "exe
 export type FindingStatus = (typeof FINDING_STATUSES)[number];
 // 显式状态迁移表（R1）：updateFinding 强制执行，表外迁移一律抛错。
 // executing 是批准执行在途态（网关领取后、落终态前）；executing→approved 是执行失败退回。
+// approved→open（拍板切片二）：用户在已批准状态下改评论正文，原批准随之作废、
+// 退回待批重走批准——「批的是什么就发什么」不因可编辑而破例。
 export const FINDING_TRANSITIONS: Record<FindingStatus, FindingStatus[]> = {
 	open: ["approved", "rejected", "expired"],
-	approved: ["executing", "rejected", "expired"],
+	approved: ["executing", "rejected", "expired", "open"],
 	executing: ["executed", "approved"],
 	rejected: [],
 	expired: [],
@@ -30,6 +32,22 @@ export interface WriteIntent {
 	body: string;
 }
 
+// 拍板详情（切片二）：开单时刻为「拍板的人」取证的 PR 证据快照——描述摘录、
+// 分支、改动规模与文件清单、每位审查人的最新表态。与 headSha 同类：立住后
+// 不可改（updateFinding 不许 patch），要新证据等下一轮扫描开新单。字段在写入
+// 边界逐个收窄（见 validateDetail），外部数据形状不对就丢弃该字段而不是整条
+// Finding 失败——详情是拍板辅助，缺了不能连事项都开不出来。
+export interface FindingDetail {
+	bodyExcerpt: string;
+	baseRef: string;
+	headRef: string;
+	changedFiles: number;
+	additions: number;
+	deletions: number;
+	files: { filename: string; additions: number; deletions: number }[];
+	reviewers: { login: string; state: string; stale: boolean }[];
+}
+
 export interface Finding {
 	id: string;
 	repo: string;
@@ -40,6 +58,7 @@ export interface Finding {
 	evidenceUrl: string;
 	suggestedAction: string;
 	writeIntent: WriteIntent | null;
+	detail: FindingDetail | null;
 	expiresAt: string | null;
 	status: FindingStatus;
 	botId: string;
@@ -59,6 +78,7 @@ export interface FindingInput {
 	evidenceUrl?: unknown;
 	suggestedAction?: unknown;
 	writeIntent?: unknown;
+	detail?: unknown;
 	expiresAt?: unknown;
 	status?: unknown;
 	botId?: unknown;
@@ -132,6 +152,38 @@ function validateWriteIntent(value: unknown): WriteIntent | null {
 	return { kind: v.kind as string, prNumber, body };
 }
 
+// 详情逐字段收窄：类型不对的字段回落安全缺省（字符串 ""、计数 0、列表 []、
+// 列表项形状不对整项丢弃），detail 本身不是对象（且非空）才抛错。
+function validateDetail(value: unknown): FindingDetail | null {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "object" || Array.isArray(value)) throw badRequest("Finding.detail 须为对象或 null");
+	const v = value as Record<string, unknown>;
+	const str = (x: unknown): string => (typeof x === "string" ? x : "");
+	const num = (x: unknown): number => (typeof x === "number" && Number.isFinite(x) && x >= 0 ? Math.floor(x) : 0);
+	const files = Array.isArray(v.files)
+		? v.files
+				.filter((f): f is Record<string, unknown> => Boolean(f) && typeof f === "object")
+				.map((f) => ({ filename: str(f.filename), additions: num(f.additions), deletions: num(f.deletions) }))
+				.filter((f) => f.filename)
+		: [];
+	const reviewers = Array.isArray(v.reviewers)
+		? v.reviewers
+				.filter((r): r is Record<string, unknown> => Boolean(r) && typeof r === "object")
+				.map((r) => ({ login: str(r.login), state: str(r.state), stale: r.stale === true }))
+				.filter((r) => r.login && r.state)
+		: [];
+	return {
+		bodyExcerpt: str(v.bodyExcerpt),
+		baseRef: str(v.baseRef),
+		headRef: str(v.headRef),
+		changedFiles: num(v.changedFiles),
+		additions: num(v.additions),
+		deletions: num(v.deletions),
+		files,
+		reviewers,
+	};
+}
+
 function validateExpiresAt(value: unknown): string | null {
 	if (value === undefined || value === null) return null;
 	if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
@@ -164,6 +216,7 @@ function buildFinding(input: FindingInput): FindingDraft {
 		evidenceUrl: validateEvidenceUrl(input.evidenceUrl),
 		suggestedAction: typeof input.suggestedAction === "string" ? input.suggestedAction : "",
 		writeIntent: validateWriteIntent(input.writeIntent),
+		detail: validateDetail(input.detail),
 		expiresAt: validateExpiresAt(input.expiresAt),
 		status: status as FindingStatus,
 		botId: requireNonEmptyString(input.botId, "botId"),
@@ -269,6 +322,24 @@ export function updateFinding(id: string, patch: Record<string, unknown>): Findi
 	// 借 buildFinding 复检合并结果（status/writeIntent/expiresAt 的合法性都在里面）
 	const checked = buildFinding(merged);
 	const next = { ...all[idx], ...checked, id: all[idx].id, createdAt: all[idx].createdAt, updatedAt: new Date().toISOString() };
+	all[idx] = next;
+	rewriteAll(all);
+	return next;
+}
+
+// 改评论正文的唯一通道（拍板切片二）：writeIntent 不在 PATCHABLE 内（R1——批准的
+// 是用户看到的那份内容），只有本函数可以动 writeIntent.body，且只动 body 一个
+// 字段；调用方（approvals.editApprovalBody）负责状态门（open / approved 才可改）
+// 与审计，本函数再借 buildFinding 复检整条。状态本身不在这里改：approved 改文后
+// 的退回 open 由调用方经 updateFinding 走迁移表完成。
+export function updateFindingWriteIntentBody(id: string, body: string): Finding | null {
+	const all = readAll();
+	const idx = all.findIndex((f) => f.id === id);
+	if (idx < 0) return null;
+	const current = all[idx];
+	if (!current.writeIntent) throw badRequest("该 Finding 没有 writeIntent，不能改正文");
+	const checked = buildFinding({ ...current, writeIntent: { ...current.writeIntent, body } });
+	const next: Finding = { ...current, ...checked, id: current.id, createdAt: current.createdAt, updatedAt: new Date().toISOString() };
 	all[idx] = next;
 	rewriteAll(all);
 	return next;
