@@ -1,0 +1,81 @@
+# Upstream suites (Piper split, drafted 2026-11-12)
+# The `test` job moved verbatim from ci.yml. It runs only when a PR or a
+# push to main touches packages/** or scripts/**, plus a weekly schedule
+# run on main (Mondays 03:00 UTC) to catch environment drift. PRs touching
+# only apps/piper/** (the usual Piper change) no longer run these suites,
+# so their timing flakes (bash-timeout, pi-env 64KiB, MCP OAuth, apt DNS)
+# stop reddening Piper PRs. scripts/** is included because the `other`
+# suite runs test:scripts. Concurrency group is distinct from ci.yml
+# so the two workflows never cancel each other.
+name: Upstream suites
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['packages/**', 'scripts/**']
+  push:
+    branches: [main]
+    paths: ['packages/**', 'scripts/**']
+  schedule:
+    - cron: '0 3 * * 1'
+
+concurrency:
+  group: upstream-suites-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Tests are split across parallel jobs so the slowest suites do not run back to back.
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: coding-agent
+          - name: durable
+          - name: other
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+
+      # fd and ripgrep are used by coding-agent tools tests and tui autocomplete tests.
+      - name: Install system dependencies
+        if: matrix.name != 'durable'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fd-find ripgrep
+          sudo ln -s $(which fdfind) /usr/local/bin/fd
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Build
+        run: npm run build
+
+      - name: Build the pi-env daemon
+        if: matrix.name == 'other'
+        run: npm run build:daemon --workspace packages/env
+
+      - name: Test
+        env:
+          SUITE: ${{ matrix.name }}
+        run: |
+          if [ "$SUITE" != other ]; then
+            npm run test --workspace "packages/$SUITE"
+            exit 0
+          fi
+          # Every other workspace, so new packages are tested without editing this workflow.
+          args=()
+          for dir in packages/*/; do
+            case "$dir" in packages/coding-agent/ | packages/durable/) continue ;; esac
+            args+=(--workspace "${dir%/}")
+          done
+          npm run test:scripts
+          npm run test --if-present "${args[@]}"
