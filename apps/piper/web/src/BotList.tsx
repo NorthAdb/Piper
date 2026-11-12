@@ -30,7 +30,7 @@ export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdi
 
 	useEffect(() => {
 		listApprovals()
-			.then(setApprovals)
+			.then(({ approvals: pending }) => setApprovals(pending))
 			.catch(() => setApprovals([]));
 		getNotifications()
 			.then((r) => setNotifUnread(r.unread))

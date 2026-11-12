@@ -13,11 +13,13 @@ export function Settings({
 	onModelSaved,
 	onUnauthorized,
 	initialTab = "model",
+	onOpenFinding,
 }: {
 	onBack: () => void;
 	onModelSaved: () => void;
 	onUnauthorized: () => void;
 	initialTab?: string;
+	onOpenFinding?: (findingId: string) => void;
 }) {
 	return (
 		<div className="flex h-dvh flex-col bg-background">
@@ -61,7 +63,7 @@ export function Settings({
 						<ConnectorsSettings onUnauthorized={onUnauthorized} />
 					</TabsContent>
 					<TabsContent value="notifications">
-						<NotificationsSettings onUnauthorized={onUnauthorized} />
+						<NotificationsSettings onUnauthorized={onUnauthorized} onOpenFinding={onOpenFinding} />
 					</TabsContent>
 				</Tabs>
 			</div>

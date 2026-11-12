@@ -29,6 +29,8 @@ export function App() {
 	const [busyBotIds, setBusyBotIds] = useState<ReadonlySet<string>>(new Set());
 	const [form, setForm] = useState<FormState>({ open: false, bot: null });
 	const [view, setView] = useState<"main" | "settings" | "inbox">("main");
+	// 通知「查看事项」直达：目标 Finding id，收件箱据此滚动定位并高亮（命中已关闭项时展开历史区）
+	const [inboxFocusId, setInboxFocusId] = useState<string | null>(null);
 	// 中栏视图（对话 / 轨迹，PR-E）：轨迹窗格首次打开后保持挂载，两个窗格靠
 	// visibility 叠放切换——ChatPane 不卸载，滚动位置与输入草稿不丢。
 	const [paneView, setPaneView] = useState<"chat" | "trace">("chat");
@@ -129,13 +131,17 @@ export function App() {
 	const currentBot = bots.find((b) => b.id === currentBotId) ?? null;
 
 	if (view === "inbox") {
-		return <Inbox bots={bots} onBack={() => setView("main")} onUnauthorized={onUnauthorized} />;
+		return <Inbox bots={bots} onBack={() => setView("main")} onUnauthorized={onUnauthorized} focusId={inboxFocusId} />;
 	}
 
 	if (view === "settings") {
 		return (
 			<Settings
 				initialTab={settingsTab}
+				onOpenFinding={(findingId) => {
+					setInboxFocusId(findingId);
+					setView("inbox");
+				}}
 				onBack={() => setView("main")}
 				onModelSaved={() => {
 					void getSession()
@@ -157,7 +163,10 @@ export function App() {
 					onSelect={setCurrentBotId}
 					onNew={() => setForm({ open: true, bot: null })}
 					onEdit={(bot) => setForm({ open: true, bot })}
-					onOpenInbox={() => setView("inbox")}
+					onOpenInbox={() => {
+						setInboxFocusId(null);
+						setView("inbox");
+					}}
 					onOpenSettings={() => {
 						setSettingsTab("model");
 						setView("settings");

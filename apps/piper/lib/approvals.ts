@@ -14,7 +14,7 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getFinding, listFindings, updateFinding } from "./findings.ts";
 import type { Finding, FindingStatus, FindingType, WriteIntent } from "./findings.ts";
-import { appendAudit, executedCommentUrl, latestFailureReason } from "./audit.ts";
+import { appendAudit, executedCommentUrl, latestFailureReason, latestTerminalAudit } from "./audit.ts";
 import { gatewayExecuteWrite } from "./gateway.ts";
 import type { GatewayResult, IntentSnapshot } from "./gateway.ts";
 import { addNotification } from "./notify.ts";
@@ -48,6 +48,12 @@ export interface ApprovalView {
 	intentHash: string | null;
 	lastError: string | null;
 	commentUrl: string | null;
+	// 已关闭视图（rejected / expired / executed）：关闭原因取终态审计的 reason
+	//（rejected_by_user / reconciled:<原因>）；无终态审计（如 TTL 清理的 expired）
+	// 为 null，界面按状态本身说明。活动态恒为 null。closedAt 为终态审计时刻，
+	// 缺失时回落 Finding.updatedAt。
+	closeReason: string | null;
+	closedAt: string | null;
 }
 
 function conflict(message: string): Error & { status: number } {
@@ -164,6 +170,7 @@ export function sweepExpiredFindings(now: Date = new Date()): number {
 
 export function toApproval(f: Finding): ApprovalView {
 	const record = latestApprovalRecord(f.id);
+	const terminal = f.status === "rejected" || f.status === "expired" || f.status === "executed" ? latestTerminalAudit(f.id) : null;
 	return {
 		id: f.id,
 		findingId: f.id,
@@ -186,6 +193,8 @@ export function toApproval(f: Finding): ApprovalView {
 		// 来自审计：最近一次执行失败/被拒原因（approved 待重试时展示）与已执行评论链接。
 		lastError: f.status === "approved" ? latestFailureReason(f.id) : null,
 		commentUrl: executedCommentUrl(f.id),
+		closeReason: terminal?.reason ?? null,
+		closedAt: terminal ? terminal.ts : f.status === "rejected" || f.status === "expired" || f.status === "executed" ? f.updatedAt : null,
 	};
 }
 
@@ -195,6 +204,18 @@ export function listApprovals(): ApprovalView[] {
 	return listFindings()
 		.filter((f) => f.writeIntent && (f.status === "open" || f.status === "approved" || f.status === "executing"))
 		.map(toApproval);
+}
+
+// 已关闭列表：带 writeIntent 且已终态（rejected / expired / executed）的 Finding，
+// 按关闭时刻新在前，上限 50 条。P1-7 试用暴露的问题：事项一旦离开待批集合就在
+// 界面无声消失，用户只能翻 JSONL 才知道它被驳回/被对账退役/已执行——这里给出
+// 带原因的历史视图，「为什么没了」在产品内可查。
+export function listClosedApprovals(limit = 50): ApprovalView[] {
+	return listFindings()
+		.filter((f) => f.writeIntent && (f.status === "rejected" || f.status === "expired" || f.status === "executed"))
+		.map(toApproval)
+		.sort((a, b) => String(b.closedAt ?? b.updatedAt).localeCompare(String(a.closedAt ?? a.updatedAt)))
+		.slice(0, limit);
 }
 
 export function getApproval(id: string): ApprovalView | null {

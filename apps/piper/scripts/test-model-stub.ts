@@ -6,7 +6,8 @@
 //   - 一次对话 SSE 中 delta ≥ 2 且拼合等于 stub 回复全文，会话 JSONL 落了助手文本且不含 Key；
 //   - 失败分类可区分：端点不通 → SSE error code 为 MODEL_ERROR（不是 BASE_NOT_BUILT、
 //     也不是 MODEL_NOT_CONFIGURED），测试连接的 error 文本不含「基座未构建」；
-//   - 清除 Key 后对话回 MODEL_NOT_CONFIGURED。
+//   - 清除 Key 后对话回 MODEL_NOT_CONFIGURED；
+//   - 发给模型的 system 含 bot 自我事实（凭据红线 + 扫描取证边界，失败可恢复切片）。
 // 隔离：server 子进程带 PIPER_DATA_DIR 临时目录、PIPER_GITHUB_API_BASE 本地桩，
 // 与用户真实 data/ 无关；结束清理临时目录。
 import { spawn } from "node:child_process";
@@ -57,6 +58,7 @@ const GH_BASE = `http://127.0.0.1:${(ghStub.address() as AddressInfo).port}`;
 
 // ---- 本地 OpenAI 兼容 stub：stream 走 SSE 分片，非 stream 回整段 JSON ----
 const seenAuth: string[] = [];
+const seenSystems: string[] = [];
 const modelStub = createServer((reqHttp, resHttp) => {
 	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
 		resHttp.statusCode = 404;
@@ -67,11 +69,25 @@ const modelStub = createServer((reqHttp, resHttp) => {
 	let raw = "";
 	reqHttp.on("data", (c) => (raw += c));
 	reqHttp.on("end", () => {
-		let body: { model?: string; stream?: unknown } = {};
+		let body: { model?: string; stream?: unknown; messages?: { role?: string; content?: unknown }[] } = {};
 		try {
 			body = JSON.parse(raw || "{}");
 		} catch {
 			/* 忽略 */
+		}
+		// 抓下发给模型的 system 内容（bot 自我事实断言用）：pi-ai 按模型 compat 把
+		// 指令消息发成 role=system 或 role=developer，两者都收。string 直取，
+		// parts 数组取各 text 段拼合。
+		for (const m of body.messages ?? []) {
+			if (m.role !== "system" && m.role !== "developer") continue;
+			if (typeof m.content === "string") seenSystems.push(m.content);
+			else if (Array.isArray(m.content)) {
+				seenSystems.push(
+					m.content
+						.map((p) => (p && typeof p === "object" && "text" in p ? String((p as { text?: unknown }).text ?? "") : ""))
+						.join(""),
+				);
+			}
 		}
 		const model = body.model || "stub-model";
 		if (body.stream) {
@@ -211,6 +227,16 @@ try {
 		"stub 收到的 Authorization 是保存的 Key（链路真的用了设置里的 Key）",
 		seenAuth.length > 0 && seenAuth.every((a) => a === `Bearer ${FAKE_KEY}`),
 		`请求数=${seenAuth.length}`,
+	);
+	// bot 自我事实（失败可恢复切片）：真正发给模型的 system 里必须带凭据红线与
+	// 扫描取证边界——bot 再也不会在对话里向用户索要令牌，或声称能实时查 PR 状态。
+	const allSystems = seenSystems.join("\n");
+	check(
+		"发给模型的 system 含 bot 自我事实：凭据红线（只走设置页、拒绝在对话里接收）与扫描取证边界",
+		allSystems.includes("只能由用户在「设置」页填写") &&
+			allSystems.includes("绝不要请用户在对话里把令牌或 Key 发给你") &&
+			allSystems.includes("没有直接查询 GitHub 的工具"),
+		`system 段数=${seenSystems.length}`,
 	);
 
 	// 会话 JSONL：落了助手文本、不含 Key 全文
