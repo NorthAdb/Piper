@@ -460,7 +460,7 @@ try {
 const { artifact, report, failures, total, findings} = await runMorningScan({ repos, botId: bot?.id?? "repo-keeper", saveArtifact});
 // 新开的带 writeIntent 的 Finding 即新的待批写操作（P1-6）：逐条写 approval.pending 通知。
 for (const f of findings) {
-if (f.writeIntent) addNotification({ type: "approval.pending", title: `待批写操作：${f.title}`, body: `建议在 ${f.repo} 的 PR #${f.writeIntent.prNumber} 下发表模板评论，请到待批收件箱批准或驳回。证据：${f.evidenceUrl}`, routineId: "morning-scan", artifactId: artifact.id, findingId: f.id});
+if (f.writeIntent) { const target = f.writeIntent.kind === "issue_comment" ? `Issue #${f.writeIntent.issueNumber}` : `PR #${f.writeIntent.prNumber}`; addNotification({ type: "approval.pending", title: `待批写操作：${f.title}`, body: `建议在 ${f.repo} 的 ${target} 下发表模板评论，请到待批收件箱批准或驳回。证据：${f.evidenceUrl}`, routineId: "morning-scan", artifactId: artifact.id, findingId: f.id}); }
 }
 if (total > 0 && failures >= total) {
 updateRoutine("morning-scan", { lastRunAt: new Date().toISOString(), lastArtifactId: artifact.id, lastStatus: "failed"});

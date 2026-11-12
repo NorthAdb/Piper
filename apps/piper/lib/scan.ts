@@ -1,10 +1,12 @@
 // 晨间仓库扫描 routine（P1-2）：只读拉 GitHub REST API 取证，主产物是拍板清单（Finding），
 // 统计信息只进日报的「其余观察」，不再冒充主结果。
-// 进入拍板清单的规则是程序化的（本批就这两条，不要临时扩种类）：
+// 进入拍板清单的规则是程序化的（就这三条，不要临时扩种类）：
 //   ci_failed：按工作流分别取各自在默认分支上最新一条已结束（status=completed）的 run，
 //   仅 conclusion 为 failure 才开单（cancelled/timed_out/startup_failure 不报、不回溯）；
 //   pr_needs_review：open、非 draft、且按「已批准」锁定语义（lib/pr-review.ts：每位审查人
-//   最新一条为准、陈旧批准不算数）仍待审的 PR。
+//   最新一条为准、陈旧批准不算数）仍待审的 PR；
+//   issue_untriaged（Issue 分诊）：open 的 Issue（非 PR），打开满 48 小时，且无人评论、
+//   无标签、无认领人——三者任一出现即视为已有人分诊，不开单。
 // 取证完整性（R6）：pulls/reviews/runs 都翻页取尽（各自有上限，触顶时日报写明「仅检查
 // 前 N 条」）；一个仓的全部取证先完成，再统一计算、统一落盘——任一环节失败整仓不开
 // Finding、不做对账退役，失败记入日报（半成品不落盘）；runs 接口失败不再静默吞掉，
@@ -15,7 +17,8 @@
 // 存进 Finding.headSha 作下轮比较基准。
 // 扫描前对账（R5）：每仓先复核既有 open/approved Finding——PR 已合并/关闭/draft/已批准、
 // 或同工作流 CI 已转绿/已被新失败 run 取代的，自动转 expired 并写审计 reconciled:<原因>，
-// 退出待批。建议先用规则模板，不上模型润色，
+// 退出待批。Issue 类同理：已关闭（issue_closed）或已有人评论/打标签/认领
+//（issue_triaged）的自动退役。建议先用规则模板，不上模型润色，
 // 模型不得发明 GitHub 上不存在的 PR 或 CI（后续步骤若引入模型写建议，同样受此约束）。
 // 令牌经 lib/settings.ts 的 githubToken() 统一读取（L0-4：设置文件优先、环境变量兜底），
 // 本文件不直读令牌环境变量；无令牌走公开限额。API 基址缺省 https://api.github.com，
@@ -89,10 +92,11 @@ export interface PageCaps {
 	maxItems: number;
 }
 
-export const PAGE_CAPS: Record<"pulls" | "reviews" | "runs", PageCaps> = {
+export const PAGE_CAPS: Record<"pulls" | "reviews" | "runs" | "issues", PageCaps> = {
 	pulls: { perPage: 100, maxItems: 200 },
 	reviews: { perPage: 100, maxItems: 300 },
 	runs: { perPage: 100, maxItems: 100 },
+	issues: { perPage: 100, maxItems: 200 },
 };
 
 export async function ghPage<T>(
@@ -138,20 +142,22 @@ async function fetchRepoData(repo: string): Promise<RepoData> {
 		PAGE_CAPS.runs,
 		(j) => j?.workflow_runs,
 	).catch((err) => ({ items: [] as any[], truncated: false, ciMissing: (err as { status?: string | number } | undefined)?.status ?? "未知" }));
-	const [commits, pullsPage, issues, runsPage] = await Promise.all([
+	const issuesPagePromise = ghPage(`/repos/${repo}/issues?state=open`, PAGE_CAPS.issues);
+	const [commits, pullsPage, issuesPage, runsPage] = await Promise.all([
 		gh(`/repos/${repo}/commits?per_page=5`),
 		pullsPagePromise,
-		gh(`/repos/${repo}/issues?state=open&per_page=10`),
+		issuesPagePromise,
 		runsPagePromise,
 	]);
 	if (pullsPage.truncated) notes.push(`PR 超过检查上限，仅检查前 ${PAGE_CAPS.pulls.maxItems} 条`);
+	if (issuesPage.truncated) notes.push(`Issue 超过检查上限，仅检查前 ${PAGE_CAPS.issues.maxItems} 条`);
 	if (runsPage.truncated) notes.push(`CI run 超过检查上限，仅检查最近 ${PAGE_CAPS.runs.maxItems} 条`);
 	return {
 		info,
 		branch,
 		commits: commits ?? [],
 		pulls: pullsPage.items,
-		issues: (issues ?? []).filter((i: any) => !i.pull_request),
+		issues: issuesPage.items.filter((i: any) => !i.pull_request),
 		runs: runsPage.items,
 		ciMissing: runsPage.ciMissing ?? null,
 		notes,
@@ -225,6 +231,35 @@ function prRetireCause(f: Finding, data: RepoData, prDetails: Map<number, any>, 
 	return null;
 }
 
+// Issue 的标签名归一：接口给 [{ name }] 或字符串数组都认。
+export function issueLabels(issue: any): string[] {
+	if (!Array.isArray(issue?.labels)) return [];
+	return issue.labels.map((l: any) => (typeof l === "string" ? l : String(l?.name ?? ""))).filter(Boolean);
+}
+
+// 「已有人分诊」判定（规则三与对账共用同一口径）：有评论、或有标签、或有认领人，
+// 任一成立即已分诊。字段缺失按未分诊处理（与取证缺 head 同口径：不误判已分诊）。
+export function issueTouched(issue: any): boolean {
+	return (
+		(typeof issue?.comments === "number" && issue.comments > 0) ||
+		issueLabels(issue).length > 0 ||
+		(Array.isArray(issue?.assignees) && issue.assignees.length > 0)
+	);
+}
+
+function issueRetireCause(f: Finding, data: RepoData, issueDetails: Map<number, any>): string | null {
+	const num = Number(f.subject);
+	const inList = data.issues.find((i) => i.number === num);
+	if (inList) return issueTouched(inList) ? "issue_triaged" : null;
+	const one = issueDetails.get(num) ?? null;
+	if (!one) return null;
+	if (one.state === "closed") return "issue_closed";
+	return issueTouched(one) ? "issue_triaged" : null;
+}
+
+// Issue 开单的年龄门：刚提的 Issue 给维护者留 48 小时自然处理窗口，过了才进拍板清单。
+const ISSUE_TRIAGE_MIN_AGE_MS = 48 * 3600 * 1000;
+
 // 对一个仓库取证并按规则开 Finding。三阶段（R6，半成品不落盘）：
 //   阶段一 取证：仓数据、对账候选 PR 的单查、全部相关 PR 的审查，全部先取齐；
 //     本阶段任何失败都抛错，由上层记入日报并计 failures，本仓不落任何盘。
@@ -274,6 +309,18 @@ async function scanRepo(repo: string, botId: string, now: Date): Promise<{ data:
 		const pr = data.pulls.find((p) => p.number === num) ?? prDetails.get(num);
 		if (pr && pr.state !== "closed" && !pr.draft) await fetchReviewsCached(num);
 	}
+	// 对账候选 Issue 不在 open 列表时单查取证（已关闭的 Issue 不在 open 列表里）。
+	const issueDetails = new Map<number, any>();
+	for (const f of candidates) {
+		if (f.type !== "issue_untriaged") continue;
+		const num = Number(f.subject);
+		if (data.issues.some((i) => i.number === num)) continue;
+		try {
+			issueDetails.set(num, await gh(`/repos/${repo}/issues/${num}`));
+		} catch {
+			issueDetails.set(num, null);
+		}
+	}
 	// 规则要看的审查全部取齐。draft 不取审查、直接跳过（也不产生 Finding）。
 	for (const p of data.pulls) {
 		if (!p.draft) await fetchReviewsCached(p.number);
@@ -283,7 +330,11 @@ async function scanRepo(repo: string, botId: string, now: Date): Promise<{ data:
 	const retirePlan: Array<{ finding: Finding; cause: string }> = [];
 	for (const f of candidates) {
 		const cause =
-			f.type === "pr_needs_review" ? prRetireCause(f, data, prDetails, (num) => reviewsCache.get(num)) : ciRetireCause(f, data);
+			f.type === "pr_needs_review"
+				? prRetireCause(f, data, prDetails, (num) => reviewsCache.get(num))
+				: f.type === "issue_untriaged"
+					? issueRetireCause(f, data, issueDetails)
+					: ciRetireCause(f, data);
 		if (cause) retirePlan.push({ finding: f, cause });
 	}
 	const createPlan: FindingInput[] = [];
@@ -343,6 +394,42 @@ async function scanRepo(repo: string, botId: string, now: Date): Promise<{ data:
 			},
 			expiresAt: expiresAtFrom(now),
 			headSha,
+		});
+	}
+
+	// 规则三：issue_untriaged。附带 writeIntent 是分诊评论模板（先回应作者、告知
+	// 已进入分诊），同样只是待批参数，批准后才由网关发送。Issue 没有 head，
+	// 去重头部恒为 null（驳回后按 14 天冷却，见 findings.findBlockingFinding）。
+	for (const issue of data.issues) {
+		const createdMs = Date.parse(issue.created_at ?? "");
+		if (!Number.isFinite(createdMs) || now.getTime() - createdMs < ISSUE_TRIAGE_MIN_AGE_MS) continue;
+		if (issueTouched(issue)) continue;
+		const subject = String(issue.number);
+		if (findBlockingFinding(repo, "issue_untriaged", subject, { headSha: null, now })) continue;
+		const ageDays = Math.floor((now.getTime() - createdMs) / 86400000);
+		createPlan.push({
+			repo,
+			type: "issue_untriaged",
+			subject,
+			botId,
+			title: `Issue 待分诊：#${issue.number} ${issue.title}（${repo}）`,
+			summary: `Issue #${issue.number} 由 ${issue.user?.login ?? "?"} 于 ${fmtDate(issue.created_at)} 打开，已 ${ageDays} 天无人评论、无标签、无认领人。`,
+			evidenceUrl: issue.html_url,
+			suggestedAction: "请分诊该 Issue：补充标签或指认领人，或批准收件箱里的分诊评论先回应作者。",
+			writeIntent: {
+				kind: "issue_comment",
+				issueNumber: issue.number,
+				body: `分诊提醒：这个 Issue 已打开 ${ageDays} 天，尚无人回应。维护者会尽快完成分诊（补充标签 / 指认领人）；作者如有更多复现信息，欢迎补充在下面。\n\n（由 Piper 仓库管家在晨间扫描中生成，经人工批准后由网关发送。）`,
+			},
+			issueDetail: {
+				bodyExcerpt: String(issue.body ?? "").slice(0, DETAIL_BODY_CHARS),
+				labels: issueLabels(issue),
+				assignees: (Array.isArray(issue.assignees) ? issue.assignees : []).map((a: any) => String(a?.login ?? "")).filter(Boolean),
+				commentCount: typeof issue.comments === "number" ? issue.comments : 0,
+				authorLogin: issue.user?.login ?? "",
+			},
+			expiresAt: expiresAtFrom(now),
+			headSha: null,
 		});
 	}
 
@@ -503,8 +590,9 @@ export async function runMorningScan({
 	];
 	if (createdAll.length) {
 		parts.push(`本轮新开 ${createdAll.length} 条需要拍板的事项：`, "");
+		const TYPE_LABELS: Record<string, string> = { ci_failed: "CI 失败", pr_needs_review: "PR 待审查", issue_untriaged: "Issue 待分诊" };
 		for (const f of createdAll) {
-			parts.push(`- [${f.type === "ci_failed" ? "CI 失败" : "PR 待审查"}] ${f.title}`);
+			parts.push(`- [${TYPE_LABELS[f.type] ?? f.type}] ${f.title}`);
 			parts.push(`  - 证据：${f.evidenceUrl}`);
 			parts.push(`  - 建议：${f.suggestedAction}`);
 		}

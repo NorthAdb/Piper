@@ -74,7 +74,7 @@ try {
 	});
 	check(
 		"createFinding 带 pr_comment writeIntent 时 prNumber 归一为数字、subject 归一为字符串",
-		f2.subject === "42" && f2.writeIntent?.prNumber === 42 && f2.writeIntent?.body === "请补充测试。",
+		f2.subject === "42" && f2.writeIntent?.kind === "pr_comment" && f2.writeIntent.prNumber === 42 && f2.writeIntent?.body === "请补充测试。",
 		JSON.stringify(f2.writeIntent),
 	);
 
@@ -103,6 +103,47 @@ try {
 	check("listFindings 非法 status 过滤被拒绝", throws(() => F.listFindings({ status: "pending" }), /status/));
 
 	check("getFinding 按 id 读回，不存在返回 null", F.getFinding(f1.id)?.id === f1.id && F.getFinding("f-nope") === null);
+
+	// Issue 分诊：issue_comment 意图与 issueDetail 的写入边界校验。
+	const fi = F.createFinding({
+		...base,
+		type: "issue_untriaged",
+		subject: 7,
+		title: "Issue 待分诊：#7 导出失败",
+		evidenceUrl: "https://github.com/NorthAdb/LinkForge/issues/7",
+		writeIntent: { kind: "issue_comment", issueNumber: "7", body: "分诊提醒。" },
+		issueDetail: { bodyExcerpt: "导出时报错", labels: [], assignees: [], commentCount: 0, authorLogin: "reporter" },
+	});
+	check(
+		"createFinding 带 issue_comment writeIntent 时 issueNumber 归一为数字、issueDetail 落盘",
+		fi.subject === "7" &&
+			fi.writeIntent?.kind === "issue_comment" &&
+			fi.writeIntent.issueNumber === 7 &&
+			fi.issueDetail?.authorLogin === "reporter" &&
+			fi.issueDetail?.commentCount === 0,
+		JSON.stringify(fi),
+	);
+	check(
+		"issue_comment 缺 issueNumber 被拒绝",
+		throws(() => F.createFinding({ ...base, writeIntent: { kind: "issue_comment", body: "x" } }), /issueNumber/),
+	);
+	const fiBad = F.createFinding({
+		...base,
+		type: "issue_untriaged",
+		subject: 8,
+		title: "Issue 待分诊：#8 坏字段",
+		evidenceUrl: "https://github.com/NorthAdb/LinkForge/issues/8",
+		issueDetail: { bodyExcerpt: 42, labels: ["bug", 7, ""], assignees: "nobody", commentCount: -3, authorLogin: null },
+	});
+	check(
+		"issueDetail 坏字段逐个回落缺省（不整条失败）",
+		fiBad.issueDetail?.bodyExcerpt === "" &&
+			JSON.stringify(fiBad.issueDetail?.labels) === JSON.stringify(["bug"]) &&
+			fiBad.issueDetail?.assignees.length === 0 &&
+			fiBad.issueDetail?.commentCount === 0 &&
+			fiBad.issueDetail?.authorLogin === "",
+		JSON.stringify(fiBad.issueDetail),
+	);
 
 	check(
 		"findOpenFinding 命中 open 的同 repo/type/subject",
@@ -136,10 +177,11 @@ try {
 
 	// R1：writeIntent 已从可改字段移除——批准后内容以批准记录快照为准，存储层不许再改。
 	F.updateFinding(f2.id, { writeIntent: { kind: "pr_comment", prNumber: 99, body: "被篡改的正文" } });
+	const wiAfterTamper = F.getFinding(f2.id)?.writeIntent;
 	check(
 		"updateFinding 不能改 writeIntent（批准内容不可篡改）",
-		F.getFinding(f2.id)?.writeIntent?.prNumber === 42 && F.getFinding(f2.id)?.writeIntent?.body === "请补充测试。",
-		JSON.stringify(F.getFinding(f2.id)?.writeIntent),
+		wiAfterTamper?.kind === "pr_comment" && wiAfterTamper.prNumber === 42 && wiAfterTamper.body === "请补充测试。",
+		JSON.stringify(wiAfterTamper),
 	);
 
 	// R1：状态迁移表——非法迁移全部被拒，合法链完整可走。

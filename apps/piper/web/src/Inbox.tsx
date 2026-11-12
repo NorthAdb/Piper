@@ -1,6 +1,6 @@
 // 待批收件箱（P1-5 独立视图 + P1-6 网关执行）：「拍板」的主界面——列出带 writeIntent
 // 的待批 Finding（类型 / 仓库 / 证据 / 建议 / 完整写参数 / 过期时间）。
-// 批准后经薄网关执行写入（本批唯一写操作：给指定 PR 发模板评论），结果当场可见：
+// 批准后经薄网关执行写入（给指定 PR 或 Issue 发模板评论），结果当场可见：
 // 成功给出评论链接；失败保持已批准状态、显示原因、可再次点批准重试。驳回不产生写操作。
 // 失败可恢复切片（P1-7 试用复盘）：驳回改为两步确认（误点代价是 14 天去重冷却，
 // 必须让用户在点下前看清后果）；下方加「已关闭」历史区（被驳回 / 被对账退役 /
@@ -21,7 +21,13 @@ import type { Approval, Bot } from "./model";
 const TYPE_LABEL: Record<string, string> = {
 	ci_failed: "CI 失败",
 	pr_needs_review: "PR 待审查",
+	issue_untriaged: "Issue 待分诊",
 };
+
+// 写意图的评论目标（PR 或 Issue），批准回执与写操作框共用。
+function intentTarget(a: Approval): string {
+	return a.writeIntent.kind === "issue_comment" ? `Issue #${a.writeIntent.issueNumber}` : `PR #${a.writeIntent.prNumber}`;
+}
 
 const CLOSED_STATUS_LABEL: Record<string, string> = {
 	executed: "已执行",
@@ -32,13 +38,18 @@ const CLOSED_STATUS_LABEL: Record<string, string> = {
 // 关闭原因（后端给的是审计 reason 原文）→ 给人看的说明。
 function closeReasonText(a: Approval): string {
 	const reason = a.closeReason;
-	if (reason === "rejected_by_user") return "由你驳回关闭。同一 PR 头部未变时 14 天内不会再开新事项，有新提交则可重开。";
+	if (reason === "rejected_by_user")
+		return a.type === "issue_untriaged"
+			? "由你驳回关闭。14 天内同一 Issue 不会再开新事项。"
+			: "由你驳回关闭。同一 PR 头部未变时 14 天内不会再开新事项，有新提交则可重开。";
 	if (reason === "reconciled:pr_merged") return "PR 已合并，扫描对账时自动关闭。";
 	if (reason === "reconciled:pr_closed") return "PR 已关闭，扫描对账时自动关闭。";
 	if (reason === "reconciled:pr_draft") return "PR 已转为草稿，扫描对账时自动关闭。";
 	if (reason === "reconciled:pr_approved") return "PR 已获得批准，扫描对账时自动关闭。";
 	if (reason === "reconciled:ci_green") return "CI 已转绿，扫描对账时自动关闭。";
 	if (reason === "reconciled:ci_superseded") return "已被更新的 CI 运行取代，扫描对账时自动关闭。";
+	if (reason === "reconciled:issue_closed") return "Issue 已关闭，扫描对账时自动关闭。";
+	if (reason === "reconciled:issue_triaged") return "Issue 已有人评论、打标签或认领，扫描对账时自动关闭。";
 	if (reason) return `关闭原因：${reason}`;
 	if (a.status === "expired") return "已超过有效期，自动关闭。";
 	return "";
@@ -115,7 +126,7 @@ export function Inbox({
 			if (action === "approve") {
 				const { execution } = await approveApproval(a.id, a.intentHash);
 				if (execution.ok) {
-					setNotice(`已执行「${a.title}」，评论已发到 ${a.repo} 的 PR #${a.writeIntent.prNumber}${execution.commentUrl ? `：${execution.commentUrl}` : ""}`);
+					setNotice(`已执行「${a.title}」，评论已发到 ${a.repo} 的 ${intentTarget(a)}${execution.commentUrl ? `：${execution.commentUrl}` : ""}`);
 				} else {
 					setNotice(`「${a.title}」已批准但执行未成功（${execution.reason ?? execution.result}），保持已批准状态，可再次点批准重试。`);
 				}
@@ -314,6 +325,22 @@ export function Inbox({
 													) : null}
 												</div>
 											) : null}
+											{a.issueDetail ? (
+												<div className="flex flex-col gap-2 rounded-lg border px-3 py-2.5 text-sm">
+													<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+														{a.issueDetail.authorLogin ? <span>作者：{a.issueDetail.authorLogin}</span> : null}
+														<span>开单时评论数：{a.issueDetail.commentCount}</span>
+														<span>标签：{a.issueDetail.labels.length > 0 ? a.issueDetail.labels.join("、") : "无"}</span>
+														<span>认领人：{a.issueDetail.assignees.length > 0 ? a.issueDetail.assignees.join("、") : "无"}</span>
+													</div>
+													{a.issueDetail.bodyExcerpt ? (
+														<div>
+															<p className="pb-1 text-xs font-medium tracking-wider text-muted-foreground uppercase">Issue 正文（摘录）</p>
+															<pre className="font-mono text-xs break-words whitespace-pre-wrap">{a.issueDetail.bodyExcerpt}</pre>
+														</div>
+													) : null}
+												</div>
+											) : null}
 											<div className="rounded-lg border bg-card px-3 py-2.5">
 												<div className="flex items-center pb-1.5">
 													<p className="text-xs font-medium tracking-wider text-muted-foreground uppercase">批准后将执行的写操作</p>
@@ -335,7 +362,7 @@ export function Inbox({
 													) : null}
 												</div>
 												<p className="text-sm">
-													在 {a.repo} 的 PR #{a.writeIntent.prNumber} 下发表评论：
+													在 {a.repo} 的 {intentTarget(a)} 下发表评论：
 												</p>
 												{editId === a.id ? (
 													<div className="flex flex-col gap-2 pt-1.5">
@@ -368,7 +395,15 @@ export function Inbox({
 													<p className="flex items-start gap-2 text-sm">
 														<TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
 														<span>
-															驳回后本事项立即关闭：同一 PR 头部未变时，<strong>14 天内不会再开新事项</strong>（PR 有新提交则可重开）。只是暂时不想处理的话，不要驳回，留着即可。
+															{a.type === "issue_untriaged" ? (
+																<>
+																	驳回后本事项立即关闭：<strong>14 天内同一 Issue 不会再开新事项</strong>。只是暂时不想处理的话，不要驳回，留着即可。
+																</>
+															) : (
+																<>
+																	驳回后本事项立即关闭：同一 PR 头部未变时，<strong>14 天内不会再开新事项</strong>（PR 有新提交则可重开）。只是暂时不想处理的话，不要驳回，留着即可。
+																</>
+															)}
 														</span>
 													</p>
 													<div className="flex gap-2">

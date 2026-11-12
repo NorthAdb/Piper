@@ -22,6 +22,7 @@ export interface IntentSummary {
 	kind: unknown;
 	repo: unknown;
 	prNumber: unknown;
+	issueNumber: unknown;
 	bodyLength: number;
 	bodyPreview: string;
 }
@@ -48,12 +49,13 @@ function auditFile(): string {
 // GitHub 令牌，旧令牌与模型 Key 都漏（审计 M4）。
 export function summarizeIntent(intent: unknown): IntentSummary | null {
 	if (!intent || typeof intent !== "object") return null;
-	const o = intent as { body?: unknown; kind?: unknown; repo?: unknown; prNumber?: unknown };
+	const o = intent as { body?: unknown; kind?: unknown; repo?: unknown; prNumber?: unknown; issueNumber?: unknown };
 	const rawBody = typeof o.body === "string" ? o.body : "";
 	return {
 		kind: o.kind ?? null,
 		repo: o.repo ?? null,
 		prNumber: o.prNumber ?? null,
+		issueNumber: o.issueNumber ?? null,
 		bodyLength: rawBody.length,
 		bodyPreview: redact(rawBody).slice(0, 120),
 	};

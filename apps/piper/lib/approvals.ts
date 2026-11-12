@@ -13,7 +13,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { getFinding, listFindings, updateFinding, updateFindingWriteIntentBody } from "./findings.ts";
-import type { Finding, FindingDetail, FindingStatus, FindingType, WriteIntent } from "./findings.ts";
+import type { Finding, FindingDetail, FindingStatus, FindingType, IssueDetail, WriteIntent } from "./findings.ts";
 import { containsSecret } from "./redact.ts";
 import { appendAudit, executedCommentUrl, latestFailureReason, latestTerminalAudit } from "./audit.ts";
 import { gatewayExecuteWrite } from "./gateway.ts";
@@ -42,6 +42,7 @@ export interface ApprovalView {
 	suggestedAction: string;
 	writeIntent: WriteIntent | null;
 	detail: FindingDetail | null;
+	issueDetail: IssueDetail | null;
 	status: FindingStatus;
 	expiresAt: string | null;
 	createdAt: string;
@@ -70,11 +71,13 @@ function approvalsFile(): string {
 // 意图快照：网关执行的唯一内容来源。repo 取 Finding.repo（取证事实，不可改）。
 export function intentSnapshotOf(finding: Finding | null | undefined): IntentSnapshot | null {
 	if (!finding?.writeIntent) return null;
+	const intent = finding.writeIntent;
 	return {
-		kind: finding.writeIntent.kind,
+		kind: intent.kind,
 		repo: finding.repo,
-		prNumber: finding.writeIntent.prNumber,
-		body: finding.writeIntent.body,
+		prNumber: intent.kind === "pr_comment" ? intent.prNumber : null,
+		issueNumber: intent.kind === "issue_comment" ? intent.issueNumber : null,
+		body: intent.body,
 	};
 }
 
@@ -185,6 +188,7 @@ export function toApproval(f: Finding): ApprovalView {
 		suggestedAction: f.suggestedAction,
 		writeIntent: f.writeIntent,
 		detail: f.detail ?? null,
+		issueDetail: f.issueDetail ?? null,
 		status: f.status,
 		expiresAt: f.expiresAt,
 		createdAt: f.createdAt,
