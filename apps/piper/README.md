@@ -2304,3 +2304,16 @@ agent-tool-typebox / proxy 四个文件），`start` 顺序变更未打破任何
   `github_comment`、GitHub 写入均未在本切片出现，分别归 P2-2 至 P2-4；
   未向任何产品 bot 挂文件工具或 shell。CI 侧本 PR 改 `packages/**`，
   `upstream-suites` 随 PR 触发，结果以 PR 检查为准。
+- CI 补记（2026-11-12 晚，PR #33 首轮）：常规三门禁与 test (other) 绿，
+  test (coding-agent) 仅 1 条红（3105 过、1 红）：上游回归测试
+  `8935-parallel-preflight-abort` 断言 starts 应为 2、实得 1。定性：不是
+  flake，是新事件契约与该上游测试钉住的旧时序正面冲突——旧契约下并行
+  预检一开始就给每个调用发 start；该测试的场景是第二个调用的预检中途
+  abort，其命名的回归性质是「已预备好的工具不得执行」（executions 为
+  空），start 计数只是旧时序的副产品。处置：按切片锁定的新契约改这条
+  上游测试的计数断言（starts 2 → 1，并注明唯一 start 属于已通过预检的
+  第一个调用；ends 与 tool result 的集合断言改对 ends 比），回归性质的
+  断言（preflights 两条、executions 空、result hooks 空、两条结果均为
+  Operation aborted）一条未动。本地复现与修复后单跑均已验证；此改动
+  请 PA—design 在 P2-1 审计时一并裁决——若审计认为并行模式应保留旧
+  时序，应回本节改判，而不是在代码里含糊过去。
