@@ -12,6 +12,8 @@
 // 以及「除网关外无人构造 GitHub 评论写端点」的源码绕过断言。
 // 失败可恢复切片新增：已关闭视图（终态 Finding 带关闭原因留痕、不混入待批列表、
 // 无 writeIntent 不入列）与 bot 自我事实（绑定清单如实、凭据红线在场）。
+// 拍板切片二新增：评论正文可编辑（改文冻结口径、approved 改文作废批准、
+// 含令牌正文保存即拒）。
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ArtifactMeta } from "../lib/store.ts";
 import type { Finding } from "../lib/findings.ts";
@@ -111,7 +113,7 @@ try {
 	const { ensureData } = await import("../lib/store.ts");
 	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
 	const { createFinding, getFinding: getFindingRaw, updateFinding } = await import("../lib/findings.ts");
-	const { approveApproval: approveApprovalRaw, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.ts");
+	const { approveApproval: approveApprovalRaw, editApprovalBody, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.ts");
 	// 本套件的 Finding 均为刚写入必存在（原 JS 全程按此隐含假定写）：包一层非空断言收口，
 	// approveApproval 的 null（不存在→404）与 getFinding 的 null 在本套件语境下都不出现。
 	const getFinding = (id: string): Finding => getFindingRaw(id) as Finding;
@@ -723,7 +725,82 @@ try {
 		);
 	}
 
-	// 24. bot 自我事实（失败可恢复切片）：绑定仓库如实列出、扫描取证边界与凭据
+	// 24. 正文可编辑（拍板切片二）：open 改文后批准发的是新正文、用旧哈希批准
+	//     回 409；approved 改文作废原批准退回 open 并留审计；含令牌正文保存时
+	//     即被拒（400）；已关闭改文 409；空正文 400。
+	{
+		const f = makeFinding({ subject: "130" });
+		const oldHash = viewOf(f.id)?.intentHash;
+		const edited = editApprovalBody(f.id, "改后的正文：请重点看迁移脚本与回滚说明。") as NonNullable<ReturnType<typeof editApprovalBody>>;
+		let staleThrew: (Error & { status?: number }) | null = null;
+		try {
+			await approveApproval(f.id, { intentHash: oldHash, saveArtifactFn: saveArtifactStub });
+		} catch (err) {
+			staleThrew = err as Error & { status?: number };
+		}
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: edited.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"正文可编辑：open 改文后旧哈希批准回 409、新哈希批准执行且发出的是改后正文",
+			edited.writeIntent?.body === "改后的正文：请重点看迁移脚本与回滚说明。" &&
+				staleThrew?.status === 409 &&
+				out.execution.ok === true &&
+				postCalls.length === before + 1 &&
+				String(postCalls[before]?.body?.body ?? "").startsWith("改后的正文：请重点看迁移脚本与回滚说明。"),
+			`edited=${JSON.stringify(edited.writeIntent)} stale=${staleThrew?.status}`,
+		);
+	}
+	{
+		const f = makeFinding({ subject: "131" });
+		pullState = "closed";
+		await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		pullState = "open";
+		const wasApproved = getFinding(f.id).status === "approved";
+		const edited = editApprovalBody(f.id, "第二版正文。") as NonNullable<ReturnType<typeof editApprovalBody>>;
+		const out = await approveApproval(f.id, { intentHash: edited.intentHash, saveArtifactFn: saveArtifactStub });
+		check(
+			"正文可编辑：approved 改文作废原批准（退回 open、审计 edited/approval_invalidated），重新批准后发出新正文",
+			wasApproved &&
+				edited.status === "open" &&
+				auditFor(f.id).some((x) => x.result === "edited" && x.reason === "approval_invalidated") &&
+				out.execution.ok === true &&
+				String(postCalls[postCalls.length - 1]?.body?.body ?? "").startsWith("第二版正文。"),
+			`wasApproved=${wasApproved} editedStatus=${edited.status}`,
+		);
+	}
+	{
+		const f = makeFinding({ subject: "132" });
+		let secretThrew: (Error & { status?: number }) | null = null;
+		try {
+			editApprovalBody(f.id, `这是令牌 ${ENV_TOKEN} 请查收`);
+		} catch (err) {
+			secretThrew = err as Error & { status?: number };
+		}
+		let emptyThrew: (Error & { status?: number }) | null = null;
+		try {
+			editApprovalBody(f.id, "   ");
+		} catch (err) {
+			emptyThrew = err as Error & { status?: number };
+		}
+		const g = makeFinding({ subject: "133" });
+		rejectApproval(g.id);
+		let closedThrew: (Error & { status?: number }) | null = null;
+		try {
+			editApprovalBody(g.id, "关闭后改文");
+		} catch (err) {
+			closedThrew = err as Error & { status?: number };
+		}
+		check(
+			"正文可编辑：疑似含令牌的正文保存即被拒（400、正文不变）、空正文 400、已关闭改文 409",
+			secretThrew?.status === 400 &&
+				getFinding(f.id).writeIntent?.body === BODY &&
+				emptyThrew?.status === 400 &&
+				closedThrew?.status === 409,
+			`secret=${secretThrew?.status} empty=${emptyThrew?.status} closed=${closedThrew?.status}`,
+		);
+	}
+
+	// 25. bot 自我事实（失败可恢复切片）：绑定仓库如实列出、扫描取证边界与凭据
 	//     红线在场；无绑定时明说未绑定，不编造。
 	{
 		const base = {

@@ -146,6 +146,19 @@ export type WriteIntent = {
 	body: string;
 };
 
+// 拍板详情（切片二）：开单时刻的 PR 证据快照，形状与后端 FindingDetail 对齐；
+// 旧数据或详情取证失败时为 null，界面回落到只有摘要 + 证据链接
+export type FindingDetail = {
+	bodyExcerpt: string;
+	baseRef: string;
+	headRef: string;
+	changedFiles: number;
+	additions: number;
+	deletions: number;
+	files: { filename: string; additions: number; deletions: number }[];
+	reviewers: { login: string; state: string; stale: boolean }[];
+};
+
 export type Approval = {
 	id: string;
 	findingId: string;
@@ -157,6 +170,7 @@ export type Approval = {
 	evidenceUrl: string;
 	suggestedAction: string;
 	writeIntent: WriteIntent;
+	detail: FindingDetail | null;
 	status: string;
 	expiresAt: string | null;
 	createdAt: string;

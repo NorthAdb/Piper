@@ -6,12 +6,15 @@
 // 必须让用户在点下前看清后果）；下方加「已关闭」历史区（被驳回 / 被对账退役 /
 // 已执行的事项带原因留痕，不再无声消失）；通知里的「查看事项」经 focusId 直达
 // 本页对应条目并高亮（在已关闭区时自动展开该区）。
-import { ArrowLeftIcon, CheckIcon, ChevronDownIcon, ExternalLinkIcon, InboxIcon, RotateCcwIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { ArrowLeftIcon, CheckIcon, ChevronDownIcon, ExternalLinkIcon, InboxIcon, PencilIcon, RotateCcwIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { approveApproval, listApprovals, rejectApproval, UnauthorizedError } from "./api";
+import { approveApproval, createAdHocApproval, editApprovalBody, listApprovals, rejectApproval, UnauthorizedError } from "./api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
 import type { Approval, Bot } from "./model";
 
@@ -57,6 +60,15 @@ export function Inbox({
 	const [closedOpen, setClosedOpen] = useState(false);
 	const [confirmRejectId, setConfirmRejectId] = useState<string | null>(null);
 	const [highlightId, setHighlightId] = useState<string | null>(null);
+	// 正文编辑（切片二）：正在编辑的事项 id 与草稿文本
+	const [editId, setEditId] = useState<string | null>(null);
+	const [editText, setEditText] = useState("");
+	// 即席开单（切片二）：仓库 + PR 号表单与本地定位目标（新建/既有事项开单后高亮）
+	const boundRepos = [...new Set(bots.flatMap((b) => b.repos ?? []))];
+	const [adHocRepo, setAdHocRepo] = useState("");
+	const [adHocPr, setAdHocPr] = useState("");
+	const [adHocBusy, setAdHocBusy] = useState(false);
+	const [localFocusId, setLocalFocusId] = useState<string | null>(null);
 	const [busyId, setBusyId] = useState<string | null>(null);
 	const [err, setErr] = useState("");
 	const [notice, setNotice] = useState("");
@@ -78,20 +90,22 @@ export function Inbox({
 		load();
 	}, [load]);
 
-	// 通知直达：focusId 命中待批项直接滚动高亮；命中已关闭项先展开历史区再定位。
+	// 定位高亮：通知直达（focusId）与即席开单结果（localFocusId）共用——命中待批项
+	// 直接滚动高亮；命中已关闭项先展开历史区再定位。
+	const focusTarget = focusId ?? localFocusId;
 	useEffect(() => {
-		if (!focusId || items === null) return;
-		const inClosed = !items.some((a) => a.id === focusId) && closed.some((a) => a.id === focusId);
+		if (!focusTarget || items === null) return;
+		const inClosed = !items.some((a) => a.id === focusTarget) && closed.some((a) => a.id === focusTarget);
 		if (inClosed) setClosedOpen(true);
 		const t = setTimeout(() => {
-			const el = cardRefs.current.get(focusId);
+			const el = cardRefs.current.get(focusTarget);
 			if (el) {
 				el.scrollIntoView({ block: "center", behavior: "smooth" });
-				setHighlightId(focusId);
+				setHighlightId(focusTarget);
 			}
 		}, inClosed ? 80 : 0);
 		return () => clearTimeout(t);
-	}, [focusId, items, closed]);
+	}, [focusTarget, items, closed]);
 
 	const act = async (a: Approval, action: "approve" | "reject") => {
 		setBusyId(a.id);
@@ -119,6 +133,51 @@ export function Inbox({
 		}
 	};
 
+	const saveEdit = async (a: Approval) => {
+		setBusyId(a.id);
+		setErr("");
+		setNotice("");
+		try {
+			const wasApproved = a.status === "approved";
+			await editApprovalBody(a.id, editText);
+			setEditId(null);
+			setNotice(
+				wasApproved
+					? `已保存「${a.title}」的新正文。原批准已作废，请按新正文重新批准。`
+					: `已保存「${a.title}」的新正文，批准时将按这份正文冻结执行。`,
+			);
+			load();
+		} catch (e) {
+			if (e instanceof UnauthorizedError) onUnauthorized();
+			else setErr(e instanceof Error ? e.message : String(e));
+		} finally {
+			setBusyId(null);
+		}
+	};
+
+	const submitAdHoc = async () => {
+		const repo = adHocRepo || boundRepos[0] || "";
+		const prNumber = Number(adHocPr);
+		if (!repo || !Number.isInteger(prNumber) || prNumber <= 0) {
+			setErr("即席开单需要选择仓库并填写正整数 PR 号。");
+			return;
+		}
+		setAdHocBusy(true);
+		setErr("");
+		setNotice("");
+		try {
+			const { approval, existing } = await createAdHocApproval(repo, prNumber);
+			setNotice(existing ? `该 PR 已有事项「${approval.title}」，已为你定位。` : `已即席开单「${approval.title}」，可在下方改好正文再批准。`);
+			setLocalFocusId(approval.id);
+			load();
+		} catch (e) {
+			if (e instanceof UnauthorizedError) onUnauthorized();
+			else setErr(e instanceof Error ? e.message : String(e));
+		} finally {
+			setAdHocBusy(false);
+		}
+	};
+
 	const botName = (id: string) => bots.find((b) => b.id === id)?.name ?? id;
 	const cardRef = (id: string) => (el: HTMLDivElement | null) => {
 		cardRefs.current.set(id, el);
@@ -143,6 +202,30 @@ export function Inbox({
 			<div className="mx-auto w-full max-w-3xl min-h-0 flex-1 overflow-y-auto px-5 py-6">
 				{err ? <p className="mb-4 text-sm text-destructive">{err}</p> : null}
 				{notice ? <p className="mb-4 rounded-lg border px-3 py-2 text-sm text-muted-foreground">{notice}</p> : null}
+				{boundRepos.length > 0 ? (
+					<div className="mb-5 flex flex-wrap items-center gap-2 rounded-lg border px-3 py-2.5">
+						<span className="text-sm font-medium">即席开单</span>
+						<span className="text-xs text-muted-foreground">不用等扫描：指定一个 PR，立即取证开一条待审事项（正文可改，批准后照样走网关）。</span>
+						<div className="ml-auto flex items-center gap-2">
+							<Select value={adHocRepo || boundRepos[0]} onValueChange={setAdHocRepo}>
+								<SelectTrigger className="h-8 w-48">
+									<SelectValue />
+								</SelectTrigger>
+								<SelectContent>
+									{boundRepos.map((r) => (
+										<SelectItem key={r} value={r}>
+											{r}
+										</SelectItem>
+									))}
+								</SelectContent>
+							</Select>
+							<Input className="h-8 w-24" placeholder="PR 号" inputMode="numeric" value={adHocPr} onChange={(e) => setAdHocPr(e.target.value)} />
+							<Button type="button" size="sm" disabled={adHocBusy} onClick={() => void submitAdHoc()}>
+								开单
+							</Button>
+						</div>
+					</div>
+				) : null}
 				{items === null ? (
 					<p className="text-sm text-muted-foreground">加载待批项…</p>
 				) : (
@@ -183,12 +266,97 @@ export function Inbox({
 											</div>
 											{a.summary ? <p className="text-sm">{a.summary}</p> : null}
 											{a.suggestedAction ? <p className="text-sm text-muted-foreground">建议：{a.suggestedAction}</p> : null}
+											{a.detail ? (
+												<div className="flex flex-col gap-2 rounded-lg border px-3 py-2.5 text-sm">
+													<div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+														{a.detail.headRef || a.detail.baseRef ? (
+															<span>
+																分支：{a.detail.headRef || "?"} → {a.detail.baseRef || "?"}
+															</span>
+														) : null}
+														<span>
+															改动：{a.detail.changedFiles} 个文件 · +{a.detail.additions} / −{a.detail.deletions} 行
+														</span>
+													</div>
+													{a.detail.reviewers.length > 0 ? (
+														<div className="flex flex-wrap items-center gap-1.5">
+															<span className="text-xs text-muted-foreground">审查态势：</span>
+															{a.detail.reviewers.map((r) => (
+																<Badge key={r.login} variant={r.state === "CHANGES_REQUESTED" ? "destructive" : "outline"} className="text-[11px]">
+																	{r.login}：{r.state === "CHANGES_REQUESTED" ? "要求修改" : r.stale ? "已批准（旧提交）" : "已批准"}
+																</Badge>
+															))}
+														</div>
+													) : (
+														<p className="text-xs text-muted-foreground">审查态势：尚无人表态。</p>
+													)}
+													{a.detail.bodyExcerpt ? (
+														<div>
+															<p className="pb-1 text-xs font-medium tracking-wider text-muted-foreground uppercase">PR 描述（摘录）</p>
+															<pre className="font-mono text-xs break-words whitespace-pre-wrap">{a.detail.bodyExcerpt}</pre>
+														</div>
+													) : null}
+													{a.detail.files.length > 0 ? (
+														<div>
+															<p className="pb-1 text-xs font-medium tracking-wider text-muted-foreground uppercase">变更文件（前 {a.detail.files.length} 个）</p>
+															<ul className="flex flex-col gap-0.5 font-mono text-xs">
+																{a.detail.files.slice(0, 8).map((f) => (
+																	<li key={f.filename} className="flex items-baseline justify-between gap-3">
+																		<span className="min-w-0 truncate">{f.filename}</span>
+																		<span className="shrink-0 text-muted-foreground">
+																			+{f.additions} / −{f.deletions}
+																		</span>
+																	</li>
+																))}
+																{a.detail.files.length > 8 ? <li className="text-muted-foreground">…… 其余 {a.detail.files.length - 8} 个见 GitHub</li> : null}
+															</ul>
+														</div>
+													) : null}
+												</div>
+											) : null}
 											<div className="rounded-lg border bg-card px-3 py-2.5">
-												<p className="pb-1.5 text-xs font-medium tracking-wider text-muted-foreground uppercase">批准后将执行的写操作</p>
+												<div className="flex items-center pb-1.5">
+													<p className="text-xs font-medium tracking-wider text-muted-foreground uppercase">批准后将执行的写操作</p>
+													{editId !== a.id ? (
+														<Button
+															type="button"
+															size="sm"
+															variant="ghost"
+															className="ml-auto h-6 px-2 text-xs"
+															disabled={busyId === a.id || a.status === "executing"}
+															onClick={() => {
+																setEditId(a.id);
+																setEditText(a.writeIntent.body);
+															}}
+														>
+															<PencilIcon />
+															改正文
+														</Button>
+													) : null}
+												</div>
 												<p className="text-sm">
 													在 {a.repo} 的 PR #{a.writeIntent.prNumber} 下发表评论：
 												</p>
-												<pre className="pt-1.5 font-mono text-xs break-words whitespace-pre-wrap">{a.writeIntent.body}</pre>
+												{editId === a.id ? (
+													<div className="flex flex-col gap-2 pt-1.5">
+														<Textarea value={editText} onChange={(e) => setEditText(e.target.value)} rows={5} className="font-mono text-xs" />
+														{a.status === "approved" ? (
+															<p className="text-xs text-amber-500">本事项已批准：保存新正文会作废这次批准，需要按新正文重新批准后才会执行。</p>
+														) : (
+															<p className="text-xs text-muted-foreground">批准时按这份正文冻结，网关只发批准的那一版。</p>
+														)}
+														<div className="flex gap-2">
+															<Button type="button" size="sm" disabled={busyId === a.id || !editText.trim()} onClick={() => void saveEdit(a)}>
+																保存正文
+															</Button>
+															<Button type="button" size="sm" variant="outline" disabled={busyId === a.id} onClick={() => setEditId(null)}>
+																取消
+															</Button>
+														</div>
+													</div>
+												) : (
+													<pre className="pt-1.5 font-mono text-xs break-words whitespace-pre-wrap">{a.writeIntent.body}</pre>
+												)}
 											</div>
 											{a.status === "approved" && a.lastError ? (
 												<p className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm">

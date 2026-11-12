@@ -1,5 +1,6 @@
 // 晨间扫描规则测试（P1-2）：用进程内 fetch 替身喂假 GitHub 响应，断言拍板清单两条规则、
 // 去重与单仓失败不拖垮整轮。用法（在 apps/piper 下）：node dist/scripts/test-scan.js（或 npm run test:scan）
+// 拍板切片二新增场景 G/G2/H：拍板详情取证与降级、即席开单（判定与扫描同口径、去重回既有项）。
 // Finding 落盘用临时文件隔离（PIPER_FINDINGS_FILE），PIPER_DATA_DIR 一并指向临时目录
 // （R4：ensureData 的种子文件也不落真实 data/），不访问网络。
 // P1-3 的冻结夹具评测（scripts/eval-scan.ts）在这套断言口径上扩成入库夹具。
@@ -35,6 +36,7 @@ interface ScenarioRepo {
 	pulls?: { number?: number | string; [k: string]: unknown }[];
 	reviews?: Record<string, { error?: number } | unknown[]>;
 	pullDetails?: Record<string, unknown>;
+	prFiles?: Record<string, { error?: number } | unknown[]>;
 }
 function installStub(scenario: Record<string, ScenarioRepo>) {
 	requested.length = 0;
@@ -63,6 +65,11 @@ function installStub(scenario: Record<string, ScenarioRepo>) {
 			const one = (entry.pulls ?? []).find((p) => String(p.number) === num) ?? entry.pullDetails?.[num];
 			if (!one) return { ok: false, status: 404, json: async () => ({}) };
 			payload = one;
+		} else if (rest.match(/^\/pulls\/\d+\/files/)) {
+			const num = rest.match(/^\/pulls\/(\d+)\/files/)?.[1] ?? "";
+			const fl = entry.prFiles?.[num] ?? [];
+			if (!Array.isArray(fl) && fl?.error) return { ok: false, status: fl.error, json: async () => ({}) };
+			payload = pageOf(Array.isArray(fl) ? fl : []);
 		} else if (rest.startsWith("/pulls")) payload = pageOf(entry.pulls);
 		else if (rest.startsWith("/issues")) payload = pageOf(entry.issues);
 		else if (rest.startsWith("/actions/runs")) {
@@ -84,7 +91,7 @@ const saveArtifactStub = ({ title }: { title?: unknown }) => ({
 });
 
 try {
-	const { runMorningScan } = await import("../lib/scan.ts");
+	const { createAdHocReviewFinding, runMorningScan } = await import("../lib/scan.ts");
 	const findingsMod = await import("../lib/findings.ts");
 
 	// ---- 场景 A：失败 CI（中间夹一条进行中与一条别分支失败）+ 待审 PR + draft PR ----
@@ -260,6 +267,124 @@ try {
 		"场景F：PR 超过检查上限时翻页取到 200 条并在日报写明「仅检查前 200 条」",
 		runF.findings.length === 200 && runF.report.includes("仅检查前 200 条"),
 		`新开=${runF.findings.length} 日报含提示=${runF.report.includes("仅检查前 200 条")}`,
+	);
+
+	// ---- 场景 G（拍板切片二）：新开 pr_needs_review 带拍板详情——描述摘录、分支、
+	//      改动规模、文件清单、每位审查人最新表态（含陈旧批准标记）。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "g.jsonl");
+	installStub({
+		"Acme/Detail": {
+			runs: [],
+			pulls: [
+				{
+					number: 5, title: "Rework exporter", draft: false, state: "open",
+					head: { sha: "h123", ref: "feat-export" }, base: { ref: "main" },
+					body: "导出器重写：换流式写出，附回滚开关。", changed_files: 3, additions: 120, deletions: 30,
+					html_url: "https://github.com/Acme/Detail/pull/5", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z",
+				},
+			],
+			reviews: {
+				"5": [
+					{ state: "APPROVED", user: { login: "amy" }, commit_id: "old999" },
+					{ state: "CHANGES_REQUESTED", user: { login: "bob" }, commit_id: "h123" },
+				],
+			},
+			prFiles: {
+				"5": [
+					{ filename: "src/export.ts", additions: 100, deletions: 10 },
+					{ filename: "src/export.test.ts", additions: 20, deletions: 20 },
+				],
+			},
+			commits: [],
+			issues: [],
+		},
+	});
+	const runG = await runMorningScan({ repos: ["Acme/Detail"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const g = runG.findings.find((f) => f.type === "pr_needs_review");
+	check(
+		"场景G：拍板详情齐全（描述/分支/改动规模/文件清单）",
+		g?.detail != null &&
+			g.detail.bodyExcerpt.includes("导出器重写") &&
+			g.detail.headRef === "feat-export" &&
+			g.detail.baseRef === "main" &&
+			g.detail.changedFiles === 3 &&
+			g.detail.additions === 120 &&
+			g.detail.deletions === 30 &&
+			g.detail.files.length === 2 &&
+			g.detail.files[0].filename === "src/export.ts",
+		JSON.stringify(g?.detail ?? null),
+	);
+	check(
+		"场景G：审查态势按每人最新表态（amy 的批准对旧提交标 stale、bob 要求修改）",
+		g?.detail != null &&
+			g.detail.reviewers.length === 2 &&
+			g.detail.reviewers.find((r) => r.login === "amy")?.state === "APPROVED" &&
+			g.detail.reviewers.find((r) => r.login === "amy")?.stale === true &&
+			g.detail.reviewers.find((r) => r.login === "bob")?.state === "CHANGES_REQUESTED",
+		JSON.stringify(g?.detail?.reviewers ?? null),
+	);
+
+	// ---- 场景 G2：详情取证失败（files 接口 500）不连坐开单——事项照常开、
+	//      detail 为 null、日报注明详情缺失。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "g2.jsonl");
+	installStub({
+		"Acme/NoDetail": {
+			runs: [],
+			pulls: [
+				{ number: 6, title: "Plain", draft: false, state: "open", head: { sha: "h6", ref: "f6" }, base: { ref: "main" }, html_url: "https://github.com/Acme/NoDetail/pull/6", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" },
+			],
+			reviews: { "6": [] },
+			prFiles: { "6": { error: 500 } },
+			commits: [],
+			issues: [],
+		},
+	});
+	const runG2 = await runMorningScan({ repos: ["Acme/NoDetail"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const g2 = runG2.findings.find((f) => f.type === "pr_needs_review");
+	check(
+		"场景G2：详情取证失败时事项照常开出、detail 为 null、日报注明「拍板详情取证失败」",
+		g2 !== undefined && g2.detail === null && runG2.failures === 0 && runG2.report.includes("拍板详情取证失败"),
+		`detail=${JSON.stringify(g2?.detail)} failures=${runG2.failures}`,
+	);
+
+	// ---- 场景 H（拍板切片二）：即席开单——指定 PR 即时开单（带详情与即席模板）、
+	//      重复指定返回既有项、已批准/已合并回 refusal。 ----
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "h.jsonl");
+	installStub({
+		"Acme/Adhoc": {
+			runs: [],
+			pulls: [
+				{ number: 11, title: "Ad hoc PR", draft: false, state: "open", head: { sha: "hh1", ref: "f11" }, base: { ref: "main" }, body: "即席说明", changed_files: 1, additions: 5, deletions: 1, html_url: "https://github.com/Acme/Adhoc/pull/11", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" },
+				{ number: 12, title: "Approved PR", draft: false, state: "open", head: { sha: "hh2", ref: "f12" }, base: { ref: "main" }, html_url: "https://github.com/Acme/Adhoc/pull/12", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" },
+				{ number: 13, title: "Merged PR", draft: false, state: "closed", merged_at: "2026-11-10T00:00:00Z", head: { sha: "hh3", ref: "f13" }, base: { ref: "main" }, html_url: "https://github.com/Acme/Adhoc/pull/13", user: { login: "alice" }, created_at: "2026-11-09T00:00:00Z" },
+			],
+			reviews: { "11": [], "12": [{ state: "APPROVED", user: { login: "amy" }, commit_id: "hh2" }], "13": [] },
+			prFiles: { "11": [{ filename: "a.ts", additions: 5, deletions: 1 }] },
+			commits: [],
+			issues: [],
+		},
+	});
+	const h1 = await createAdHocReviewFinding({ repo: "Acme/Adhoc", prNumber: 11, botId: "repo-keeper" });
+	check(
+		"场景H：即席开单成功——带详情、写意图正文为即席模板",
+		h1.created !== null &&
+			h1.created.detail?.changedFiles === 1 &&
+			(h1.created.writeIntent?.body ?? "").includes("即席请求") &&
+			h1.created.status === "open",
+		JSON.stringify(h1.created?.id ?? h1),
+	);
+	const h2 = await createAdHocReviewFinding({ repo: "Acme/Adhoc", prNumber: 11, botId: "repo-keeper" });
+	check(
+		"场景H：重复指定同一 PR 返回既有事项、不另开一条",
+		h2.created === null && h2.existing?.id === h1.created?.id && findingsMod.listFindings({ repo: "Acme/Adhoc" }).length === 1,
+		`existing=${h2.existing?.id}`,
+	);
+	const h3 = await createAdHocReviewFinding({ repo: "Acme/Adhoc", prNumber: 12, botId: "repo-keeper" });
+	const h4 = await createAdHocReviewFinding({ repo: "Acme/Adhoc", prNumber: 13, botId: "repo-keeper" });
+	check(
+		"场景H：已批准 PR 回 refusal=pr_approved、已合并 PR 回 refusal=pr_merged，均不开单",
+		h3.created === null && h3.refusal === "pr_approved" && h4.created === null && h4.refusal === "pr_merged",
+		`h3=${h3.refusal} h4=${h4.refusal}`,
 	);
 } finally {
 	globalThis.fetch = realFetch;

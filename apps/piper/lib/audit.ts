@@ -12,7 +12,10 @@ import { redact } from "./redact.ts";
 // executing（R1）：网关领取执行、真正发出评论之前先落一条，进程崩溃后能看到「发到一半」。
 // expired（R5）：扫描前对账把失效的 open/approved Finding 自动退役时落一条，
 // reason 形如 reconciled:<原因>（pr_merged / pr_closed / pr_draft / pr_approved / ci_green / ci_superseded）。
-export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired"] as const;
+// edited（拍板切片二）：批准前用户改了评论正文时落一条，intent 摘要即新正文；
+// 已批准状态下改文同时作废原批准（reason=approval_invalidated），审计里可追到
+// 「批的是哪一版、哪一版被改掉」。
+export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired", "edited"] as const;
 export type AuditResult = (typeof AUDIT_RESULTS)[number];
 
 export interface IntentSummary {

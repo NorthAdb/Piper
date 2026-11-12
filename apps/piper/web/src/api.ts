@@ -105,6 +105,19 @@ export async function rejectApproval(id: string): Promise<Approval> {
 	return (await api<{ approval: Approval }>(`/api/approvals/${id}/reject`, { method: "POST", body: "{}" })).approval;
 }
 
+// 改评论正文（切片二）：approved 状态下改文会作废原批准（返回的 approval 回到 open）
+export async function editApprovalBody(id: string, body: string): Promise<Approval> {
+	return (await api<{ approval: Approval }>(`/api/approvals/${id}/edit`, { method: "POST", body: JSON.stringify({ body }) })).approval;
+}
+
+// 即席开单（切片二）：对指定 PR 即时取证开事项；已有同键事项时 existing=true
+export async function createAdHocApproval(repo: string, prNumber: number): Promise<{ approval: Approval; existing?: boolean }> {
+	return api<{ approval: Approval; existing?: boolean }>("/api/findings/ad-hoc", {
+		method: "POST",
+		body: JSON.stringify({ repo, prNumber }),
+	});
+}
+
 export function getMemory(botId: string): Promise<{ botId: string; markdown: string; aboutMe: string }> {
 	return api(`/api/memory/${botId}`);
 }

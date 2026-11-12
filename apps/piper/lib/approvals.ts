@@ -12,8 +12,9 @@
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { getFinding, listFindings, updateFinding } from "./findings.ts";
-import type { Finding, FindingStatus, FindingType, WriteIntent } from "./findings.ts";
+import { getFinding, listFindings, updateFinding, updateFindingWriteIntentBody } from "./findings.ts";
+import type { Finding, FindingDetail, FindingStatus, FindingType, WriteIntent } from "./findings.ts";
+import { containsSecret } from "./redact.ts";
 import { appendAudit, executedCommentUrl, latestFailureReason, latestTerminalAudit } from "./audit.ts";
 import { gatewayExecuteWrite } from "./gateway.ts";
 import type { GatewayResult, IntentSnapshot } from "./gateway.ts";
@@ -40,6 +41,7 @@ export interface ApprovalView {
 	evidenceUrl: string;
 	suggestedAction: string;
 	writeIntent: WriteIntent | null;
+	detail: FindingDetail | null;
 	status: FindingStatus;
 	expiresAt: string | null;
 	createdAt: string;
@@ -182,14 +184,16 @@ export function toApproval(f: Finding): ApprovalView {
 		evidenceUrl: f.evidenceUrl,
 		suggestedAction: f.suggestedAction,
 		writeIntent: f.writeIntent,
+		detail: f.detail ?? null,
 		status: f.status,
 		expiresAt: f.expiresAt,
 		createdAt: f.createdAt,
 		updatedAt: f.updatedAt,
 		// R1：批准记录 id 与意图哈希——前端批准时必须把 intentHash 带回，内容变了就回 409。
-		// 尚无批准记录（open）时下发当前内容的哈希；已有记录时下发记录里的哈希（批准快照）。
-		approvalId: record?.approvalId ?? null,
-		intentHash: record?.intentHash ?? intentHashOf(intentSnapshotOf(f)),
+		// open 时下发当前内容的哈希（改文作废批准后旧记录不再作数，按新内容重走批准）；
+		// approved 时下发批准记录里的哈希（批准快照，重试沿用）。
+		approvalId: f.status === "open" ? null : (record?.approvalId ?? null),
+		intentHash: f.status === "open" ? intentHashOf(intentSnapshotOf(f)) : (record?.intentHash ?? intentHashOf(intentSnapshotOf(f))),
 		// 来自审计：最近一次执行失败/被拒原因（approved 待重试时展示）与已执行评论链接。
 		lastError: f.status === "approved" ? latestFailureReason(f.id) : null,
 		commentUrl: executedCommentUrl(f.id),
@@ -312,6 +316,42 @@ export async function approveApproval(
 		findingId: id,
 	});
 	return { approval: toApproval(fresh), execution };
+}
+
+// 评论正文可编辑（拍板切片二）：模板正文只是起点，用户可在批准前把正文改成
+// 自己要说的话。完整性口径不破：改文只能走本函数且必留审计（edited）；open 时
+// 改完仍是 open，批准动作按新内容重新校验哈希、冻结新快照；approved 时改文
+// 同时作废原批准并退回 open（原批准记录保留在 approvals.jsonl 里备查，但其
+// 快照不再可执行——approveApproval 对 open 恒新建记录）。正文上限 10000 字
+// （GitHub 评论上限 65536，此处取产品上限防误贴长文）；疑似含令牌/密钥的
+// 正文在保存时就拒绝（与网关 secret_in_body 同一出口 redact.containsSecret），
+// 不等执行时才失败。
+export const COMMENT_BODY_MAX_CHARS = 10000;
+
+export function editApprovalBody(id: string, rawBody: unknown): ApprovalView | null {
+	const f = requireApprovable(id);
+	if (!f) return null;
+	if (f.status === "executing") throw conflict("该待批项正在执行，不能改正文");
+	if (f.status !== "open" && f.status !== "approved") {
+		throw conflict(`该待批项已关闭（当前状态 ${f.status}），不能改正文`);
+	}
+	if (typeof rawBody !== "string" || !rawBody.trim()) throw badRequest("评论正文不能为空");
+	if (rawBody.length > COMMENT_BODY_MAX_CHARS) throw badRequest(`评论正文过长（上限 ${COMMENT_BODY_MAX_CHARS} 字）`);
+	if (containsSecret(rawBody)) throw badRequest("评论正文疑似包含令牌或密钥，已拒绝保存（凭据请勿写进评论）");
+	const wasApproved = f.status === "approved";
+	updateFindingWriteIntentBody(id, rawBody);
+	if (wasApproved) updateFinding(id, { status: "open" });
+	// 两步更新后该 Finding 必然仍在（本函数全程同步段，无并发删除路径）。
+	const fresh = getFinding(id) as Finding;
+	appendAudit({
+		botId: f.botId,
+		intent: { ...fresh.writeIntent, repo: fresh.repo },
+		result: "edited",
+		reason: wasApproved ? "approval_invalidated" : null,
+		findingId: id,
+		approvalId: latestApprovalRecord(id)?.approvalId ?? null,
+	});
+	return toApproval(fresh);
 }
 
 // 驳回：open / approved → rejected，写审计，不调用任何写 API。

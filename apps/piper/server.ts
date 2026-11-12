@@ -29,6 +29,8 @@
 //   intentHash 与当前内容不一致回 409「内容已变，请重新查看」；正在 executing 回 409；
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
 // POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
+// POST /api/approvals/:id/edit {body} 改评论正文（切片二）：open 直接改；approved 改文同时作废原批准退回 open；已关闭/executing 回 409；空正文/超长/疑似含密钥回 400；改动写审计 edited
+// POST /api/findings/ad-hoc {repo, prNumber} 即席开单（切片二，/api/findings 下唯一的写路由）：对指定 PR 即时取证开 pr_needs_review 事项（判定与扫描同一套）；已有同键未关闭/冷却中事项回 200 {existing:true}；已合并/关闭/draft/已批准回 409；PR 不存在回 404；仓库未绑定任何 bot 回 400
 // GET /api/audit 网关审计记录（可按 findingId 过滤）：denied / approved / executing / executed / failed / rejected
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
@@ -99,10 +101,10 @@ import { isThinkingLevel, listConnectors, readModelSettingsFile, readProfileSett
 import { fetchUpstreamModels, isKnownModelProvider, loadModelProviders, resolveModelProviderId, thinkingLevelsFor} from "./lib/model-providers.ts";
 import { redact } from "./lib/redact.ts";
 import { buildTrace} from "./lib/trace.ts";
-import { runMorningScan} from "./lib/scan.ts";
+import { createAdHocReviewFinding, runMorningScan} from "./lib/scan.ts";
 import { getFinding, listFindings} from "./lib/findings.ts";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.ts";
-import { approveApproval, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
+import { approveApproval, editApprovalBody, getApproval, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
 import { listAudit} from "./lib/audit.ts";
 
 const PORT = Number(process.env.PORT || 4310);
@@ -695,15 +697,45 @@ const art = readArtifact(artMatch[1]);
 return art? sendJson(res, 200, { artifact: art}): sendJson(res, 404, { error: "产物不存在"});
 }
 if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: listApprovals(), closed: listClosedApprovals()});
-const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject)$/);
+const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject|edit)$/);
 if (approvalMatch && req.method === "POST") {
 if (approvalMatch[2] === "approve") {
 const body = await readBody(req);
 const out = await approveApproval(approvalMatch[1], { intentHash: typeof body.intentHash === "string"? body.intentHash: undefined});
 return out? sendJson(res, 200, { approval: out.approval, execution: out.execution}): sendJson(res, 404, { error: "待批项不存在"});
 }
+if (approvalMatch[2] === "edit") {
+const body = await readBody(req);
+const approval = editApprovalBody(approvalMatch[1], body.body);
+return approval? sendJson(res, 200, { approval}): sendJson(res, 404, { error: "待批项不存在"});
+}
 const approval = rejectApproval(approvalMatch[1]);
 return approval? sendJson(res, 200, { approval}): sendJson(res, 404, { error: "待批项不存在"});
+}
+if (path === "/api/findings/ad-hoc" && req.method === "POST") {
+const body = await readBody(req);
+const repo = typeof body.repo === "string"? body.repo.trim(): "";
+const prNumber = Number(body.prNumber);
+if (!/^[\w.-]+\/[\w.-]+$/.test(repo)) return sendJson(res, 400, { error: "repo 须为 owner/name 形状"});
+if (!Number.isInteger(prNumber) || prNumber <= 0) return sendJson(res, 400, { error: "prNumber 须为正整数"});
+// bot 归属：优先晨间扫描的 bot（它就是仓库管家），否则任一绑定了该仓的 bot。
+const scanBotId = morningRoutine()?.botId;
+const scanBot = scanBotId? getBot(scanBotId): null;
+const bot = scanBot?.repos?.includes(repo)? scanBot: listBots().find((b) => b.repos?.includes(repo));
+if (!bot) return sendJson(res, 400, { error: `仓库 ${repo} 未绑定任何 bot，请先在 bot 表单里把它加进绑定仓库`});
+try {
+const out = await createAdHocReviewFinding({ repo, prNumber, botId: bot.id});
+if (out.refusal) {
+const refusalText: Record<string, string> = { pr_merged: "该 PR 已合并，无需再开待审事项", pr_closed: "该 PR 已关闭，无需再开待审事项", pr_draft: "该 PR 还是草稿，扫描口径不给草稿开待审事项", pr_approved: "该 PR 已获得批准（按每位审查人最新表态判定），无需再催"};
+return sendJson(res, 409, { error: refusalText[out.refusal] ?? "该 PR 当前状态不适合开单"});
+}
+if (out.existing) return sendJson(res, 200, { approval: getApproval(out.existing.id), existing: true});
+return sendJson(res, 201, { approval: out.created? getApproval(out.created.id): null});
+} catch (err) {
+const status = (err as { status?: number } | null | undefined)?.status;
+if (status === 404) return sendJson(res, 404, { error: `在 ${repo} 找不到 PR #${prNumber}（或当前令牌无权访问）`});
+throw err;
+}
 }
 if (path === "/api/audit" && req.method === "GET") {
 const findingId = url.searchParams.get("findingId");
