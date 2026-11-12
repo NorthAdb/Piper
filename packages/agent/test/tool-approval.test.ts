@@ -379,6 +379,115 @@ describe("tool approval gate", () => {
 		expect(executedB).toHaveLength(1);
 	});
 
+	it("does not start an allowed call while a later batch sibling is suspended (parallel)", async () => {
+		const executedA: unknown[] = [];
+		const executedB: unknown[] = [];
+		const agent = new Agent({
+			initialState: { tools: [countingTool("first", executedA), countingTool("second", executedB)] },
+			streamFn: scriptedStream([
+				createToolUseMessage([
+					{ type: "toolCall", id: "call-a", name: "first", arguments: { value: "a" } },
+					{ type: "toolCall", id: "call-b", name: "second", arguments: { value: "b" } },
+				]),
+				createAssistantMessage("done"),
+			]),
+			toolExecution: "parallel",
+			beforeToolCall: async (context) =>
+				context.toolCall.name === "second" ? { decision: "ask" } : { decision: "allow" },
+			waitForToolApproval: neverSettles,
+		});
+		const events = collectEvents(agent);
+
+		const promptPromise = agent.prompt("go");
+		await waitForEvent(events, (event) => event.type === "tool_approval_pending");
+		await waitForTick();
+		// The allowed sibling is prepared but must not have started: in the parallel path the
+		// start event fires inside the execution thunk, which runs only after preflight ends.
+		expect(events.some((event) => event.type === "tool_execution_start")).toBe(false);
+		expect(executedA).toHaveLength(0);
+
+		agent.abort();
+		await promptPromise;
+		expect(events.some((event) => event.type === "tool_execution_start")).toBe(false);
+		expect(executedA).toHaveLength(0);
+		expect(executedB).toHaveLength(0);
+	});
+
+	it("rejects resolutions for unknown or settled ids during an active run", async () => {
+		const executedArgs: unknown[] = [];
+		const agent = new Agent({
+			initialState: { tools: [countingTool("guarded", executedArgs)] },
+			streamFn: scriptedStream([
+				createToolUseMessage([{ type: "toolCall", id: "call-1", name: "guarded", arguments: { value: "a" } }]),
+				createToolUseMessage([{ type: "toolCall", id: "call-2", name: "guarded", arguments: { value: "b" } }]),
+				createAssistantMessage("done"),
+			]),
+			beforeToolCall: askAll,
+			waitForToolApproval: neverSettles,
+		});
+		const events = collectEvents(agent);
+
+		const promptPromise = agent.prompt("go");
+		await waitForEvent(events, (event) => event.type === "tool_approval_pending" && event.toolCallId === "call-1");
+		await expect(agent.resolveToolCall("call-nope", { decision: "allow" })).rejects.toThrow(
+			"no such tool call in the current run",
+		);
+
+		await agent.resolveToolCall("call-1", { decision: "allow" });
+		await waitForEvent(events, (event) => event.type === "tool_approval_pending" && event.toolCallId === "call-2");
+		expect(executedArgs).toEqual([{ value: "a" }]);
+		// call-1 is settled by now; a second resolution for it in the same run is stale.
+		await expect(agent.resolveToolCall("call-1", { decision: "allow" })).rejects.toThrow("already been settled");
+		expect(executedArgs).toEqual([{ value: "a" }]);
+
+		agent.abort();
+		await promptPromise;
+	});
+
+	it("holds a resolution that arrives before the approval wait begins", async () => {
+		const executedArgs: unknown[] = [];
+		let releaseHook: (() => void) | undefined;
+		const hookGate = new Promise<void>((resolve) => {
+			releaseHook = resolve;
+		});
+		const agent = new Agent({
+			initialState: { tools: [countingTool("guarded", executedArgs)] },
+			streamFn: scriptedStream([
+				createToolUseMessage([{ type: "toolCall", id: "call-1", name: "guarded", arguments: { value: "a" } }]),
+				createAssistantMessage("done"),
+			]),
+			beforeToolCall: async () => {
+				await hookGate;
+				return { decision: "ask" };
+			},
+			waitForToolApproval: neverSettles,
+		});
+
+		let earlyResolve: Promise<void> | undefined;
+		agent.subscribe((event) => {
+			if (
+				event.type === "message_end" &&
+				event.message.role === "assistant" &&
+				event.message.content.some((content) => content.type === "toolCall")
+			) {
+				// The call has been issued but its preflight hook has not returned yet, so no
+				// approval wait exists: the decision must be held, not dropped or rejected.
+				earlyResolve = agent.resolveToolCall("call-1", { decision: "allow" });
+			}
+		});
+
+		const promptPromise = agent.prompt("go");
+		const startedAt = Date.now();
+		while (!earlyResolve) {
+			if (Date.now() - startedAt > 5000) throw new Error("assistant message never landed");
+			await waitForTick();
+		}
+		await expect(earlyResolve).resolves.toBeUndefined();
+		releaseHook?.();
+		await promptPromise;
+		expect(executedArgs).toEqual([{ value: "a" }]);
+	});
+
 	it("aborting during the wait cancels the call; aborting during execution fails it", async () => {
 		const executedArgs: unknown[] = [];
 		const waiting = new Agent({
@@ -536,6 +645,54 @@ describe("resolveToolCall after a restart", () => {
 		const last = revived.state.messages[revived.state.messages.length - 1];
 		expect(last?.role).toBe("assistant");
 		expect(events.some((event) => event.type === "tool_approval_pending")).toBe(false);
+	});
+
+	it("executes the persisted snapshot when the host passes it back after a restart", async () => {
+		// The preflight hook rewrites the arguments and suspends the call. The persisted
+		// approval record holds the rewritten snapshot; the transcript keeps the model's
+		// original arguments.
+		const persistedSnapshots: unknown[] = [];
+		const first = new Agent({
+			initialState: { tools: [countingTool("guarded", [])] },
+			streamFn: scriptedStream([
+				createToolUseMessage([
+					{ type: "toolCall", id: "call-1", name: "guarded", arguments: { value: "original" } },
+				]),
+				createAssistantMessage("done"),
+			]),
+			beforeToolCall: async () => ({ decision: "ask", arguments: { value: "rewritten" } }),
+			onToolApprovalPending: async (context) => {
+				persistedSnapshots.push(context.args);
+			},
+			waitForToolApproval: neverSettles,
+		});
+		const firstEvents = collectEvents(first);
+		void first.prompt("go");
+		await waitForEvent(firstEvents, (event) => event.type === "tool_approval_pending");
+		expect(persistedSnapshots).toEqual([{ value: "rewritten" }]);
+		const transcript = first.state.messages.slice();
+
+		// Host passes the persisted snapshot back: the snapshot executes, not the original.
+		const executedWithSnapshot: unknown[] = [];
+		const revivedWithSnapshot = new Agent({
+			initialState: { messages: transcript, tools: [countingTool("guarded", executedWithSnapshot)] },
+			streamFn: scriptedStream([createAssistantMessage("after")]),
+		});
+		await revivedWithSnapshot.resolveToolCall("call-1", {
+			decision: "allow",
+			arguments: persistedSnapshots[0],
+		});
+		expect(executedWithSnapshot).toEqual([{ value: "rewritten" }]);
+
+		// Contract, stated plainly: an allow that omits `arguments` after a restart executes
+		// the transcript arguments. The snapshot lives only in the host's record.
+		const executedWithoutSnapshot: unknown[] = [];
+		const revivedWithoutSnapshot = new Agent({
+			initialState: { messages: transcript, tools: [countingTool("guarded", executedWithoutSnapshot)] },
+			streamFn: scriptedStream([createAssistantMessage("after")]),
+		});
+		await revivedWithoutSnapshot.resolveToolCall("call-1", { decision: "allow" });
+		expect(executedWithoutSnapshot).toEqual([{ value: "original" }]);
 	});
 
 	it("writes an error result instead of executing when the persisted call is denied", async () => {

@@ -784,13 +784,6 @@ async function executeToolCallsParallel(
 			continue;
 		}
 
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: preparation.args,
-		});
-
 		finalizedCalls.push(async () => {
 			if (signal?.aborted) {
 				const finalized = {
@@ -801,6 +794,14 @@ async function executeToolCallsParallel(
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
+			// Start fires here, not during preflight: a prepared call whose batch is aborted
+			// before its execution begins emits an end without a start.
+			await emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: preparation.args,
+			});
 			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,

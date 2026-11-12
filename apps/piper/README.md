@@ -2256,8 +2256,10 @@ test:scan/test:gateway 数据面钉住，无对应截图位）。
   的抛错语义刻意不动。
 - **闸门顺序**：参数校验 → `beforeToolCall` → ask 时先 `await`
   `onToolApprovalPending`（宿主落盘）→ 发 `tool_approval_pending` →
-  `await waitForToolApproval` → allow 才发 `tool_execution_start` 并
-  `execute()`。deny / 落盘失败 / 未配置等待处理器（裸循环层）/ 中止，
+  `await waitForToolApproval` → 放行后才发 `tool_execution_start` 并
+  `execute()`：顺序路径 start 紧贴执行前发；并行路径 start 发在执行
+  thunk 内、中止检查之后——已预备但批次被中止而从未执行的调用只发 end
+  不发 start（审计 MAJOR-1 后定型）。deny / 落盘失败 / 未配置等待处理器（裸循环层）/ 中止，
   一律写错误 tool result 收尾，不发 start。本件起 `tool_execution_start`
   改到预检通过后才发（带最终校验后的参数），与第一件前「先发 start 再
   block」的顺序不同，是切片明确要求改掉的；截断消息的
@@ -2269,37 +2271,51 @@ test:scan/test:gateway 数据面钉住，无对应截图位）。
   决定直接结算（它在挂起前已经预检过，不重复走 `beforeToolCall`），同批
   其余未决调用按顺序走正常预检（含再次 ask），写完 tool result 后再进入
   与 `continue()` 相同的后续循环。不得在未写 tool result 时调 `continue()`。
-- **批次纪律**：批次预检本来就是逐个顺序进行的，ask 挂起即挡住同批后续
-  调用的预检与执行，即使 `toolExecution: "parallel"` 也不会偷跑；
-  `runToolCall()`（嵌套调用）走同一套闸，只是不发事件。
+- **批次纪律**：并行批次的预检仍逐个顺序进行，ask 挂起即挡住同批后续
+  调用的预检；已通过预检的同批调用也要等整批预检结束才进入执行 thunk，
+  挂起期间不发 start、不执行，即使 `toolExecution: "parallel"` 也不会
+  偷跑；`runToolCall()`（嵌套调用）走同一套闸，只是不发事件。
 
-实测（本地）：新文件 15 个用例全绿，逐条对应切片验收 1–9——未批准执行
+实测（本地）：新文件 19 个用例全绿，逐条对应切片验收 1–9——未批准执行
 计数 0 且事件只有 pending 没有 start、落盘先于等待；批准后恰好执行 1 次
 且参数等于快照、事件序 pending → start → end；宿主自有等待通道放行与
 拒绝；deny 不发 start 且错误文案用钩子 reason；裸循环层无等待处理器时
 默认拒绝；落盘钩子抛错即拒绝且不执行；钩子改参数生效、非法改写被拒；
 resolve 时提交的参数作为新快照执行；并行批次第一个 ask 时第二个执行
-计数 0、放行后各 1 次；等待中 abort 不执行、执行中 abort 工具收到信号
-且结果非成功；嵌套 `runToolCall` 未放行前内层执行 0；重启恢复一组：
-丢弃实例后新 Agent 凭同一份 transcript 恢复、执行恰 1 次且不再触发
-落盘钩子，deny 则写错误结果，未知 id 与已执行过的 id 再次 resolve 明确
-抛错，`continue()` 对同一 transcript 仍抛
-`Cannot continue from message role: assistant`。
-既有 `packages/agent` 测试 84/84 全绿（agent-loop / agent /
-agent-tool-typebox / proxy 四个文件），`start` 顺序变更未打破任何既有
-断言、未改一行旧测试。根级 `npm run check` 退出码 0。可复制命令：
-在 `packages/agent` 下跑
-`node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/tool-approval.test.ts`
-（或包内 `npm test`，含本文件）。
+计数 0、放行后各 1 次；并行反序（先 allow 后 ask）挂起期间已放行的同批
+调用同样不发 start、中止后仍无 start；活动 run 内对未知 id / 已结算 id
+的 resolve 明确抛错，等待点到达前的抢跑 resolve 被暂存、挂起时交付且
+只执行 1 次；等待中 abort 不执行、执行中 abort 工具收到信号且结果非
+成功；嵌套 `runToolCall` 未放行前内层执行 0；重启恢复一组：丢弃实例
+后新 Agent 凭同一份 transcript 恢复、执行恰 1 次且不再触发落盘钩子，
+deny 则写错误结果，未知 id 与已执行过的 id 再次 resolve 明确抛错，
+`continue()` 对同一 transcript 仍抛
+`Cannot continue from message role: assistant`；钩子改写参数后重启的
+一组：宿主把落盘快照经 `arguments` 传回则执行快照、省略则执行
+transcript 原参数（见落点的快照契约）。验收 5 的「落盘」在测试里用
+内存数组模拟（落盘钩子把待批参数推进数组、重启用例以
+`state.messages` 的副本作为 transcript），未用临时文件，如实记此。
+`packages/agent` 全量 113/113 全绿（既有基线 94——含 `e2e.test.ts`
+的 10 条，首轮曾误记为 84——加新增 19），根级 `npm run check` 退出
+码 0。可复制命令：在 `packages/agent` 下跑包内 `npm test`（全量），
+或单跑本文件
+`node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/tool-approval.test.ts`。
 
 - 落点说明（切片未写死、由实现定，已在此写清）：验收 4 的「过期批准」
-  在核心层落为——无活动 run 时对未知/已结算 id 的 resolve 明确抛错、
-  不执行；活动 run 中先于挂起到达的 resolve 会被暂存、等该调用挂起时
-  交付（收件箱点击与循环推进存在竞态，丢弃先到的批准会让真批准失效），
-  快照一致性比对由宿主在 P2-3 用 ToolApproval 记录与网关复检落。错误
-  文案沿用核心层既有英文串（如 `Tool execution was denied`），核心层不做
-  本地化。Agent 路径下等待桥始终安装，故「无等待处理器即拒绝」只在裸
-  `agentLoop` 层成立（已单测钉住）。
+  在核心层落为——对未知 id 与已结算 id 的 resolve 一律明确抛错、不
+  执行（无活动 run 时凭 transcript 判定；活动 run 时凭本 run 的已见 /
+  已结算集合判定，审计 MAJOR-3 后补齐）；仅「本 run 已提出、尚未到达
+  等待点」的 id 允许抢跑暂存、挂起时交付（收件箱点击与循环推进存在
+  竞态，丢弃先到的批准会让真批准失效）。快照一致性比对由宿主在 P2-3
+  用 ToolApproval 记录与网关复检落。**重启快照契约（审计 MAJOR-2 后
+  写死）**：transcript 只存模型原参数；钩子在 ask 时改写过的参数只存在
+  于宿主的落盘记录——重启后宿主必须把快照经 `arguments` 传回，省略
+  则执行 transcript 原参数；该契约已写进 `types.ts` 的
+  `ToolApprovalResolution` 与 `Agent.resolveToolCall` 的文档注释并有
+  用例钉住。错误文案沿用核心层既有英文串（如
+  `Tool execution was denied`），核心层不做本地化。Agent 路径下等待桥
+  始终安装，故「无等待处理器即拒绝」只在裸 `agentLoop` 层成立（已
+  单测钉住）。
 - 明确不做（按切片）：Piper 侧策略、工作区闸、收件箱界面、
   `github_comment`、GitHub 写入均未在本切片出现，分别归 P2-2 至 P2-4；
   未向任何产品 bot 挂文件工具或 shell。CI 侧本 PR 改 `packages/**`，
@@ -2317,3 +2333,18 @@ agent-tool-typebox / proxy 四个文件），`start` 顺序变更未打破任何
   Operation aborted）一条未动。本地复现与修复后单跑均已验证；此改动
   请 PA—design 在 P2-1 审计时一并裁决——若审计认为并行模式应保留旧
   时序，应回本节改判，而不是在代码里含糊过去。
+- 审计返工补记（2026-11-12 深夜，PA—design 评论审计：有条件通过、无
+  BLOCKER、3 条 MAJOR 在本 PR 追加一笔提交修完）：**MAJOR-1** 裁决
+  方向对（新契约不回滚）、但指出并行路径 start 在预检循环里发得太早
+  ——已把 start 挪进执行 thunk（中止检查之后、执行之前），8935 随之
+  定型为 starts == 0，并恢复「每个 start 必有对应 end」「tool result
+  顺序等于 assistant 消息 toolCall 顺序」两条断言（上一段的 starts==1
+  处置以此为准）；另补并行反序用例钉住「挂起期间已放行同批调用无
+  start」。**MAJOR-2** 钩子改写参数的重启快照契约写死（见落点），补
+  传回 / 省略两路用例。**MAJOR-3** 活动 run 内未知 / 已结算 id 的
+  resolve 改为抛错（见落点），补未知、重复结算、抢跑暂存三条用例。
+  审计另确认三项已知、不在本 PR 修：嵌套待批重启后无法经
+  `resolveToolCall` 恢复（内层 id 不在 transcript）；无活动 run 时
+  `resolveToolCall` 会等整段续跑结束，P2-4 的 HTTP 处理器不得直接
+  `await` 它；批次中途 abort 时尚未处理的后续调用没有 tool result，
+  下一轮请求会带着悬空 tool_use。

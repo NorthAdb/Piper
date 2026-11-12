@@ -113,6 +113,12 @@ export interface ToolApprovalWaitContext {
  *
  * `arguments`, when present, is treated as the final approved snapshot and replaces the pending
  * arguments; it is validated against the tool schema again before execution.
+ *
+ * Restart contract: a transcript only ever holds the model's original arguments. If
+ * `beforeToolCall` rewrote the arguments when it suspended the call, the rewritten snapshot
+ * exists only in the host's persisted approval record. A host resuming after a restart must
+ * pass that snapshot back as `arguments`; an allow without `arguments` executes the
+ * transcript arguments, not the rewritten snapshot.
  */
 export interface ToolApprovalResolution {
 	decision: "allow" | "deny";

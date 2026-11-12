@@ -236,6 +236,10 @@ export class Agent {
 	private readonly toolApprovalWaiters = new Map<string, (resolution: ToolApprovalResolution) => void>();
 	/** Decisions delivered by `resolveToolCall` before the active run started waiting on that call. */
 	private readonly toolApprovalResolutions = new Map<string, ToolApprovalResolution>();
+	/** Tool call ids the active run's model has issued (registered as their assistant messages land). */
+	private readonly runToolCallIds = new Set<string>();
+	/** Tool call ids of the active run whose outcome is already decided (wait settled or result written). */
+	private readonly settledToolCallIds = new Set<string>();
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -447,15 +451,29 @@ export class Agent {
 	 * suspended batch is then settled with this decision, tool results are appended, and the
 	 * loop continues from there. This is the only supported resume for that transcript shape:
 	 * `continue()` rejects it by design.
+	 *
+	 * Snapshot contract for the restart path: the transcript holds the model's original
+	 * arguments. If `beforeToolCall` rewrote the arguments when it suspended the call, the
+	 * rewritten snapshot exists only in the host's persisted approval record, and the host
+	 * must pass it back as `result.arguments`. An allow without `arguments` executes the
+	 * transcript arguments, not the rewritten snapshot.
 	 */
 	async resolveToolCall(toolCallId: string, result: ToolApprovalResolution): Promise<void> {
 		if (this.activeRun) {
 			const waiter = this.toolApprovalWaiters.get(toolCallId);
 			if (waiter) {
 				waiter(result);
-			} else {
-				this.toolApprovalResolutions.set(toolCallId, result);
+				return;
 			}
+			if (this.settledToolCallIds.has(toolCallId)) {
+				throw new Error(`Cannot resolve tool call ${toolCallId}: it has already been settled in this run`);
+			}
+			if (!this.runToolCallIds.has(toolCallId)) {
+				throw new Error(`Cannot resolve tool call ${toolCallId}: no such tool call in the current run`);
+			}
+			// The run has issued this call but has not reached its approval wait yet (for
+			// example, the preflight hook is still running). Hold the decision for the wait.
+			this.toolApprovalResolutions.set(toolCallId, result);
 			return;
 		}
 
@@ -581,6 +599,7 @@ export class Agent {
 						: await delivered;
 				} finally {
 					this.toolApprovalWaiters.delete(context.toolCallId);
+					this.settledToolCallIds.add(context.toolCallId);
 				}
 			},
 			finishTurn: this.finishTurn,
@@ -621,6 +640,8 @@ export class Agent {
 		this.activeRun = { promise, resolve: resolvePromise, abortController };
 		// Decisions held for a previous run must not leak into this one.
 		this.toolApprovalResolutions.clear();
+		this.runToolCallIds.clear();
+		this.settledToolCallIds.clear();
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -681,6 +702,16 @@ export class Agent {
 			case "message_end":
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
+				if (event.message.role === "assistant") {
+					for (const content of event.message.content) {
+						if (content.type === "toolCall") {
+							this.runToolCallIds.add(content.id);
+						}
+					}
+				}
+				if (event.message.role === "toolResult") {
+					this.settledToolCallIds.add(event.message.toolCallId);
+				}
 				break;
 
 			case "tool_execution_start": {

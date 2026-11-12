@@ -60,19 +60,24 @@ describe("#8935 parallel preflight abort", () => {
 
 		const starts = harness.eventsOfType("tool_execution_start");
 		const ends = harness.eventsOfType("tool_execution_end");
-		// Piper P2-1 event contract: `tool_execution_start` fires only after a call has passed
-		// preflight and is about to execute, so the call whose preflight aborted emits an end
-		// without a start. Upstream #8935 pinned two starts under the old preflight-start
-		// timing; the regression property (no prepared tool executes) is unchanged.
-		expect(starts).toHaveLength(1);
-		expect(starts[0]?.args).toEqual({ value: "first" });
+		// Piper P2-1 event contract: `tool_execution_start` fires only once a call is actually
+		// about to execute (in the parallel path, inside the execution thunk, after the abort
+		// check). Neither call executes in this scenario, so there are no starts at all.
+		// Upstream #8935 pinned two starts under the old preflight-start timing; the regression
+		// property (no prepared tool executes) is unchanged.
+		expect(starts).toHaveLength(0);
 		expect(ends).toHaveLength(2);
 		expect(ends.every((event) => event.isError)).toBe(true);
+		for (const start of starts) {
+			expect(ends.map((event) => event.toolCallId)).toContain(start.toolCallId);
+		}
 
-		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
-		expect(new Set(toolResults.map((message) => message.toolCallId))).toEqual(
-			new Set(ends.map((event) => event.toolCallId)),
+		const assistantMessage = harness.session.messages.find((message) => message.role === "assistant");
+		const issuedIds = (assistantMessage?.content ?? []).flatMap((content) =>
+			content.type === "toolCall" ? [content.id] : [],
 		);
+		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
+		expect(toolResults.map((message) => message.toolCallId)).toEqual(issuedIds);
 		expect(toolResults.map(getMessageText)).toEqual(["Operation aborted", "Operation aborted"]);
 	});
 });
