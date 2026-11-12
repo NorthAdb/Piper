@@ -1,5 +1,5 @@
 // Finding 存储层单元测试（P1-1）：写入 / 读取 / 过滤 / 非法值拒绝 / 跨进程文件读回。
-// 用法（在 apps/piper 下）：node scripts/test-findings.mjs（或 npm run test:findings）
+// 用法（在 apps/piper 下）：node dist/scripts/test-findings.js（或 npm run test:findings）
 // 行为：用临时目录里的 findings.jsonl（经 PIPER_FINDINGS_FILE 隔离），且 PIPER_DATA_DIR
 // 一并指向临时目录（R4：findings 落盘会 ensureData，种子文件也不落真实 data/），
 // 逐项断言后退出。退出码 0 = 全部通过；1 = 有失败。不访问网络。
@@ -7,32 +7,34 @@
 import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { APP_DIR } from "./app-dir.ts";
 
 const SCRIPT = fileURLToPath(import.meta.url);
-const APP_DIR = join(dirname(SCRIPT), "..");
 
 if (process.argv.includes("--read")) {
-	const { listFindings } = await import("../dist/lib/findings.js");
+	const { listFindings } = await import("../lib/findings.ts");
 	console.log(JSON.stringify(listFindings()));
 	process.exit(0);
 }
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
-function throws(fn, pattern) {
+function throws(fn: () => unknown, pattern: RegExp) {
 	try {
 		fn();
 		return false;
 	} catch (err) {
-		return pattern.test(String(err.message ?? err));
+		// err 为 unknown（抛出物不保证是 Error）：沿用原口径，有 message 取 message，否则取 err 本身。
+		const msg = (err as { message?: unknown } | null | undefined)?.message;
+		return pattern.test(String(msg ?? err));
 	}
 }
 
@@ -42,7 +44,7 @@ process.env.PIPER_FINDINGS_FILE = file;
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 
 try {
-	const F = await import("../dist/lib/findings.js");
+	const F = await import("../lib/findings.ts");
 
 	const base = {
 		repo: "NorthAdb/LinkForge",
@@ -109,15 +111,16 @@ try {
 	);
 
 	// R1 起状态迁移由显式迁移表强制：走到 executed 必须经 open→approved→executing→executed。
-	const attempt = (fn) => {
+	const attempt = <T,>(fn: () => T): T | null => {
 		try {
 			return fn();
 		} catch {
 			return null;
 		}
 	};
+	// 迁移链合法时每步必返回 Finding；真返回 null 时 .id 抛错由 attempt 捕获（与原 JS 同语义），故用非空断言。
 	const updated = attempt(() =>
-		F.updateFinding(F.updateFinding(F.updateFinding(f1.id, { status: "approved" }).id, { status: "executing" }).id, { status: "executed" }),
+		F.updateFinding(F.updateFinding(F.updateFinding(f1.id, { status: "approved" })!.id, { status: "executing" })!.id, { status: "executed" }),
 	);
 	check(
 		"updateFinding 沿合法迁移链改 status 生效且取证字段不可改",
@@ -141,7 +144,7 @@ try {
 
 	// R1：状态迁移表——非法迁移全部被拒，合法链完整可走。
 	{
-		const mk = (subject) => F.createFinding({ ...base, subject });
+		const mk = (subject: string) => F.createFinding({ ...base, subject });
 		const g1 = mk("9101");
 		check("非法迁移 open→executed 被拒", throws(() => F.updateFinding(g1.id, { status: "executed" }), /迁移/));
 		check("非法迁移 open→executing 被拒", throws(() => F.updateFinding(g1.id, { status: "executing" }), /迁移/));
@@ -173,9 +176,9 @@ try {
 		env: { ...process.env, PIPER_FINDINGS_FILE: file },
 		encoding: "utf8",
 	});
-	let fromChild = [];
+	let fromChild: { id: string }[] = [];
 	try {
-		fromChild = JSON.parse(child.stdout);
+		fromChild = JSON.parse(child.stdout) as { id: string }[];
 	} catch {
 		/* 解析失败则断言失败 */
 	}

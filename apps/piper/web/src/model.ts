@@ -1,5 +1,5 @@
 // Piper 前端数据模型：与后端 API / SSE 契约对齐的线格式类型，以及前端自持的消息模型。
-// 后端契约见 server.mjs 文件头注释，迁移前后保持不变。
+// 后端契约见 server.ts 文件头注释，迁移前后保持不变。
 
 export type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
@@ -180,7 +180,7 @@ export type ApprovalExecution = {
 };
 
 // 会话流水条目（GET /api/bots/:id/messages 的元素，来自 sessions/<botId>.jsonl）
-// role:"tool" 是工具调用条目：回合结束时按最终态落盘（见 server.mjs handleChat），
+// role:"tool" 是工具调用条目：回合结束时按最终态落盘（见 server.ts handleChat），
 // historyToMessages 把它还原成工具卡 part，挂到紧随其后的 assistant 消息开头。
 // role:"thinking" 是思考链条目：按段落盘（一段一条，超长截断时 truncated=true），
 // 带 seq（与同轮 tool 条目共用递增序号）、durationMs（段时长）与 level（生效
@@ -206,7 +206,7 @@ export type HistoryEntry = {
 };
 
 // 轨迹（GET /api/bots/:id/trace 的线格式，PR-D 出数、PR-E 消费）：会话流水
-// 经服务端 lib/trace.mjs 的 buildTrace 按轮归一化。时间口径：ts / startedAt /
+// 经服务端 lib/trace.ts 的 buildTrace 按轮归一化。时间口径：ts / startedAt /
 // endedAt / durationMs 均为 epoch 毫秒；无证据一律 null（界面显示「—」，不
 // 编造）。textPreview 是脱敏后截断 200 字的预览（textChars 是全文长度）；
 // tool 的 args/result 是落盘的已脱敏版本。kind 取会话条目 role 原值（user /

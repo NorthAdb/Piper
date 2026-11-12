@@ -1,5 +1,5 @@
 // R2 监听面测试：另起真实 server 进程核对监听地址与启动拒绝。
-// 用法（在 apps/piper 下）：node scripts/test-listen.mjs（或 npm run test:listen）
+// 用法（在 apps/piper 下）：node dist/scripts/test-listen.js（或 npm run test:listen）
 // 覆盖：
 //   A 默认（不设 PIPER_HOST）：只监听 127.0.0.1（ss 实查），回环可达（未登录 401）。
 //   B PIPER_HOST=0.0.0.0 且未设 PIPER_TOKEN（默认口令）：进程拒绝启动，退出码非 0
@@ -11,31 +11,31 @@
 // R4 起子进程一律带 PIPER_DATA_DIR 指向临时目录：调度启动 tick 的补跑产物只落
 // 隔离目录，不再写用户真实 data/；本脚本只断言监听面，不碰业务数据。
 import { execFileSync, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TMP_DATA = join(mkdtempSync(join(tmpdir(), "piper-listen-")), "data");
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
-function baseEnv(port) {
-	const env = { ...process.env, PORT: String(port), PIPER_DATA_DIR: TMP_DATA };
+function baseEnv(port: number) {
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(port), PIPER_DATA_DIR: TMP_DATA };
 	delete env.PIPER_HOST;
 	delete env.PIPER_TOKEN;
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
 	return env;
 }
 
-function startServer(env) {
+function startServer(env: NodeJS.ProcessEnv) {
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let out = "";
 	proc.stdout.on("data", (d) => (out += d));
@@ -43,7 +43,7 @@ function startServer(env) {
 	return { proc, output: () => out };
 }
 
-async function waitReady(proc, port, timeoutMs = 15000) {
+async function waitReady(proc: ChildProcess, port: number, timeoutMs = 15000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return false;
@@ -58,7 +58,7 @@ async function waitReady(proc, port, timeoutMs = 15000) {
 	return false;
 }
 
-async function waitExit(proc, timeoutMs = 8000) {
+async function waitExit(proc: ChildProcess, timeoutMs = 8000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return proc.exitCode;
@@ -67,7 +67,7 @@ async function waitExit(proc, timeoutMs = 8000) {
 	return null;
 }
 
-function listenLocalAddr(port) {
+function listenLocalAddr(port: number) {
 	const out = execFileSync("ss", ["-ltn"], { encoding: "utf8" });
 	for (const line of out.split("\n")) {
 		const fields = line.trim().split(/\s+/);

@@ -2,34 +2,35 @@
 // 场景：替身 GitHub 在评论 POST 落库后延迟响应（30 秒），期间对 server 进程 kill -9，
 // 再重启——重启后 Finding 必须是 approved（启动恢复 + 审计 failed/interrupted），
 // 再次批准靠幂等标记查重，评论总数仍 1、状态转 executed。
-// 用法（在 apps/piper 下）：node scripts/test-recovery.mjs（或 npm run test:recovery）
+// 用法（在 apps/piper 下）：node dist/scripts/test-recovery.js（或 npm run test:recovery）
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = 4421;
 const TOKEN = "recovery-test-token";
 const FINDING_ID = "f-recovery-1";
 const tmp = mkdtempSync(join(tmpdir(), "piper-recovery-"));
 const DATA_DIR = join(tmp, "data");
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
 // ---- 本地替身 GitHub：评论 POST 落库后延迟 30 秒才回响应（模拟「已发出、进程被杀」窗口） ----
-const stubState = { comments: [], postCount: 0 };
+const stubState: { comments: { body: unknown; html_url: string }[]; postCount: number } = { comments: [], postCount: 0 };
 const stub = createServer((req, res) => {
-	const u = new URL(req.url, "http://stub");
-	const send = (status, obj) => {
+	const u = new URL(req.url ?? "/", "http://stub");
+	const send = (status: number, obj: unknown) => {
 		res.writeHead(status, { "Content-Type": "application/json" });
 		res.end(JSON.stringify(obj));
 	};
@@ -61,11 +62,13 @@ const stub = createServer((req, res) => {
 	if (/^\/repos\/[^/]+\/[^/]+$/.test(u.pathname)) return send(200, { default_branch: "main" });
 	return send(404, { message: "stub: not found" });
 });
-await new Promise((r) => stub.listen(0, "127.0.0.1", r));
-const stubPort = stub.address().port;
+await new Promise<void>((r) => {
+	stub.listen(0, "127.0.0.1", () => r());
+});
+const stubPort = (stub.address() as AddressInfo).port;
 
 function startPiper() {
-	const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: DATA_DIR, PIPER_GITHUB_API_BASE: `http://127.0.0.1:${stubPort}`, PIPER_TOKEN: TOKEN, GITHUB_TOKEN: "stub-gh-token" };
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: DATA_DIR, PIPER_GITHUB_API_BASE: `http://127.0.0.1:${stubPort}`, PIPER_TOKEN: TOKEN, GITHUB_TOKEN: "stub-gh-token" };
 	delete env.PIPER_HOST;
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	let out = "";
@@ -74,7 +77,7 @@ function startPiper() {
 	return { proc, output: () => out };
 }
 
-async function waitReady(proc, timeoutMs = 20000) {
+async function waitReady(proc: ChildProcess, timeoutMs = 20000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return false;
@@ -89,7 +92,7 @@ async function waitReady(proc, timeoutMs = 20000) {
 	return false;
 }
 
-async function waitExit(proc, timeoutMs = 10000) {
+async function waitExit(proc: ChildProcess, timeoutMs = 10000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return proc.exitCode;
@@ -98,16 +101,17 @@ async function waitExit(proc, timeoutMs = 10000) {
 	return null;
 }
 
-async function api(path, { method = "GET", body } = {}) {
+// json 是 HTTP 响应边界（外部数据，逐字段取用），与产品侧 readBody 同口径用 any。
+async function api(path: string, { method = "GET", body }: { method?: string; body?: unknown } = {}): Promise<{ status: number; json: any }> {
 	const res = await fetch(`http://127.0.0.1:${PORT}${path}`, {
 		method,
 		headers: { Authorization: `Bearer ${TOKEN}`, ...(body !== undefined ? { "Content-Type": "application/json" } : {}) },
 		body: body !== undefined ? JSON.stringify(body) : undefined,
 	});
-	return { status: res.status, json: await res.json().catch(() => null) };
+	return { status: res.status, json: (await res.json().catch(() => null)) as any };
 }
 
-let server = null;
+let server: ReturnType<typeof startPiper> | null = null;
 try {
 	server = startPiper();
 	check("替身环境下 server 首次启动成功", await waitReady(server.proc), server.output().slice(0, 300));
@@ -135,7 +139,7 @@ try {
 	writeFileSync(join(DATA_DIR, "findings.jsonl"), JSON.stringify(finding) + "\n", "utf8");
 
 	const list = await api("/api/approvals");
-	const view = (list.json?.approvals ?? []).find((a) => a.findingId === FINDING_ID);
+	const view = (list.json?.approvals ?? []).find((a: { findingId?: string; intentHash?: string }) => a.findingId === FINDING_ID);
 	check("种子 Finding 出现在待批收件箱且带 intentHash", Boolean(view?.intentHash), JSON.stringify(list.json).slice(0, 200));
 
 	// 发起批准：网关 POST 评论到替身后替身延迟响应，批准请求会一直挂起——不 await。
@@ -164,13 +168,13 @@ try {
 	const audit = await api(`/api/audit?findingId=${FINDING_ID}`);
 	check(
 		"审计可查到 failed/interrupted 记录",
-		(audit.json?.records ?? []).some((r) => r.result === "failed" && r.reason === "interrupted"),
-		`records=${(audit.json?.records ?? []).map((r) => `${r.result}/${r.reason}`).join(",")}`,
+		(audit.json?.records ?? []).some((r: { result?: string; reason?: string }) => r.result === "failed" && r.reason === "interrupted"),
+		`records=${(audit.json?.records ?? []).map((r: { result?: string; reason?: string }) => `${r.result}/${r.reason}`).join(",")}`,
 	);
 
 	// 再批准：网关先查评论标记，复用已发出的评论记 executed，不再 POST。
 	const list2 = await api("/api/approvals");
-	const view2 = (list2.json?.approvals ?? []).find((a) => a.findingId === FINDING_ID);
+	const view2 = (list2.json?.approvals ?? []).find((a: { findingId?: string; intentHash?: string }) => a.findingId === FINDING_ID);
 	const retry = await api(`/api/approvals/${FINDING_ID}/approve`, { method: "POST", body: { intentHash: view2?.intentHash } });
 	const final = await api(`/api/findings/${FINDING_ID}`);
 	check(

@@ -1,5 +1,5 @@
-// 定时调度测试（P1-4）：假时钟驱动 lib/schedule.mjs 的状态机，禁止依赖真实时间流逝。
-// 用法（在 apps/piper 下）：node scripts/test-schedule.mjs（或 npm run test:schedule）
+// 定时调度测试（P1-4）：假时钟驱动 lib/schedule.ts 的状态机，禁止依赖真实时间流逝。
+// 用法（在 apps/piper 下）：node dist/scripts/test-schedule.js（或 npm run test:schedule）
 // 覆盖：下一次运行计算（时区换算）、到点只触发一次、失败有限补跑、成功后同周期不再跑、
 // 启动补跑判定（已过点未成功补一次 / 已成功不补 / 未到点不补）、并发重入防护、
 // schedule 字段解析与旧文本迁移。时区固定 Asia/Hong_Kong（UTC+8，无夏令时）。
@@ -12,11 +12,11 @@ import { join } from "node:path";
 const tmp = mkdtempSync(join(tmpdir(), "piper-schedule-"));
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 
-const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../dist/lib/schedule.js");
+const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../lib/schedule.ts");
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
@@ -69,7 +69,7 @@ check(
 // ---- 状态机：到点只跑一次，成功后同周期不再跑，次日再跑 ----
 {
 	let calls = 0;
-	const state = { lastRunAt: null, lastStatus: null };
+	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
 	const sched = createScheduler({
 		run: async () => {
 			calls += 1;
@@ -95,7 +95,7 @@ check(
 // ---- 状态机：失败有限补跑（3 次、每次 +5 分钟），给满后等下一周期 ----
 {
 	let calls = 0;
-	const state = { lastRunAt: null, lastStatus: null };
+	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
 	const sched = createScheduler({
 		run: async () => {
 			calls += 1;
@@ -132,7 +132,7 @@ check(
 // ---- 状态机：失败一次后补跑成功，attempts 清零、不再补跑 ----
 {
 	let calls = 0;
-	const state = { lastRunAt: null, lastStatus: null };
+	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
 	const sched = createScheduler({
 		run: async () => {
 			calls += 1;
@@ -190,9 +190,11 @@ check(
 // ---- 状态机：并发重入防护（运行在途时 tick 返回 busy，不重复跑） ----
 {
 	let calls = 0;
-	let release;
-	const gate = new Promise((r) => (release = r));
-	const state = { lastRunAt: null, lastStatus: null };
+	let release: () => void = () => {};
+	const gate = new Promise<void>((r) => {
+		release = () => r();
+	});
+	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
 	const sched = createScheduler({
 		run: async () => {
 			calls += 1;
@@ -217,7 +219,7 @@ check(
 // ---- 状态机：run 返回 skipped（执行层重入防护命中）不计成败、不推进 ----
 {
 	let calls = 0;
-	const state = { lastRunAt: null, lastStatus: null };
+	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
 	const sched = createScheduler({
 		run: async () => {
 			calls += 1;
@@ -241,7 +243,7 @@ check(
 	let broken = true;
 	let calls = 0;
 	const errors = [];
-	const state = { lastRunAt: null, lastStatus: null };
+	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
 	const sched = createScheduler({
 		run: async () => {
 			calls += 1;

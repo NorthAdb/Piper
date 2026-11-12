@@ -1,6 +1,6 @@
 // R9 截图证据：用本机现成的 Chromium（Playwright 缓存的 headless shell）经 CDP
 // 驱动已构建的前端，对一个隔离的种子实例逐页截图，落 apps/piper/docs/screens/。
-// 用法（在 apps/piper 下）：node scripts/shots.mjs（或 npm run shots）
+// 用法（在 apps/piper 下）：node dist/scripts/shots.js（或 npm run shots）
 // 前提：本机有 Chromium 二进制（CHROMIUM_BIN 或 ~/.cache/ms-playwright 下的
 // chromium / chrome-headless-shell）；没有则明确报错退出，不下载、不冒充。
 // 种子数据全是假数据：模型 Key 为 sk-r9-fake-…wxyz（界面只应出现末四位掩码），
@@ -9,11 +9,11 @@
 import { execFileSync, spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import type { AddressInfo } from "node:net";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCREENS_DIR = join(APP_DIR, "docs", "screens");
 const PORT = Number(process.env.SHOTS_PORT || 4399);
 const BASE = `http://127.0.0.1:${PORT}`;
@@ -24,8 +24,8 @@ const FIXTURE_FEATURE = "夹具特征句：紫水晶海豹在屋顶上读报纸�
 
 function findChrome() {
 	// headless shell 优先于全量 chrome（后者在无显示环境要额外 --headless=new 才起得来）。
-	const shellCandidates = [];
-	const fullCandidates = [];
+	const shellCandidates: string[] = [];
+	const fullCandidates: string[] = [];
 	if (process.env.CHROMIUM_BIN) (process.env.CHROMIUM_BIN.includes("headless") ? shellCandidates : fullCandidates).push(process.env.CHROMIUM_BIN);
 	const cache = join(homedir(), ".cache", "ms-playwright");
 	if (existsSync(cache)) {
@@ -53,7 +53,7 @@ execFileSync("npm", ["run", "build:server"], { cwd: APP_DIR, stdio: "inherit" })
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-shots-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 
-function runSeed(code) {
+function runSeed(code: string) {
 	const seedFile = join(TMP_ROOT, `seed-${Math.random().toString(36).slice(2, 8)}.mjs`);
 	writeFileSync(seedFile, code, "utf8");
 	execFileSync("node", [seedFile], {
@@ -73,8 +73,19 @@ const fixtureServer = createServer((reqHttp, resHttp) => {
 		resHttp.end("not found");
 	}
 });
-await new Promise((r) => fixtureServer.listen(0, "127.0.0.1", r));
-const FIXTURE_PORT = fixtureServer.address().port;
+await new Promise<void>((r) => {
+	fixtureServer.listen(0, "127.0.0.1", () => r());
+});
+const FIXTURE_PORT = (fixtureServer.address() as AddressInfo).port;
+
+// 模型桩收到的请求体形状（OpenAI 兼容子集，只列桩实际读到的字段）。
+interface ModelRequestBody {
+	model?: string;
+	stream?: boolean;
+	reasoning_effort?: unknown;
+	tools?: { function?: { name?: string }; name?: string }[];
+	messages?: { role?: string; content?: unknown }[];
+}
 
 const shotsModelStub = createServer((reqHttp, resHttp) => {
 	// 模型名单拉取（改版截图 12 用）：设置页会用已保存 Key 向端点 GET /models，
@@ -92,9 +103,10 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 	let raw = "";
 	reqHttp.on("data", (c) => (raw += c));
 	reqHttp.on("end", async () => {
-		let body = {};
+		// 请求体是 wire 输入（外部数据边界）：只列桩实际读到的字段。
+		let body: ModelRequestBody = {};
 		try {
-			body = JSON.parse(raw || "{}");
+			body = JSON.parse(raw || "{}") as ModelRequestBody;
 		} catch {
 			/* 忽略 */
 		}
@@ -110,7 +122,7 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 		const lastUser = [...messages].reverse().find((m) => m.role === "user");
 		const userText = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
 		resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
-		const chunk = (delta, finishReason = null) =>
+		const chunk = (delta: unknown, finishReason: string | null = null) =>
 			`data: ${JSON.stringify({ id: "chatcmpl-shots", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
 		resHttp.write(chunk({ role: "assistant" }));
 		if (last.role === "tool") {
@@ -134,7 +146,8 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 		) {
 			// 思考分段截图（15）第一段：先回一段 reasoning，再发 web_fetch 工具调用，
 			// 让工具调用把思考段打断。
-			const url = /https?:\/\/[^\s"']+/.exec(userText)[0];
+			// 此分支已由前置 .test(userText) 保证有匹配，exec 结果非空（原 JS 隐含假定）。
+			const url = (/https?:\/\/[^\s"']+/.exec(userText) as RegExpExecArray)[0];
 			resHttp.write(chunk({ reasoning_content: "先拆解问题：" }));
 			resHttp.write(chunk({ reasoning_content: "要先打开页面确认内容，再组织回答。" }));
 			// 停顿一下再发工具调用，让第一段的 durationMs 是真实秒数（摘要行不至于是 0 秒）
@@ -143,7 +156,8 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
 			resHttp.write(chunk({}, "tool_calls"));
 		} else if (toolNames.includes("web_fetch") && /https?:\/\//.test(userText)) {
-			const url = /https?:\/\/[^\s"']+/.exec(userText)[0];
+			// 此分支已由前置 .test(userText) 保证有匹配，exec 结果非空（原 JS 隐含假定）。
+			const url = (/https?:\/\/[^\s"']+/.exec(userText) as RegExpExecArray)[0];
 			resHttp.write(chunk({ tool_calls: [{ index: 0, id: "call_shots", type: "function", function: { name: "web_fetch", arguments: "" } }] }));
 			resHttp.write(chunk({ tool_calls: [{ index: 0, function: { arguments: JSON.stringify({ url }) } }] }));
 			resHttp.write(chunk({}, "tool_calls"));
@@ -162,14 +176,16 @@ const shotsModelStub = createServer((reqHttp, resHttp) => {
 		resHttp.end("data: [DONE]\n\n");
 	});
 });
-await new Promise((r) => shotsModelStub.listen(0, "127.0.0.1", r));
-const SHOTS_MODEL_BASE = `http://127.0.0.1:${shotsModelStub.address().port}/v1`;
+await new Promise<void>((r) => {
+	shotsModelStub.listen(0, "127.0.0.1", () => r());
+});
+const SHOTS_MODEL_BASE = `http://127.0.0.1:${(shotsModelStub.address() as AddressInfo).port}/v1`;
 
-const libUrl = (name) => `file://${join(APP_DIR, "dist", "lib", name.replace(/\.mjs$/, ".js"))}`;
+const libUrl = (name: string) => `file://${join(APP_DIR, "dist", "lib", name)}`;
 runSeed(`
-import { ensureData, saveArtifact, updateRoutine } from "${libUrl("store.mjs")}";
-import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
-import { addNotification } from "${libUrl("notify.mjs")}";
+import { ensureData, saveArtifact, updateRoutine } from "${libUrl("store.js")}";
+import { saveModelSettingsFile } from "${libUrl("settings.js")}";
+import { addNotification } from "${libUrl("notify.js")}";
 ensureData();
 saveModelSettingsFile({ baseUrl: "${SHOTS_MODEL_BASE}", modelId: "gpt-4o-mini", apiKey: "${FAKE_KEY}" });
 // 网页查询不在种子里预启（第二轮 F13）：06 要截「未启用」默认态，与 10 的已启用态
@@ -195,7 +211,7 @@ console.log("种子（模型/产物/通知）已写入");
 const ghStub = createServer((reqHttp, resHttp) => {
 	const u = new URL(reqHttp.url ?? "/", "http://stub.invalid");
 	resHttp.setHeader("Content-Type", "application/json");
-	let payload;
+	let payload: unknown;
 	if (u.pathname.includes("/actions/runs")) payload = { workflow_runs: [] };
 	else if (/\/(commits|pulls|issues)$/.test(u.pathname) || u.pathname.includes("/reviews")) payload = [];
 	else if (/^\/repos\/[^/]+\/[^/]+$/.test(u.pathname))
@@ -206,17 +222,19 @@ const ghStub = createServer((reqHttp, resHttp) => {
 	}
 	resHttp.end(JSON.stringify(payload));
 });
-await new Promise((r) => ghStub.listen(0, "127.0.0.1", r));
-const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
+await new Promise<void>((r) => {
+	ghStub.listen(0, "127.0.0.1", () => r());
+});
+const GH_BASE = `http://127.0.0.1:${(ghStub.address() as AddressInfo).port}`;
 
 // ---- 起被截实例 ----
-const env = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE, PIPER_WEB_FETCH_TEST_ALLOW: `127.0.0.1:${FIXTURE_PORT}`, PIPER_TEST_MODE: "1" };
+const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(PORT), PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE, PIPER_WEB_FETCH_TEST_ALLOW: `127.0.0.1:${FIXTURE_PORT}`, PIPER_TEST_MODE: "1" };
 delete env.PIPER_TOKEN;
 delete env.PIPER_HOST;
 const serverProc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 let serverLog = "";
-serverProc.stdout.on("data", (d) => (serverLog += d));
-serverProc.stderr.on("data", (d) => (serverLog += d));
+serverProc.stdout?.on("data", (d) => (serverLog += d));
+serverProc.stderr?.on("data", (d) => (serverLog += d));
 
 async function waitReady() {
 	for (let i = 0; i < 60; i++) {
@@ -248,23 +266,24 @@ const chromeProc = spawn(
 	{ stdio: ["ignore", "pipe", "pipe"] },
 );
 
-let ws;
+let ws: WebSocket | undefined;
 let msgId = 0;
-const pending = new Map();
-function cdp(method, params = {}, sessionId) {
+const pending = new Map<number, { resolvePromise: (value: any) => void; rejectPromise: (err: Error) => void }>();
+// CDP 结果是外部协议数据（各命令形状不同），以 any 回给调用点逐字段取用。
+function cdp(method: string, params: Record<string, unknown> = {}, sessionId?: string | null): Promise<any> {
 	return new Promise((resolvePromise, rejectPromise) => {
 		const id = ++msgId;
 		pending.set(id, { resolvePromise, rejectPromise });
-		ws.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
+		ws?.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) }));
 	});
 }
 
 async function connectCdp() {
-	let version = null;
+	let version: { webSocketDebuggerUrl?: string } | null = null;
 	for (let i = 0; i < 60; i++) {
 		try {
 			const res = await fetch(`http://127.0.0.1:${CDP_PORT}/json/version`);
-			version = await res.json();
+			version = (await res.json()) as { webSocketDebuggerUrl?: string };
 			break;
 		} catch {
 			await new Promise((r) => setTimeout(r, 250));
@@ -272,17 +291,18 @@ async function connectCdp() {
 	}
 	if (!version?.webSocketDebuggerUrl) throw new Error("CDP 端点未就绪");
 	ws = new WebSocket(version.webSocketDebuggerUrl);
-	await new Promise((resolvePromise, rejectPromise) => {
-		ws.addEventListener("open", resolvePromise, { once: true });
-		ws.addEventListener("error", rejectPromise, { once: true });
+	const sock = ws;
+	await new Promise<void>((resolvePromise, rejectPromise) => {
+		sock.addEventListener("open", () => resolvePromise(), { once: true });
+		sock.addEventListener("error", (event) => rejectPromise(new Error(`CDP WebSocket 错误：${String(event)}`)), { once: true });
 	});
-	ws.addEventListener("message", (event) => {
-		const msg = JSON.parse(String(event.data));
+	sock.addEventListener("message", (event) => {
+		const msg = JSON.parse(String(event.data)) as { id?: number; error?: { message?: string }; result?: unknown };
 		if (msg.id && pending.has(msg.id)) {
-			const { resolvePromise, rejectPromise } = pending.get(msg.id);
+			const slot = pending.get(msg.id)!;
 			pending.delete(msg.id);
-			if (msg.error) rejectPromise(new Error(`${msg.error.message}`));
-			else resolvePromise(msg.result);
+			if (msg.error) slot.rejectPromise(new Error(`${msg.error.message}`));
+			else slot.resolvePromise(msg.result);
 		}
 	});
 	const { targetId } = await cdp("Target.createTarget", { url: "about:blank" });
@@ -290,14 +310,14 @@ async function connectCdp() {
 	return sessionId;
 }
 
-let sessionId = null;
-async function evaluate(expression) {
+let sessionId: string | null = null;
+async function evaluate(expression: string): Promise<any> {
 	const res = await cdp("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId);
 	if (res.exceptionDetails) throw new Error(`页面求值失败：${res.exceptionDetails.text ?? ""} ${res.exceptionDetails.exception?.description ?? ""}`);
 	return res.result?.value;
 }
 
-async function waitFor(expression, description, timeoutMs = 20000) {
+async function waitFor(expression: string, description: string, timeoutMs = 20000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		try {
@@ -310,9 +330,9 @@ async function waitFor(expression, description, timeoutMs = 20000) {
 	throw new Error(`等待超时：${description}`);
 }
 
-const bodyHas = (text) => `document.body && document.body.innerText.includes(${JSON.stringify(text)})`;
+const bodyHas = (text: string) => `document.body && document.body.innerText.includes(${JSON.stringify(text)})`;
 
-async function clickText(text, { maxX = Infinity, minX = 0 } = {}) {
+async function clickText(text: string, { maxX = Infinity, minX = 0 }: { maxX?: number; minX?: number } = {}) {
 	const point = await evaluate(`(() => {
 		// bot 行是 div onClick、页签是 button：都纳入候选，按面积取最小并限高，避免误中布局大容器。
 		const els = [...document.querySelectorAll('button, a, [role="tab"], [role="button"], div, span, li')];
@@ -333,7 +353,7 @@ async function clickText(text, { maxX = Infinity, minX = 0 } = {}) {
 
 // 按表达式求出的坐标点做一次真实鼠标点击（Radix Select 的 trigger/option 靠
 // 指针事件开关，合成 .click() 不可靠，须走 CDP Input）。
-async function clickPoint(expression, description) {
+async function clickPoint(expression: string, description: string) {
 	const point = await evaluate(expression);
 	if (!point) throw new Error(`找不到可点击元素：${description}`);
 	await cdp("Input.dispatchMouseEvent", { type: "mousePressed", x: point.x, y: point.y, button: "left", clickCount: 1 }, sessionId);
@@ -341,9 +361,9 @@ async function clickPoint(expression, description) {
 	await new Promise((r) => setTimeout(r, 500));
 }
 
-const centerOf = (selector) => `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`;
+const centerOf = (selector: string) => `(() => { const el = document.querySelector(${JSON.stringify(selector)}); if (!el) return null; const r = el.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`;
 
-async function selectRadixOption(triggerSelector, optionText) {
+async function selectRadixOption(triggerSelector: string, optionText: string) {
 	await clickPoint(centerOf(triggerSelector), `下拉触发器 ${triggerSelector}`);
 	await waitFor(`[...document.querySelectorAll('[role="option"]')].some((el) => (el.textContent || '').includes(${JSON.stringify(optionText)}))`, `下拉选项出现：${optionText}`);
 	await clickPoint(
@@ -352,8 +372,8 @@ async function selectRadixOption(triggerSelector, optionText) {
 	);
 }
 
-const shots = [];
-async function shot(fileName) {
+const shots: string[] = [];
+async function shot(fileName: string) {
 	const { data } = await cdp("Page.captureScreenshot", { format: "png" }, sessionId);
 	mkdirSync(SCREENS_DIR, { recursive: true });
 	writeFileSync(join(SCREENS_DIR, fileName), Buffer.from(data, "base64"));
@@ -362,7 +382,7 @@ async function shot(fileName) {
 }
 
 // 局部裁剪截图（17 号右栏特写用）：clip 为视口 CSS 像素坐标。
-async function shotClip(fileName, clip) {
+async function shotClip(fileName: string, clip: { x: number; y: number; width: number; height: number }) {
 	const { data } = await cdp("Page.captureScreenshot", { format: "png", clip: { ...clip, scale: 1 } }, sessionId);
 	mkdirSync(SCREENS_DIR, { recursive: true });
 	writeFileSync(join(SCREENS_DIR, fileName), Buffer.from(data, "base64"));
@@ -409,7 +429,7 @@ try {
 	// 自动向 stub 拉一次 /models；等「已从端点拉取 2 个模型」出现后打开模型
 	// 下拉，名单里应是 stub 回的 stub-alpha / stub-beta。
 	runSeed(`
-import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+import { saveModelSettingsFile } from "${libUrl("settings.js")}";
 saveModelSettingsFile({ provider: "deepseek", baseUrl: "${SHOTS_MODEL_BASE}", modelId: "stub-alpha", apiKey: "${FAKE_KEY}" });
 console.log("截图 12 用配置已写入（provider=deepseek，端点=本地 stub）");
 `);
@@ -436,7 +456,7 @@ console.log("截图 12 用配置已写入（provider=deepseek，端点=本地 st
 	// （端点仍是本地 stub、Key 仍是种子假 Key），重载后在模型组打开思考挡位
 	// 下拉——选项应恰为 pi-ai 给该模型的支持集 off / low / high / max。
 	runSeed(`
-import { saveModelSettingsFile } from "${libUrl("settings.mjs")}";
+import { saveModelSettingsFile } from "${libUrl("settings.js")}";
 saveModelSettingsFile({ provider: "deepseek", baseUrl: "${SHOTS_MODEL_BASE}", modelId: "deepseek-flash", apiKey: "${FAKE_KEY}", thinkingLevel: "high" });
 console.log("截图 14 用配置已写入（deepseek-flash + thinkingLevel=high）");
 `);
@@ -490,7 +510,7 @@ console.log("截图 14 用配置已写入（deepseek-flash + thinkingLevel=high�
 	await shot("08-inbox-empty.png");
 
 	runSeed(`
-import { createFinding } from "${libUrl("findings.mjs")}";
+import { createFinding } from "${libUrl("findings.js")}";
 createFinding({
 	repo: "NorthAdb/LinkForge",
 	type: "pr_needs_review",
@@ -590,7 +610,7 @@ console.log("种子（待批 Finding）已写入");
 	// 工具调用）、分段时长条、按轮时间线应齐备，思考行摘要带「挡位 high」。
 	// 断言一律限定在 [data-testid="trace-view"] 内，避免误中被 visibility 隐藏
 	// 的对话窗格 DOM。
-	const traceHas = (text) =>
+	const traceHas = (text: string) =>
 		`(() => { const el = document.querySelector('[data-testid="trace-view"]'); return Boolean(el) && (el.textContent || '').includes(${JSON.stringify(text)}); })()`;
 	// 切换不卸载对话状态：先在输入框留一句草案（不发送），切去轨迹再切回，
 	// 草案应仍在（双窗格 visibility 叠放的实现以此断言钉住）。

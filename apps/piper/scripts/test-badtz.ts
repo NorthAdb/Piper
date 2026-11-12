@@ -1,18 +1,18 @@
 // R3 坏时区文件重启测试：把 settings-profile.json 的 timezone 预置成非法值后
 // 启动真实 server 进程，核对进程存活、日志回落提示、调度状态回缺省时区、且能从
-// 设置接口把时区修好。用法（在 apps/piper 下）：node scripts/test-badtz.mjs
+// 设置接口把时区修好。用法（在 apps/piper 下）：node dist/scripts/test-badtz.js
 // R4 起坏文件预置在临时数据目录（PIPER_DATA_DIR），子进程全程只碰隔离目录——
 // R3 当年是直接改用户真实 data/settings-profile.json 再还原，正是 B4 的污染面。
 // 第二轮 F10：收尾必须先等子进程真退出再删临时目录。旧写法 kill 后立刻 rmSync，
 // 子进程尚未写完的启动补跑（日报产物、会话流水等）会把目录重新写出来，留下
 // /tmp/piper-badtz-* 残留（实测连跑 40 次留 2 个，残留里正是补跑写的文件）。
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const TMP_ROOT = mkdtempSync(join(tmpdir(), "piper-badtz-"));
 const TMP_DATA = join(TMP_ROOT, "data");
 const PROFILE_FILE = join(TMP_DATA, "settings-profile.json");
@@ -20,16 +20,16 @@ const PORT = 4414;
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = "badtz-test-token";
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
 function startServer() {
-	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA };
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA };
 	delete env.PIPER_HOST;
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -41,9 +41,9 @@ function startServer() {
 
 // 等子进程真正退出（F10）：SIGTERM 后进程还要跑完关闭流程与在途异步写，
 // 在此之前删目录必然竞态。超时未退则 SIGKILL 兜底。
-async function waitExit(proc, timeoutMs = 10000) {
+async function waitExit(proc: ChildProcess, timeoutMs = 10000) {
 	if (proc.exitCode !== null) return true;
-	const exited = await new Promise((resolvePromise) => {
+	const exited = await new Promise<boolean>((resolvePromise) => {
 		const timer = setTimeout(() => resolvePromise(false), timeoutMs);
 		proc.once("exit", () => {
 			clearTimeout(timer);
@@ -53,7 +53,7 @@ async function waitExit(proc, timeoutMs = 10000) {
 	if (exited) return true;
 	proc.kill("SIGKILL");
 	if (proc.exitCode !== null) return true;
-	return new Promise((resolvePromise) => {
+	return new Promise<boolean>((resolvePromise) => {
 		const timer = setTimeout(() => resolvePromise(false), 5000);
 		proc.once("exit", () => {
 			clearTimeout(timer);
@@ -62,7 +62,7 @@ async function waitExit(proc, timeoutMs = 10000) {
 	});
 }
 
-async function waitReady(proc, timeoutMs = 15000) {
+async function waitReady(proc: ChildProcess, timeoutMs = 15000) {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
 		if (proc.exitCode !== null) return false;
@@ -106,9 +106,9 @@ try {
 		});
 		cookie = (login.headers.get("set-cookie") || "").split(";")[0];
 	}
-	const authed = async (path, init = {}) => {
+	const authed = async (path: string, init: RequestInit = {}): Promise<{ status: number; json: Record<string, unknown> | null }> => {
 		const res = await fetch(BASE + path, { ...init, headers: { "Content-Type": "application/json", Cookie: cookie, ...(init.headers || {}) } });
-		return { status: res.status, json: await res.json().catch(() => null) };
+		return { status: res.status, json: (await res.json().catch(() => null)) as Record<string, unknown> | null };
 	};
 
 	const status = cookie ? await authed("/api/schedule/status") : { status: 0, json: null };

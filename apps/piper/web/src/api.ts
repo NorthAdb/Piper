@@ -1,4 +1,4 @@
-// Piper 后端 API 客户端：cookie 会话（与 server.mjs 一致），401 时抛 UnauthorizedError 交给界面回登录页。
+// Piper 后端 API 客户端：cookie 会话（与 server.ts 一致），401 时抛 UnauthorizedError 交给界面回登录页。
 import type {
 	Approval,
 	ApprovalExecution,

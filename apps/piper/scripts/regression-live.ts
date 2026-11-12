@@ -1,6 +1,6 @@
 // Piper 活网回归（非门禁）：唯一允许打真实 GitHub 的套件。
 // 用法（在 apps/piper 下）：npm run regression:live
-// 与硬门禁 scripts/regression.mjs 的分工（R4）：门禁全离线、走本地 GitHub 桩、
+// 与硬门禁 scripts/regression.ts 的分工（R4）：门禁全离线、走本地 GitHub 桩、
 // 结果必须确定；本套件不设 PIPER_GITHUB_API_BASE，对 repo-keeper 绑定的真实仓库
 // 跑一轮真实晨间扫描，只验证「真实世界里链路通」这一件门禁验不了的事。
 // 口径：
@@ -11,12 +11,12 @@
 //     （如 404/500、服务端 5xx、结构断言不符）：那才是要人看的失败。
 //   - SIGINT/SIGTERM 同门禁口径：杀子进程、清临时目录再退出。
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.REGRESSION_LIVE_PORT || 4399);
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = "piper-dev";
@@ -26,25 +26,26 @@ const TMP_DATA = join(TMP_ROOT, "data");
 process.env.PIPER_DATA_DIR = TMP_DATA;
 delete process.env.PIPER_GITHUB_API_BASE; // 本套件的定义就是走真实 api.github.com
 
-const results = [];
+const results: { seq: number; name: string; status: string }[] = [];
 let seq = 0;
-function record(name, status, detail = "") {
+function record(name: string, status: string, detail = "") {
 	seq += 1;
 	results.push({ seq, name, status });
 	const label = status === "pass" ? "PASS" : status === "skip" ? "SKIP" : "FAIL";
 	console.log(`${label} ${String(seq).padStart(2, "0")} ${name}${status === "pass" ? "" : ` — ${detail}`}`);
 }
-const check = (name, ok, detail = "") => record(name, ok ? "pass" : "fail", detail);
-const skip = (name, reason) => record(name, "skip", reason);
+const check = (name: string, ok: boolean, detail = "") => record(name, ok ? "pass" : "fail", detail);
+const skip = (name: string, reason: string) => record(name, "skip", reason);
 
 let cookie = "";
-async function req(path, init = {}) {
+// json 是 HTTP 响应边界（外部数据，逐字段取用），与产品侧 readBody 同口径用 any。
+async function req(path: string, init: RequestInit = {}): Promise<{ status: number; json: any; text: string }> {
 	const res = await fetch(BASE + path, {
 		...init,
 		headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...(init.headers || {}) },
 	});
 	const text = await res.text();
-	let json = null;
+	let json: any = null;
 	try {
 		json = JSON.parse(text);
 	} catch {
@@ -53,7 +54,7 @@ async function req(path, init = {}) {
 	return { status: res.status, json, text };
 }
 
-async function waitReady(proc) {
+async function waitReady(proc: ChildProcess) {
 	for (let i = 0; i < 60; i++) {
 		if (proc.exitCode !== null) throw new Error(`server 提前退出，exitCode=${proc.exitCode}`);
 		try {
@@ -67,7 +68,7 @@ async function waitReady(proc) {
 	throw new Error("server 启动超时");
 }
 
-let serverProc = null;
+let serverProc: ChildProcess | null = null;
 let cleanedUp = false;
 function cleanup() {
 	if (cleanedUp) return;
@@ -87,7 +88,7 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 }
 
 // 环境性失败判定：整轮失败或报告含失败行时，从报告文本里找环境原因。
-function envFailureReason(report) {
+function envFailureReason(report: unknown) {
 	const text = String(report ?? "");
 	if (/GitHub API 403/.test(text)) return "GitHub 403（公开限额/二次限流）";
 	if (/GitHub API 429/.test(text)) return "GitHub 429（限流）";
@@ -101,7 +102,7 @@ async function main() {
 		cleanup();
 		process.exit(2);
 	}
-	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA };
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA };
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN", "PIPER_GITHUB_API_BASE"]) delete env[k];
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
 	serverProc = proc;
@@ -119,7 +120,7 @@ async function main() {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ token: TOKEN }),
 		});
-		const loginJson = await login.json().catch(() => ({}));
+		const loginJson = (await login.json().catch(() => ({}))) as { ok?: unknown };
 		cookie = (login.headers.get("set-cookie") || "").split(";")[0];
 		check("POST /api/login 正确口令返回 {ok:true}", login.status === 200 && loginJson.ok === true && Boolean(cookie), `实际 ${login.status}`);
 
@@ -134,7 +135,7 @@ async function main() {
 		const beforeCount = before.json?.artifacts?.length ?? 0;
 		const run = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
 		const routines = await req("/api/routines");
-		const morning = (routines.json?.routines ?? []).find((r) => r.id === "morning-scan");
+		const morning = (routines.json?.routines ?? []).find((r: { id?: string; lastStatus?: string }) => r.id === "morning-scan");
 
 		const envReason = run.json?.failed === true || String(run.json?.report ?? "").includes("扫描失败") ? envFailureReason(run.json?.report) : null;
 		if (run.status !== 200) {

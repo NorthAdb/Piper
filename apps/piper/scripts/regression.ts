@@ -1,6 +1,6 @@
 // Piper API 回归脚本（硬门禁）：把历次实测的断言固化成可重复运行的检查。
 // 用法（在 apps/piper 下）：
-//   node scripts/regression.mjs        （或 npm run regression）
+//   node dist/scripts/regression.js        （或 npm run regression）
 // 行为：以「无模型 Key」的默认环境在本机测试端口启动一份 dist/server.js，逐项断言后退出。
 // 退出码 0 = 全部通过；1 = 有失败。
 // R4 测试隔离（本脚本的立身之本，改动前先想清楚）：
@@ -9,17 +9,18 @@
 //     配置，本套件结果都一样（R4 前「文件存在就 SKIP」的保护逻辑已删除，原被跳过的
 //     27-30、36-39 在隔离目录里恒为真断言）。
 //   - GitHub 经 PIPER_GITHUB_API_BASE 指向脚本内起的本地桩（下方 STUB_REPOS），
-//     全程离线、结果确定；打真实 GitHub 的几项已拆到 scripts/regression-live.mjs
+//     全程离线、结果确定；打真实 GitHub 的几项已拆到 scripts/regression-live.ts
 //     （npm run regression:live，非门禁）。
 //   - 收到 SIGINT/SIGTERM 时先杀子进程、关桩、删临时目录再退出，不留孤儿与残留。
 import { spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
+import type { AddressInfo } from "node:net";
 import { createServer } from "node:http";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const PORT = Number(process.env.REGRESSION_PORT || 4398);
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = "piper-dev";
@@ -32,7 +33,7 @@ process.env.PIPER_DATA_DIR = TMP_DATA;
 // ---- 本地 GitHub 桩：路径映射与 test-scan 替身同口径；未映射仓库回 404 ----
 // 通知组「绑不存在的仓库整轮失败」就靠这个 404。桩数据保持安静：最新已结束 run
 // 为 success、无 open PR（不开 Finding），日报结构（两节标题）仍可断言。
-function stubRepo(ownerRepo) {
+function stubRepo(ownerRepo: string) {
 	return {
 		info: { stargazers_count: 7, forks_count: 2, default_branch: "main", pushed_at: "2026-11-10T00:00:00Z" },
 		commits: [
@@ -51,10 +52,10 @@ function stubRepo(ownerRepo) {
 				created_at: "2026-11-10T00:00:00Z",
 			},
 		],
-		reviews: {},
+		reviews: {} as Record<string, unknown>,
 	};
 }
-const STUB_REPOS = { "NorthAdb/LinkForge": stubRepo("NorthAdb/LinkForge"), "NorthAdb/Loom": stubRepo("NorthAdb/Loom") };
+const STUB_REPOS: Record<string, ReturnType<typeof stubRepo>> = { "NorthAdb/LinkForge": stubRepo("NorthAdb/LinkForge"), "NorthAdb/Loom": stubRepo("NorthAdb/Loom") };
 const ghStub = createServer((reqHttp, resHttp) => {
 	const u = new URL(reqHttp.url ?? "/", "http://stub.invalid");
 	const m = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)(\/.*)?$/);
@@ -65,11 +66,11 @@ const ghStub = createServer((reqHttp, resHttp) => {
 		resHttp.end(JSON.stringify({ message: "Not Found" }));
 		return;
 	}
-	const rest = m[2] ?? "";
-	let payload;
+	const rest = m?.[2] ?? "";
+	let payload: unknown;
 	if (rest === "") payload = entry.info;
 	else if (rest.startsWith("/commits")) payload = entry.commits;
-	else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews[rest.match(/^\/pulls\/(\d+)\/reviews/)[1]] ?? [];
+	else if (rest.match(/^\/pulls\/\d+\/reviews/)) payload = entry.reviews[rest.match(/^\/pulls\/(\d+)\/reviews/)?.[1] ?? ""] ?? [];
 	else if (rest.startsWith("/pulls")) payload = entry.pulls;
 	else if (rest.startsWith("/issues")) payload = entry.issues;
 	else if (rest.startsWith("/actions/runs")) payload = { workflow_runs: entry.runs };
@@ -80,12 +81,14 @@ const ghStub = createServer((reqHttp, resHttp) => {
 	}
 	resHttp.end(JSON.stringify(payload));
 });
-await new Promise((resolveListen) => ghStub.listen(0, "127.0.0.1", resolveListen));
-const GH_BASE = `http://127.0.0.1:${ghStub.address().port}`;
+await new Promise<void>((resolveListen) => {
+	ghStub.listen(0, "127.0.0.1", () => resolveListen());
+});
+const GH_BASE = `http://127.0.0.1:${(ghStub.address() as AddressInfo).port}`;
 process.env.PIPER_GITHUB_API_BASE = GH_BASE;
 
 // ---- 信号处理：杀子进程、关桩、清临时目录，不留孤儿 server 与残留 ----
-let serverProc = null;
+let serverProc: ChildProcess | null = null;
 let cleanedUp = false;
 function cleanup() {
 	if (cleanedUp) return;
@@ -109,16 +112,23 @@ for (const sig of ["SIGINT", "SIGTERM"]) {
 	});
 }
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean; detail: string }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok, detail });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
 
 let cookie = "";
-async function req(path, init = {}) {
+// json 是 HTTP 响应边界（外部数据，逐字段取用），与产品侧 readBody 同口径用 any。
+interface ReqResult {
+	status: number;
+	json: any;
+	text: string;
+	headers: Headers;
+}
+async function req(path: string, init: RequestInit = {}): Promise<ReqResult> {
 	const res = await fetch(BASE + path, {
 		...init,
 		headers: { "Content-Type": "application/json", ...(cookie ? { Cookie: cookie } : {}), ...(init.headers || {}) },
@@ -133,14 +143,14 @@ async function req(path, init = {}) {
 	return { status: res.status, json, text, headers: res.headers };
 }
 
-async function chatEvents(botId, message) {
+async function chatEvents(botId: string, message: string) {
 	const res = await fetch(`${BASE}/api/chat`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json", Cookie: cookie },
 		body: JSON.stringify({ botId, message }),
 	});
 	const raw = await res.text();
-	const events = [];
+	const events: { event: string; data: any }[] = [];
 	for (const block of raw.split("\n\n")) {
 		const ev = /event: (.*)/.exec(block)?.[1];
 		const data = /data: (.*)/s.exec(block)?.[1];
@@ -149,7 +159,7 @@ async function chatEvents(botId, message) {
 	return events;
 }
 
-async function waitReady(proc) {
+async function waitReady(proc: ChildProcess) {
 	for (let i = 0; i < 60; i++) {
 		if (proc.exitCode !== null) throw new Error(`server 提前退出，exitCode=${proc.exitCode}`);
 		try {
@@ -169,7 +179,7 @@ async function main() {
 		cleanup();
 		process.exit(2);
 	}
-	const env = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
+	const env: NodeJS.ProcessEnv = { ...process.env, PORT: String(PORT), PIPER_TOKEN: TOKEN, PIPER_DATA_DIR: TMP_DATA, PIPER_GITHUB_API_BASE: GH_BASE };
 	// 默认环境必须是「无模型 Key」：显式剔除可能从外层继承的模型与 GitHub 令牌变量
 	for (const k of ["PIPER_MODEL_API_KEY", "OPENAI_API_KEY", "PIPER_MODEL_BASE_URL", "PIPER_MODEL_ID", "GITHUB_TOKEN"]) delete env[k];
 	const proc = spawn("node", ["dist/server.js"], { cwd: APP_DIR, env, stdio: ["ignore", "pipe", "pipe"] });
@@ -189,7 +199,7 @@ async function main() {
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify({ token: TOKEN }),
 		});
-		const loginJson = await login.json().catch(() => ({}));
+		const loginJson = (await login.json().catch(() => ({}))) as { ok?: unknown };
 		cookie = (login.headers.get("set-cookie") || "").split(";")[0];
 		check("POST /api/login 正确口令返回 {ok:true}", login.status === 200 && loginJson.ok === true && Boolean(cookie), `实际 ${login.status}`);
 
@@ -234,7 +244,7 @@ async function main() {
 
 		const ev2 = await chatEvents("piper-main", "创建一个代码审查 bot，负责审查 PR 的代码质量");
 		const sysEv = ev2.find((e) => e.event === "system");
-		check("chat 建 bot 意图 SSE 含 system 事件（标注规则兜底）", Boolean(sysEv) && String(sysEv.data?.text ?? "").includes("规则兜底"), JSON.stringify(sysEv?.data ?? null));
+		check("chat 建 bot 意图 SSE 含 system 事件（标注规则兜底）", sysEv !== undefined && String(sysEv.data?.text ?? "").includes("规则兜底"), JSON.stringify(sysEv?.data ?? null));
 		const draftEv = ev2.find((e) => e.event === "draft");
 		check(
 			"chat 建 bot 意图 SSE draft.name=代码审查 且 source=rules",
@@ -244,21 +254,22 @@ async function main() {
 		check("chat 建 bot 意图 SSE 末个事件为 done", ev2[ev2.length - 1]?.event === "done", `实际 ${ev2[ev2.length - 1]?.event}`);
 
 		// ---- 草案落库与清理（16-19）----
-		const confirm = await req("/api/bots/draft-confirm", { method: "POST", body: JSON.stringify({ draft: draftEv.data.draft }) });
+		// draftEv 已由上一项断言存在（不存在时本项按原 JS 语义直接抛错），沿用隐含假定取非空。
+		const confirm = await req("/api/bots/draft-confirm", { method: "POST", body: JSON.stringify({ draft: draftEv!.data.draft }) });
 		check("POST /api/bots/draft-confirm 返回 201", confirm.status === 201 && Boolean(confirm.json?.bot?.id), `实际 ${confirm.status}`);
 		const draftBotId = confirm.json?.bot?.id;
 
 		const afterConfirm = await req("/api/bots");
 		check(
 			"草案确认后 bot 出现在列表中",
-			(afterConfirm.json?.bots ?? []).some((b) => b.id === draftBotId),
-			`列表 ${(afterConfirm.json?.bots ?? []).map((b) => b.id).join(",")}`,
+			(afterConfirm.json?.bots ?? []).some((b: { id?: string }) => b.id === draftBotId),
+			`列表 ${(afterConfirm.json?.bots ?? []).map((b: { id?: string }) => b.id).join(",")}`,
 		);
 
 		const history = await req("/api/bots/piper-main/messages");
 		check(
 			"主 bot 会话历史含 draft 条目",
-			(history.json?.messages ?? []).some((m) => m.kind === "draft"),
+			(history.json?.messages ?? []).some((m: { kind?: string }) => m.kind === "draft"),
 			`条目数 ${history.json?.messages?.length}`,
 		);
 
@@ -267,7 +278,7 @@ async function main() {
 		check("删除草案 bot 后列表恢复为两个预置 bot", (restored.json?.bots ?? []).length === 2, `实际 ${(restored.json?.bots ?? []).length}`);
 
 		// ---- 晨间扫描与产物（20-22，R4 起走本地 GitHub 桩，离线确定性；真实
-		// GitHub 公开 API 的同口径检查在 scripts/regression-live.mjs，非门禁）----
+		// GitHub 公开 API 的同口径检查在 scripts/regression-live.ts，非门禁）----
 		// P1-4：服务端启动时可能触发一次启动补跑（今日已过点且未成功时）。先等调度空闲，
 		// 避免补跑与下面手动扫描的产物计数竞态（补跑产物会计入 before，断言仍是手动 +1）。
 		for (let i = 0; i < 160; i++) {
@@ -279,7 +290,7 @@ async function main() {
 		const beforeCount = before.json?.artifacts?.length ?? 0;
 		const run = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
 		const routines = await req("/api/routines");
-		const morning = (routines.json?.routines ?? []).find((r) => r.id === "morning-scan");
+		const morning = (routines.json?.routines ?? []).find((r: { id?: string; lastArtifactId?: string }) => r.id === "morning-scan");
 		check("POST /api/routines/morning-scan/run 成功且 routine lastStatus=ok", run.status === 200 && morning?.lastStatus === "ok", `run=${run.status} lastStatus=${morning?.lastStatus}`);
 
 		const after = await req("/api/artifacts");
@@ -306,7 +317,7 @@ async function main() {
 			approvals.status === 200 &&
 				Array.isArray(approvals.json?.approvals) &&
 				(approvals.json?.approvals ?? []).every(
-					(a) =>
+					(a: { findingId?: unknown; writeIntent?: { kind?: string }; intentHash?: unknown; status: string }) =>
 						typeof a.findingId === "string" &&
 						a.writeIntent?.kind === "pr_comment" &&
 						typeof a.intentHash === "string" &&
@@ -325,10 +336,10 @@ async function main() {
 		const homeHtml = await home.text();
 		check('GET / 返回 200 且 html 带 class="dark"', home.status === 200 && homeHtml.includes('class="dark"'), `实际 ${home.status}`);
 
-		const anon = async (path, init = {}) => {
+		const anon = async (path: string, init: RequestInit = {}): Promise<{ status: number; json: any; text: string }> => {
 			const res = await fetch(BASE + path, { ...init, headers: { "Content-Type": "application/json", ...(init.headers || {}) } });
 			const text = await res.text();
-			let json = null;
+			let json: any = null;
 			try {
 				json = JSON.parse(text);
 			} catch {
@@ -363,11 +374,41 @@ async function main() {
 	}
 }
 
+// 响应条目的最小形状（HTTP 边界，只列各断言实际读到的字段）。
+interface ConnectorCard {
+	id?: string;
+	status?: string;
+	statusNote?: string;
+	tokenHint?: string;
+	searchKeyHint?: string;
+	configurable?: boolean;
+	fetchEnabled?: boolean;
+	searchConfigured?: boolean;
+	bots?: string[];
+}
+interface NotificationEntry {
+	id?: string;
+	type?: string;
+	artifactId?: string;
+	routineId?: string;
+	read?: boolean;
+}
+
+// 各分组断言的上下文：与 main 内 req/check/anon/chatEvents 及扫描结果 run 同形状。
+interface Ctx {
+	req: typeof req;
+	check: typeof check;
+	anon: (path: string, init?: RequestInit) => Promise<{ status: number; json: any; text: string }>;
+	chatEvents: typeof chatEvents;
+	run: ReqResult;
+	cookie: string;
+}
+
 // 切片扩展断言的挂载点：后续切片在此追加。
 // L0-2（27-30）：模型设置存储——无 Key 默认值、保存不回显全文、测试连接失败不崩溃、清除恢复未配置。
 // R4 前这里有「真实 settings-model.json 存在就整组 SKIP」的保护；隔离后操作的是
 // 临时目录里的文件，恒真跑，不再跳过。
-async function runExtraChecks({ req, chatEvents, check }) {
+async function runExtraChecks({ req, chatEvents, check }: Pick<Ctx, "req" | "chatEvents" | "check">) {
 	const { existsSync, rmSync } = await import("node:fs");
 	const settingsFile = join(TMP_DATA, "settings-model.json");
 	const FAKE_KEY = "sk-regression-1234567890abcd";
@@ -402,7 +443,7 @@ async function runExtraChecks({ req, chatEvents, check }) {
 		// （packages dist 缺失时内核报 BASE_NOT_BUILT、error 含「基座未构建」）。旧断言只看
 		// ok:false，基座没构建时也会误绿；现加 error 不含「基座未构建」的反向断言钉死分类。
 		// 对话链路上的三类失败（MODEL_NOT_CONFIGURED / MODEL_ERROR / 成功流）由
-		// scripts/test-model-stub.mjs 以错误 code 逐项区分，不在这里重复。
+		// scripts/test-model-stub.ts 以错误 code 逐项区分，不在这里重复。
 		check(
 			"POST /api/settings/model/test 坏端点返回 ok:false（端点不通类：error 不含「基座未构建」）且进程存活",
 			test.status === 200 &&
@@ -429,7 +470,7 @@ async function runExtraChecks({ req, chatEvents, check }) {
 
 // L0-3（31-35）：基础资料与「关于我」——未登录写 401、profile 保存读回、about-me 三处同源、
 // 超限拒绝不写坏原文件。全部发生在隔离目录内；组内仍按快照—还原自洽（与真实数据无关）。
-async function runProfileChecks({ req, check, anon }) {
+async function runProfileChecks({ req, check, anon }: Pick<Ctx, "req" | "check" | "anon">) {
 	const origProfile = (await req("/api/settings/profile")).json ?? {};
 	const origAbout = (await req("/api/about-me")).json?.markdown ?? "";
 	const MARK = "回归标记-L0-3-关于我同源";
@@ -490,7 +531,7 @@ async function runProfileChecks({ req, check, anon }) {
 // 本组在脚本进程内临时剔除 GITHUB_TOKEN，使 githubToken() 的断言不受外层环境影响（结束恢复）。
 // 本进程内 import 的 lib 与子进程 server 共用同一 PIPER_DATA_DIR：经 API 保存的令牌
 // 文件，进程内 githubToken() 读到的正是同一份。
-async function runConnectorChecks({ req, check }) {
+async function runConnectorChecks({ req, check }: Pick<Ctx, "req" | "check">) {
 	const { existsSync, rmSync, readFileSync } = await import("node:fs");
 	const githubFile = join(TMP_DATA, "settings-github.json");
 	const FAKE_TOKEN = "ghp_regressiontoken1234567890wxyz";
@@ -498,7 +539,7 @@ async function runConnectorChecks({ req, check }) {
 	delete process.env.GITHUB_TOKEN;
 	try {
 		const list = await req("/api/settings/connectors");
-		const byId = Object.fromEntries((list.json?.connectors ?? []).map((c) => [c.id, c]));
+		const byId = Object.fromEntries((list.json?.connectors ?? []).map((c: ConnectorCard) => [c.id, c] as [string, ConnectorCard]));
 		check(
 			"GET /api/settings/connectors 返回四张卡且日历/邮件为 placeholder、GitHub 无令牌时 unconfigured",
 			list.status === 200 &&
@@ -507,12 +548,12 @@ async function runConnectorChecks({ req, check }) {
 				byId.mail?.status === "placeholder" &&
 				byId.github?.status === "unconfigured" &&
 				String(byId.mail?.statusNote ?? "").includes("收件箱"),
-			`实际 ${JSON.stringify((list.json?.connectors ?? []).map((c) => `${c.id}:${c.status}`))}`,
+			`实际 ${JSON.stringify((list.json?.connectors ?? []).map((c: ConnectorCard) => `${c.id}:${c.status}`))}`,
 		);
 
 		const put = await req("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token: FAKE_TOKEN }) });
 		const after = await req("/api/settings/connectors");
-		const ghAfter = (after.json?.connectors ?? []).find((c) => c.id === "github");
+		const ghAfter = (after.json?.connectors ?? []).find((c: ConnectorCard) => c.id === "github");
 		check(
 			"PUT 保存 GitHub 令牌后状态 connected、只回末四位掩码且响应不含令牌全文",
 			put.status === 200 &&
@@ -525,12 +566,13 @@ async function runConnectorChecks({ req, check }) {
 
 		// scan 的令牌来源只能是 settings.githubToken()：源码断言（无第二套入口）+ 同文件读回断言
 		// + 进程内 fetch 替身实际跑一次扫描，断言出站请求带了刚保存的令牌（不打活网、不打印令牌）。
-		const { githubToken } = await import("../dist/lib/settings.js");
+		const { githubToken } = await import("../lib/settings.ts");
 		const scanSrc = readFileSync(join(APP_DIR, "lib", "scan.ts"), "utf8");
-		const { runMorningScan } = await import("../dist/lib/scan.js");
-		const seenAuth = [];
+		const { runMorningScan } = await import("../lib/scan.ts");
+		const seenAuth: string[] = [];
 		const realFetch = globalThis.fetch;
-		globalThis.fetch = async (url, init = {}) => {
+		// 替身只实现扫描实际用到的 ok/status/json 三个面，不是完整 Response，故 cast 到 typeof fetch。
+		globalThis.fetch = (async (url: unknown, init: { headers?: { Authorization?: string } } = {}) => {
 			seenAuth.push(init.headers?.Authorization ?? "");
 			const u = String(url);
 			const payload = u.includes("/actions/runs")
@@ -539,14 +581,19 @@ async function runConnectorChecks({ req, check }) {
 					? []
 					: { stargazers_count: 1, forks_count: 0, default_branch: "main", pushed_at: "2026-11-10T00:00:00Z" };
 			return { ok: true, status: 200, json: async () => payload };
-		};
+		}) as typeof fetch;
 		try {
-			await runMorningScan({ repos: ["NorthAdb/LinkForge"], botId: "repo-keeper", saveArtifact: () => ({ id: "stub-artifact" }) });
+			// 返回形状对齐 lib 的 ArtifactMeta（扫描只透传，本回归不断言其内容）。
+			await runMorningScan({
+				repos: ["NorthAdb/LinkForge"],
+				botId: "repo-keeper",
+				saveArtifact: () => ({ id: "stub-artifact", botId: "repo-keeper", kind: "morning-scan", title: "", createdAt: null }),
+			});
 		} finally {
 			globalThis.fetch = realFetch;
 		}
 		check(
-			"scan.mjs 经 githubToken() 取令牌（无 env 直读）且替身扫描的出站请求带 Bearer 已保存令牌",
+			"scan.ts 经 githubToken() 取令牌（无 env 直读）且替身扫描的出站请求带 Bearer 已保存令牌",
 			scanSrc.includes("githubToken()") &&
 				!scanSrc.includes("process.env.GITHUB_TOKEN") &&
 				githubToken() === FAKE_TOKEN &&
@@ -557,7 +604,7 @@ async function runConnectorChecks({ req, check }) {
 
 		const cleared = await req("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token: "" }) });
 		const afterClear = await req("/api/settings/connectors");
-		const ghClear = (afterClear.json?.connectors ?? []).find((c) => c.id === "github");
+		const ghClear = (afterClear.json?.connectors ?? []).find((c: ConnectorCard) => c.id === "github");
 		check(
 			"清除令牌后 GitHub 回到 unconfigured 且 githubToken() 为空",
 			cleared.status === 200 && ghClear?.status === "unconfigured" && githubToken() === "",
@@ -587,7 +634,7 @@ async function runConnectorChecks({ req, check }) {
 			body: JSON.stringify({ fetchEnabled: true, searchEndpoint: "https://search.example.com/query", searchApiKey: FAKE_SEARCH_KEY }),
 		});
 		const listWeb = await req("/api/settings/connectors");
-		const webAfter = (listWeb.json?.connectors ?? []).find((c) => c.id === "web");
+		const webAfter = (listWeb.json?.connectors ?? []).find((c: ConnectorCard) => c.id === "web");
 		check(
 			"启用网页查询并保存搜索配置后卡 connected、searchConfigured=true、读回只有末四位掩码且响应不含密钥全文",
 			putWeb.status === 200 &&
@@ -601,7 +648,7 @@ async function runConnectorChecks({ req, check }) {
 		const badEndpoint = await req("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ searchEndpoint: "ftp://example.com/x" }) });
 		const putWebOff = await req("/api/settings/connectors/web", { method: "PUT", body: JSON.stringify({ fetchEnabled: false, searchApiKey: "" }) });
 		const listWebOff = await req("/api/settings/connectors");
-		const webOff = (listWebOff.json?.connectors ?? []).find((c) => c.id === "web");
+		const webOff = (listWebOff.json?.connectors ?? []).find((c: ConnectorCard) => c.id === "web");
 		check(
 			"搜索端点非 http/https 回 400；关闭抓取并清除密钥后卡回到 unconfigured 且 searchConfigured=false",
 			badEndpoint.status === 400 && putWebOff.status === 200 && webOff?.status === "unconfigured" && webOff?.searchConfigured === false,
@@ -617,14 +664,14 @@ async function runConnectorChecks({ req, check }) {
 // 绑定不存在仓库时整轮失败写失败通知且进程不崩溃，恢复后成功扫描再写完成通知。
 // R4：扫描走本地桩，「不存在的仓库」由桩回 404 实现整轮失败；通知文件在隔离目录内
 // 从空开始累积，断言仍按本轮 artifactId / 新增条目定位，不假设列表为空。
-async function runNotificationChecks({ req, check, anon }) {
+async function runNotificationChecks({ req, check, anon }: Pick<Ctx, "req" | "check" | "anon">) {
 	const unauth = await anon("/api/notifications");
 	check("未登录 GET /api/notifications 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
 
 	const routines = await req("/api/routines");
-	const morning = (routines.json?.routines ?? []).find((r) => r.id === "morning-scan");
+	const morning = (routines.json?.routines ?? []).find((r: { id?: string; lastArtifactId?: string }) => r.id === "morning-scan");
 	const list1 = await req("/api/notifications");
-	const completed = (list1.json?.notifications ?? []).find((n) => n.type === "routine.completed" && n.artifactId === morning?.lastArtifactId);
+	const completed = (list1.json?.notifications ?? []).find((n: NotificationEntry) => n.type === "routine.completed" && n.artifactId === morning?.lastArtifactId);
 	check(
 		"本轮成功扫描已写 routine.completed 通知（artifactId 对上 lastArtifactId）且初始未读",
 		Boolean(completed) && completed.read === false && (list1.json?.unread ?? 0) >= 1 && completed.routineId === "morning-scan",
@@ -634,8 +681,8 @@ async function runNotificationChecks({ req, check, anon }) {
 	// 标记已读后：接口内状态更新，且脚本进程（相当于重启后的新进程）从文件读到的也是已读——证明文件持久。
 	const unreadBefore = list1.json?.unread ?? 0;
 	const marked = completed ? await req("/api/notifications/read", { method: "POST", body: JSON.stringify({ ids: [completed.id] }) }) : { json: null };
-	const inMarked = (marked.json?.notifications ?? []).find((n) => n.id === completed?.id);
-	const { listNotifications } = await import("../dist/lib/notify.js");
+	const inMarked = (marked.json?.notifications ?? []).find((n: NotificationEntry) => n.id === completed?.id);
+	const { listNotifications } = await import("../lib/notify.ts");
 	const fromFile = listNotifications().find((n) => n.id === completed?.id);
 	check(
 		"POST /api/notifications/read 标记后 unread 减一且文件落盘（新进程读回为已读）",
@@ -645,9 +692,9 @@ async function runNotificationChecks({ req, check, anon }) {
 
 	// 失败路径：把仓库管家临时绑到不存在的仓库，整轮取证失败应记 failed + 失败通知；恢复后再跑成功。
 	const botsRes = await req("/api/bots");
-	const keeper = (botsRes.json?.bots ?? []).find((b) => b.id === "repo-keeper");
+	const keeper = (botsRes.json?.bots ?? []).find((b: { id?: string }) => b.id === "repo-keeper");
 	const keeperBody = { name: keeper.name, systemPrompt: keeper.systemPrompt, tools: keeper.tools, memoryScope: keeper.memoryScope, repos: keeper.repos };
-	const countFailed = async () => ((await req("/api/notifications")).json?.notifications ?? []).filter((n) => n.type === "routine.failed").length;
+	const countFailed = async () => ((await req("/api/notifications")).json?.notifications ?? []).filter((n: NotificationEntry) => n.type === "routine.failed").length;
 	const failedBefore = await countFailed();
 	let failOk = false;
 	let restoreOk = false;
@@ -655,7 +702,7 @@ async function runNotificationChecks({ req, check, anon }) {
 		await req("/api/bots/repo-keeper", { method: "PUT", body: JSON.stringify({ ...keeperBody, repos: ["NorthAdb/piper-no-such-repo-zzz"] }) });
 		const run = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
 		const afterFail = await req("/api/routines");
-		const morningAfterFail = (afterFail.json?.routines ?? []).find((r) => r.id === "morning-scan");
+		const morningAfterFail = (afterFail.json?.routines ?? []).find((r: { id?: string; lastArtifactId?: string }) => r.id === "morning-scan");
 		failOk =
 			run.status === 200 && morningAfterFail?.lastStatus === "failed" && (await countFailed()) === failedBefore + 1;
 	} finally {
@@ -663,10 +710,10 @@ async function runNotificationChecks({ req, check, anon }) {
 	}
 	const rerun = await req("/api/routines/morning-scan/run", { method: "POST", body: "{}" });
 	const afterRestore = await req("/api/routines");
-	const morningRestored = (afterRestore.json?.routines ?? []).find((r) => r.id === "morning-scan");
+	const morningRestored = (afterRestore.json?.routines ?? []).find((r: { id?: string; lastArtifactId?: string }) => r.id === "morning-scan");
 	const listEnd = await req("/api/notifications");
 	const restoredCompleted = (listEnd.json?.notifications ?? []).find(
-		(n) => n.type === "routine.completed" && n.artifactId === morningRestored?.lastArtifactId,
+		(n: NotificationEntry) => n.type === "routine.completed" && n.artifactId === morningRestored?.lastArtifactId,
 	);
 	restoreOk = rerun.status === 200 && morningRestored?.lastStatus === "ok" && Boolean(restoredCompleted);
 	check(
@@ -677,8 +724,8 @@ async function runNotificationChecks({ req, check, anon }) {
 }
 
 // P1-1（44-46）：Finding 只读 API——未登录 401、列表结构合法（本切片不改扫描，列表可为空）、
-// 不存在的 id 返回 404。存储层校验与持久化由 scripts/test-findings.mjs 覆盖，不在这里重复。
-async function runFindingChecks({ req, check, anon }) {
+// 不存在的 id 返回 404。存储层校验与持久化由 scripts/test-findings.ts 覆盖，不在这里重复。
+async function runFindingChecks({ req, check, anon }: Pick<Ctx, "req" | "check" | "anon">) {
 	const unauth = await anon("/api/findings");
 	check("未登录 GET /api/findings 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
 
@@ -688,7 +735,7 @@ async function runFindingChecks({ req, check, anon }) {
 		list.status === 200 &&
 			Array.isArray(list.json?.findings) &&
 			(list.json?.findings ?? []).every(
-				(f) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed", "executing"].includes(f.status),
+				(f: { evidenceUrl?: unknown; status: string }) => typeof f.evidenceUrl === "string" && f.evidenceUrl.length > 0 && ["open", "approved", "rejected", "expired", "executed", "executing"].includes(f.status),
 			),
 		`实际 ${list.status} 条数=${list.json?.findings?.length}`,
 	);
@@ -699,13 +746,13 @@ async function runFindingChecks({ req, check, anon }) {
 
 // P1-2（47-48）：扫描主产物改为拍板清单——扫描响应带 findings 数组且每条有证据链接；
 // findings 与 GET /api/findings 同一存储（按 bot 过滤可读回）。规则本身的精确断言
-// （哪条 run、哪个 PR、去重）走 scripts/test-scan.mjs 的替身测试与 P1-3 冻结夹具，
+// （哪条 run、哪个 PR、去重）走 scripts/test-scan.ts 的替身测试与 P1-3 冻结夹具，
 // 不拿活仓当唯一断言（活仓状态会变）。
-async function runScanFindingChecks({ req, check, run }) {
+async function runScanFindingChecks({ req, check, run }: Pick<Ctx, "req" | "check" | "run">) {
 	const findings = run.json?.findings;
 	check(
 		"扫描响应带 findings 数组且每条含 evidenceUrl、repo、type",
-		Array.isArray(findings) && findings.every((f) => f.evidenceUrl && f.repo && (f.type === "ci_failed" || f.type === "pr_needs_review")),
+		Array.isArray(findings) && findings.every((f: { evidenceUrl?: string; repo?: string; type?: string }) => f.evidenceUrl && f.repo && (f.type === "ci_failed" || f.type === "pr_needs_review")),
 		`实际条数=${Array.isArray(findings) ? findings.length : "非数组"}`,
 	);
 	const list = await req("/api/findings?botId=repo-keeper");
@@ -718,8 +765,8 @@ async function runScanFindingChecks({ req, check, run }) {
 
 // P1-4（49-52）：真定时调度——状态端点未登录 401、结构完整（时区/下次运行/上次结果）；
 // 例程 schedule 已是机器可解析 HH:MM 且文案不再是「仅手动触发」，并带 nextRunAt；
-// 状态机本身（到点/补跑/启动补跑/重入）由 scripts/test-schedule.mjs 假时钟覆盖。
-async function runScheduleChecks({ req, check, anon }) {
+// 状态机本身（到点/补跑/启动补跑/重入）由 scripts/test-schedule.ts 假时钟覆盖。
+async function runScheduleChecks({ req, check, anon }: Pick<Ctx, "req" | "check" | "anon">) {
 	const unauth = await anon("/api/schedule/status");
 	check("未登录 GET /api/schedule/status 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
 
@@ -738,7 +785,7 @@ async function runScheduleChecks({ req, check, anon }) {
 	);
 
 	const routines = await req("/api/routines");
-	const morning = (routines.json?.routines ?? []).find((r) => r.id === "morning-scan");
+	const morning = (routines.json?.routines ?? []).find((r: { id?: string; lastArtifactId?: string }) => r.id === "morning-scan");
 	check(
 		"morning-scan 的 schedule 为 HH:MM、scheduleText 不含「仅手动触发」且带 nextRunAt",
 		/^\d{2}:\d{2}$/.test(morning?.schedule ?? "") &&
@@ -758,8 +805,8 @@ async function runScheduleChecks({ req, check, anon }) {
 
 // P1-5（53-56）：待批收件箱独立视图的服务端契约——未登录读写均 401；对不存在的待批项
 // 批准/驳回返回 404（不假成功）；例程与产物都带 botId（桌面按 bot 隔离的数据前提）。
-// 批准/驳回的状态迁移与过期清理在 lib/approvals.mjs，由本组的结构断言 + P1-6 网关测试覆盖。
-async function runApprovalChecks({ req, check, anon }) {
+// 批准/驳回的状态迁移与过期清理在 lib/approvals.ts，由本组的结构断言 + P1-6 网关测试覆盖。
+async function runApprovalChecks({ req, check, anon }: Pick<Ctx, "req" | "check" | "anon">) {
 	const unauthGet = await anon("/api/approvals");
 	check("未登录 GET /api/approvals 返回 401", unauthGet.status === 401, `实际 ${unauthGet.status}`);
 
@@ -778,16 +825,16 @@ async function runApprovalChecks({ req, check, anon }) {
 	const artifacts = await req("/api/artifacts");
 	check(
 		"例程与产物均带 botId 字段（桌面按当前 bot 隔离过滤的数据前提）",
-		(routines.json?.routines ?? []).every((r) => typeof r.botId === "string") &&
-			(artifacts.json?.artifacts ?? []).every((a) => "botId" in a),
+		(routines.json?.routines ?? []).every((r: { botId?: unknown }) => typeof r.botId === "string") &&
+			(artifacts.json?.artifacts ?? []).every((a: Record<string, unknown>) => "botId" in a),
 		`routines=${(routines.json?.routines ?? []).length} artifacts=${(artifacts.json?.artifacts ?? []).length}`,
 	);
 }
 
 // P1-6（57-58）：网关审计的只读追溯端点——未登录 401；登录后结构合法且可按 findingId
-// 过滤。网关的拒绝/执行全路径（替身写 API 计数、正负审计）在 scripts/test-gateway.mjs 覆盖，
+// 过滤。网关的拒绝/执行全路径（替身写 API 计数、正负审计）在 scripts/test-gateway.ts 覆盖，
 // 这里不拿活仓库做写断言。
-async function runAuditChecks({ req, check, anon }) {
+async function runAuditChecks({ req, check, anon }: Pick<Ctx, "req" | "check" | "anon">) {
 	const unauth = await anon("/api/audit");
 	check("未登录 GET /api/audit 返回 401", unauth.status === 401, `实际 ${unauth.status}`);
 
@@ -797,10 +844,10 @@ async function runAuditChecks({ req, check, anon }) {
 		"GET /api/audit 返回 records 数组（元素带 result 与 ts），按 findingId 过滤不报错",
 		all.status === 200 &&
 			Array.isArray(all.json?.records) &&
-			(all.json?.records ?? []).every((r) => typeof r.result === "string" && typeof r.ts === "string") &&
+			(all.json?.records ?? []).every((r: { result?: unknown; ts?: unknown }) => typeof r.result === "string" && typeof r.ts === "string") &&
 			filtered.status === 200 &&
 			Array.isArray(filtered.json?.records) &&
-			(filtered.json?.records ?? []).every((r) => r.findingId === "f-no-such-item"),
+			(filtered.json?.records ?? []).every((r: { findingId?: string }) => r.findingId === "f-no-such-item"),
 		`实际 all=${all.status}/${all.json?.records?.length} filtered=${filtered.status}/${filtered.json?.records?.length}`,
 	);
 }
@@ -808,9 +855,9 @@ async function runAuditChecks({ req, check, anon }) {
 // R2（59-63）：监听与跨源写入收口的服务端契约——会话 Cookie SameSite=Strict；写请求
 // 带跨源 Origin 回 403、Content-Type 非 JSON 回 415、同源 Origin 正常放行；登录限速
 // （连续 11 次错口令均 401、第 12 次 429）。监听地址绑定与「非回环 + 默认口令拒绝
-// 启动」需要另起进程，在 scripts/test-listen.mjs 覆盖。本组放在最后：限速锁定来源后
+// 启动」需要另起进程，在 scripts/test-listen.ts 覆盖。本组放在最后：限速锁定来源后
 // 不应再有依赖登录的断言。
-async function runSecurityChecks({ check, cookie }) {
+async function runSecurityChecks({ check, cookie }: Pick<Ctx, "check" | "cookie">) {
 	const login = await fetch(`${BASE}/api/login`, {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
@@ -819,7 +866,7 @@ async function runSecurityChecks({ check, cookie }) {
 	const setCookie = login.headers.get("set-cookie") || "";
 	check("登录 Cookie 带 SameSite=Strict", login.status === 200 && setCookie.includes("SameSite=Strict"), `status=${login.status} set-cookie=${setCookie}`);
 
-	const put = (headers, body = "{}") =>
+	const put = (headers: Record<string, string>, body = "{}") =>
 		fetch(`${BASE}/api/settings/profile`, {
 			method: "PUT",
 			headers: { "Content-Type": "application/json", Cookie: cookie, ...headers },
@@ -834,7 +881,7 @@ async function runSecurityChecks({ check, cookie }) {
 	const sameOrigin = await put({ Origin: BASE }, JSON.stringify({ displayName: "回归测试" }));
 	check("带同源 Origin 的 PUT 正常放行（200）", sameOrigin.status === 200, `实际 ${sameOrigin.status}`);
 
-	const statuses = [];
+	const statuses: number[] = [];
 	for (let i = 0; i < 12; i++) {
 		const r = await fetch(`${BASE}/api/login`, {
 			method: "POST",
@@ -852,7 +899,7 @@ async function runSecurityChecks({ check, cookie }) {
 
 // R3（64-66）：时区保存校验——非法 IANA 时区回 400 且 settings-profile.json 字节不变；
 // 合法时区仍可正常保存（校验不误杀）。文件指隔离目录内的那份；运行前快照，结束时还原。
-async function runTimezoneChecks({ req, check }) {
+async function runTimezoneChecks({ req, check }: Pick<Ctx, "req" | "check">) {
 	const { existsSync, readFileSync } = await import("node:fs");
 	const profileFile = join(TMP_DATA, "settings-profile.json");
 	const origProfile = (await req("/api/settings/profile")).json ?? {};
@@ -887,7 +934,7 @@ async function runTimezoneChecks({ req, check }) {
 // R7（67-69）：秘密面——短 Key（≤8 位）读回为固定掩码；模型测试接口只传 baseUrl
 // 回 400（不得把已保存 Key 发往请求体给定的地址）；baseUrl 非 http/https 回 400。
 // 本组在最后运行（会改动已保存的模型 Key），隔离临时目录随回归结束整体丢弃，无需还原。
-async function runSecretsChecks({ req, check }) {
+async function runSecretsChecks({ req, check }: Pick<Ctx, "req" | "check">) {
 	const put = await req("/api/settings/model", { method: "PUT", body: JSON.stringify({ apiKey: "k1234567" }) });
 	const view = await req("/api/settings/model");
 	check(

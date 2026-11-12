@@ -1,6 +1,6 @@
 // 薄网关测试（P1-6 + R1 返工）：进程内 fetch 替身 + 临时 findings/audit/approvals/notifications
 // 文件，全程不打活网、不对真实仓库发任何评论。用法（在 apps/piper 下）：
-// node scripts/test-gateway.mjs（或 npm run test:gateway）
+// node dist/scripts/test-gateway.js（或 npm run test:gateway）
 // R4 起 PIPER_DATA_DIR 一并指向临时目录：网关经 store 读 bot 绑定、经 settings 读令牌，
 // 数据面全部隔离——种子 bots 由 ensureData 在临时目录生成，不再隐含依赖真实 data/。
 // SKIP 口径（R4）：跳过必须经 skip() 输出并在汇总单列，绝不计为 PASS。
@@ -11,11 +11,12 @@
 // 一次写、第二个 409）、崩溃重放靠评论标记查重（总写次数仍 1）、审计正负两类齐全且不含令牌、
 // 以及「除网关外无人构造 GitHub 评论写端点」的源码绕过断言。
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import type { ArtifactMeta } from "../lib/store.ts";
+import type { Finding } from "../lib/findings.ts";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { join } from "node:path";
+import { APP_DIR } from "./app-dir.ts";
 
-const APP_DIR = join(dirname(fileURLToPath(import.meta.url)), "..");
 const tmp = mkdtempSync(join(tmpdir(), "piper-gateway-"));
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 process.env.PIPER_FINDINGS_FILE = join(tmp, "findings.jsonl");
@@ -28,14 +29,14 @@ process.env.PIPER_NOTIFICATIONS_FILE = join(tmp, "notifications.jsonl");
 const ENV_TOKEN = "ghp_gateway_test_token_0001";
 process.env.GITHUB_TOKEN = ENV_TOKEN;
 
-const results = [];
+const results: { seq: number; name: string; ok: boolean; status: string }[] = [];
 let seq = 0;
-function check(name, ok, detail = "") {
+function check(name: string, ok: boolean, detail = "") {
 	seq += 1;
 	results.push({ seq, name, ok, status: ok ? "pass" : "fail" });
 	console.log(`${ok ? "PASS" : "FAIL"} ${String(seq).padStart(2, "0")} ${name}${ok ? "" : ` — ${detail}`}`);
 }
-function skip(name, reason = "") {
+function skip(name: string, reason = "") {
 	seq += 1;
 	results.push({ seq, name, ok: false, status: "skip" });
 	console.log(`SKIP ${String(seq).padStart(2, "0")} ${name}${reason ? ` — ${reason}` : ""}`);
@@ -44,16 +45,26 @@ function skip(name, reason = "") {
 // ---- fetch 替身：网关会用到的端点（PR 查询、评论列表、评论发表），其余一律 599 ----
 // 评论按 PR 落在 commentsByKey 里模拟 GitHub 侧已存在的评论（崩溃重放靠它查重标记）。
 const realFetch = globalThis.fetch;
-const postCalls = [];
-const commentsByKey = new Map();
+interface StubComment {
+	body: unknown;
+	html_url: string;
+}
+const postCalls: { path: string; body: { body?: string }; auth: string }[] = [];
+const commentsByKey = new Map<string, StubComment[]>();
 let pullState = "open";
 let pullDraft = false;
-let pullReviews = [];
+let pullReviews: { state?: string; user?: { login?: string }; commit_id?: string }[] = [];
 let postShouldFail = false;
 let pullShouldFail = false;
 let fetchDelayMs = 0;
 let postCrashAfterSuccess = false;
-globalThis.fetch = async (url, init = {}) => {
+interface StubInit {
+	method?: string;
+	body?: string;
+	headers?: { Authorization?: string };
+}
+// 替身只实现网关实际用到的 ok/status/json 三个面，不是完整 Response，故 cast 到 typeof fetch。
+globalThis.fetch = (async (url: unknown, init: StubInit = {}) => {
 	if (fetchDelayMs) await new Promise((r) => setTimeout(r, fetchDelayMs));
 	const u = new URL(String(url));
 	const method = init.method ?? "GET";
@@ -86,27 +97,32 @@ globalThis.fetch = async (url, init = {}) => {
 		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: pullDraft, head: { sha: "head-sha-1" } }) };
 	}
 	return { ok: false, status: 599, json: async () => ({}) };
-};
+}) as typeof fetch;
 
-const artifactCalls = [];
-const saveArtifactStub = (input) => {
+const artifactCalls: { botId: string; kind: string; title?: unknown; body?: unknown }[] = [];
+const saveArtifactStub = (input: { botId: string; kind: string; title?: unknown; body?: unknown }): ArtifactMeta => {
 	artifactCalls.push(input);
-	return { id: "stub-artifact-id", ...input };
+	return { id: "stub-artifact-id", botId: input.botId, kind: input.kind, title: String(input.title ?? ""), createdAt: null };
 };
 
 try {
-	const { ensureData } = await import("../dist/lib/store.js");
+	const { ensureData } = await import("../lib/store.ts");
 	ensureData(); // 在隔离目录生成种子 bots（网关按 bot 绑定仓校验，repo-keeper 必须存在）
-	const { createFinding, getFinding, updateFinding } = await import("../dist/lib/findings.js");
-	const { approveApproval, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../dist/lib/approvals.js");
-	const { gatewayExecuteWrite } = await import("../dist/lib/gateway.js");
-	const { listAudit } = await import("../dist/lib/audit.js");
-	const { listNotifications } = await import("../dist/lib/notify.js");
-	const { githubToken } = await import("../dist/lib/settings.js");
+	const { createFinding, getFinding: getFindingRaw, updateFinding } = await import("../lib/findings.ts");
+	const { approveApproval: approveApprovalRaw, listApprovals, recoverInterruptedExecutions, rejectApproval } = await import("../lib/approvals.ts");
+	// 本套件的 Finding 均为刚写入必存在（原 JS 全程按此隐含假定写）：包一层非空断言收口，
+	// approveApproval 的 null（不存在→404）与 getFinding 的 null 在本套件语境下都不出现。
+	const getFinding = (id: string): Finding => getFindingRaw(id) as Finding;
+	const approveApproval = async (...args: Parameters<typeof approveApprovalRaw>) =>
+		(await approveApprovalRaw(...args)) as NonNullable<Awaited<ReturnType<typeof approveApprovalRaw>>>;
+	const { gatewayExecuteWrite } = await import("../lib/gateway.ts");
+	const { listAudit } = await import("../lib/audit.ts");
+	const { listNotifications } = await import("../lib/notify.ts");
+	const { githubToken } = await import("../lib/settings.ts");
 	const token = githubToken();
 
 	const BODY = "晨间分诊提醒：这个 PR 尚未获得任何批准（APPROVED）审查，请维护者抽空审查并给出结论。";
-	function makeFinding(overrides = {}) {
+	function makeFinding(overrides: Record<string, unknown> = {}) {
 		return createFinding({
 			repo: "NorthAdb/LinkForge",
 			type: "pr_needs_review",
@@ -121,18 +137,20 @@ try {
 			...overrides,
 		});
 	}
-	const auditFor = (id) => listAudit({ findingId: id });
-	const viewOf = (id) => listApprovals().find((a) => a.findingId === id);
-	const snapOf = (f) => ({ kind: f.writeIntent.kind, repo: f.repo, prNumber: f.writeIntent.prNumber, body: f.writeIntent.body });
+	const auditFor = (id: string) => listAudit({ findingId: id });
+	const viewOf = (id: string) => listApprovals().find((a) => a.findingId === id);
+	// 调用点的 Finding 都带 writeIntent（makeFinding 恒给），沿用原 JS 的隐含假定取非空。
+	const snapOf = (f: Finding) => ({ kind: f.writeIntent!.kind, repo: f.repo, prNumber: f.writeIntent!.prNumber, body: f.writeIntent!.body });
 	// 直接改 findings 文件里的 writeIntent（模拟存储被事后篡改，绕过 updateFinding 的字段保护）。
-	function tamperFindingFile(id, newBody) {
-		const lines = readFileSync(process.env.PIPER_FINDINGS_FILE, "utf8").split("\n").filter(Boolean);
+	function tamperFindingFile(id: string, newBody: string) {
+		const file = process.env.PIPER_FINDINGS_FILE as string;
+		const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
 		const out = lines.map((line) => {
-			const f = JSON.parse(line);
+			const f = JSON.parse(line) as { id?: string; writeIntent?: { body?: string } };
 			if (f.id === id) f.writeIntent = { ...f.writeIntent, body: newBody };
 			return JSON.stringify(f);
 		});
-		writeFileSync(process.env.PIPER_FINDINGS_FILE, out.join("\n") + "\n", "utf8");
+		writeFileSync(file, out.join("\n") + "\n", "utf8");
 	}
 
 	// 1. 负向：未批准直调网关 → denied/not_approved，写 API 0 次，审计有 denied
@@ -149,8 +167,8 @@ try {
 
 	// 2. 正向：批准（带 intentHash）→ 网关执行快照恰好发一次评论（正文 = 快照正文 + 幂等标记），
 	//    状态 executed，审计 approved/executing/executed 同一 approvalId，artifact 与通知齐全
-	let executedFinding;
-	let executedApprovalId;
+	let executedFinding: Finding | undefined;
+	let executedApprovalId: string | null | undefined;
 	{
 		const f = makeFinding({ subject: "42" });
 		executedFinding = f;
@@ -190,17 +208,17 @@ try {
 	{
 		const f = makeFinding({ subject: "103" });
 		const before = postCalls.length;
-		const a = rejectApproval(f.id);
+		const a = rejectApproval(f.id) as NonNullable<ReturnType<typeof rejectApproval>>;
 		check(
 			"驳回：替身写 API 0 次，状态 rejected，审计有 rejected",
 			a.status === "rejected" && postCalls.length === before && auditFor(f.id).some((x) => x.result === "rejected"),
 			`status=${a.status}`,
 		);
-		let threw = null;
+		let threw: (Error & { status?: number }) | null = null;
 		try {
 			await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		} catch (err) {
-			threw = err;
+			threw = err as Error & { status?: number };
 		}
 		check("已关闭（rejected）再批准被拒（409），不产生写调用", threw?.status === 409 && postCalls.length === before, `threw=${threw?.status}`);
 	}
@@ -208,11 +226,11 @@ try {
 	// 4. 过期：open 且已过期 → 批准回 409 且转 expired；approved 后过期 → 网关 denied/expired
 	{
 		const f = makeFinding({ subject: "104", expiresAt: new Date(Date.now() - 1000).toISOString() });
-		let threw = null;
+		let threw: (Error & { status?: number }) | null = null;
 		try {
 			await approveApproval(f.id, { intentHash: undefined, saveArtifactFn: saveArtifactStub });
 		} catch (err) {
-			threw = err;
+			threw = err as Error & { status?: number };
 		}
 		const g = makeFinding({ subject: "105" });
 		updateFinding(g.id, { status: "approved", expiresAt: new Date(Date.now() - 1000).toISOString() });
@@ -245,11 +263,11 @@ try {
 		const staleHash = viewOf(f.id)?.intentHash;
 		tamperFindingFile(f.id, "被篡改的正文");
 		const before = postCalls.length;
-		let threw = null;
+		let threw: (Error & { status?: number }) | null = null;
 		try {
 			await approveApproval(f.id, { intentHash: staleHash, saveArtifactFn: saveArtifactStub });
 		} catch (err) {
-			threw = err;
+			threw = err as Error & { status?: number };
 		}
 		check(
 			"篡改后批准被拒：writeIntent 被改后带旧 intentHash 批准回 409「内容已变」，状态仍 open，写 API 0 次",
@@ -289,7 +307,7 @@ try {
 			createdAt: new Date().toISOString(),
 			updatedAt: new Date().toISOString(),
 		};
-		appendFileSync(process.env.PIPER_FINDINGS_FILE, JSON.stringify(raw) + "\n", "utf8");
+		appendFileSync(process.env.PIPER_FINDINGS_FILE as string, JSON.stringify(raw) + "\n", "utf8");
 		const before = postCalls.length;
 		const r = await gatewayExecuteWrite({
 			findingId: raw.id,
@@ -379,7 +397,8 @@ try {
 		const hash = viewOf(f.id)?.intentHash;
 		fetchDelayMs = 50;
 		const before = postCalls.length;
-		const settle = (p) => p.then((v) => ({ ok: true, v })).catch((e) => ({ ok: false, e }));
+		const settle = <T,>(p: Promise<T>): Promise<{ ok: true; v: T } | { ok: false; e: Error & { status?: number } }> =>
+			p.then((v) => ({ ok: true as const, v })).catch((e) => ({ ok: false as const, e: e as Error & { status?: number } }));
 		const [r1, r2] = await Promise.all([
 			settle(approveApproval(f.id, { intentHash: hash, saveArtifactFn: saveArtifactStub })),
 			settle(approveApproval(f.id, { intentHash: hash, saveArtifactFn: saveArtifactStub })),
@@ -420,11 +439,11 @@ try {
 
 	// 15. 审计完整性：字段形状齐全且全文件不含令牌全文
 	{
-		const rec = auditFor(executedFinding.id).find((x) => x.result === "executed");
-		const rawAudit = readFileSync(process.env.PIPER_AUDIT_FILE, "utf8");
+		const rec = auditFor(executedFinding!.id).find((x) => x.result === "executed");
+		const rawAudit = readFileSync(process.env.PIPER_AUDIT_FILE as string, "utf8");
 		check(
 			"审计样例字段：ts/botId/intent{kind,repo,prNumber,bodyLength,bodyPreview}/result/findingId/approvalId/commentUrl 齐全且审计文件不含令牌",
-			Boolean(rec) &&
+			rec !== undefined &&
 				typeof rec.ts === "string" &&
 				rec.botId === "repo-keeper" &&
 				rec.intent?.kind === "pr_comment" &&
@@ -432,7 +451,7 @@ try {
 				rec.intent?.prNumber === 42 &&
 				rec.intent?.bodyLength === BODY.length &&
 				rec.intent?.bodyPreview === BODY.slice(0, 120) &&
-				rec.findingId === executedFinding.id &&
+				rec.findingId === executedFinding!.id &&
 				rec.approvalId === executedApprovalId &&
 				!rawAudit.includes(token),
 			JSON.stringify(rec),
@@ -461,14 +480,15 @@ try {
 	}
 
 	// 直接改 findings 文件里的 updatedAt（模拟执行在途已停留很久，updatedAt 不是可改字段）。
-	function ageFindingFile(id, iso) {
-		const lines = readFileSync(process.env.PIPER_FINDINGS_FILE, "utf8").split("\n").filter(Boolean);
+	function ageFindingFile(id: string, iso: string) {
+		const file = process.env.PIPER_FINDINGS_FILE as string;
+		const lines = readFileSync(file, "utf8").split("\n").filter(Boolean);
 		const out = lines.map((line) => {
-			const f = JSON.parse(line);
+			const f = JSON.parse(line) as { id?: string; updatedAt?: string };
 			if (f.id === id) f.updatedAt = iso;
 			return JSON.stringify(f);
 		});
-		writeFileSync(process.env.PIPER_FINDINGS_FILE, out.join("\n") + "\n", "utf8");
+		writeFileSync(file, out.join("\n") + "\n", "utf8");
 	}
 
 	// 17. executing 崩溃恢复（F1，第二轮返工）：进程在网关领取执行后、落终态前死亡
@@ -483,12 +503,12 @@ try {
 		const fresh = makeFinding({ subject: "119" });
 		updateFinding(fresh.id, { status: "approved" });
 		updateFinding(fresh.id, { status: "executing" });
-		let recovered = null;
-		let err = null;
+		let recovered: number | null = null;
+		let err: Error | null = null;
 		try {
 			recovered = recoverInterruptedExecutions();
 		} catch (e) {
-			err = e;
+			err = e as Error;
 		}
 		check(
 			"executing 恢复：超时 executing 退回 approved 并写审计 failed/interrupted，未超时的不动",
@@ -499,11 +519,11 @@ try {
 				getFinding(fresh.id).status === "executing",
 			`err=${err?.message ?? ""} recovered=${recovered} stale=${getFinding(stale.id).status} fresh=${getFinding(fresh.id).status}`,
 		);
-		let recoveredAtBoot = null;
+		let recoveredAtBoot: number | null = null;
 		try {
 			recoveredAtBoot = recoverInterruptedExecutions({ olderThanMs: 0 });
 		} catch (e) {
-			err = e;
+			err = e as Error;
 		}
 		check(
 			"executing 恢复（启动语义）：olderThanMs=0 时未超时的 executing 也退回 approved",
@@ -519,13 +539,14 @@ try {
 	//     B 共 120 条、标记在第 111 条（per_page=100 的第 2 页）；
 	//     C 共 1006 条、标记在第 1006 条（超出 10 页 × 100 的取尽上限）。
 	//     A/B：重试 POST 0 次、复用已有评论记 executed；C：POST 0 次、保持 approved、审计有该原因。
-	async function seedCrashedWithMarker(f, total, markerIndex) {
+	async function seedCrashedWithMarker(f: Finding, total: number, markerIndex: number) {
 		postCrashAfterSuccess = true;
 		const out1 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		postCrashAfterSuccess = false;
-		const key = `${f.repo}#${f.writeIntent.prNumber}`;
+		// 调用点的 Finding 恒带 writeIntent（makeFinding 恒给），沿用原 JS 的隐含假定取非空。
+		const key = `${f.repo}#${f.writeIntent!.prNumber}`;
 		const arr = commentsByKey.get(key) ?? [];
-		const markerComment = arr[arr.length - 1];
+		const markerComment = arr[arr.length - 1] as StubComment;
 		const fillers = Array.from({ length: total - 1 }, (_, i) => ({ body: `filler ${i}`, html_url: `https://example.invalid/filler-${i}` }));
 		commentsByKey.set(key, [...fillers.slice(0, markerIndex), markerComment, ...fillers.slice(markerIndex)]);
 		return out1;
@@ -568,7 +589,7 @@ try {
 	//     扫描与对话层文件不得同时出现 api.github.com 与 POST 写调用。
 	{
 		const libFiles = readdirSync(join(APP_DIR, "lib")).filter((f) => f.endsWith(".ts"));
-		const sources = Object.fromEntries(libFiles.map((f) => [f, readFileSync(join(APP_DIR, "lib", f), "utf8")]));
+		const sources: Record<string, string> = Object.fromEntries(libFiles.map((f) => [f, readFileSync(join(APP_DIR, "lib", f), "utf8")]));
 		sources["server.ts"] = readFileSync(join(APP_DIR, "server.ts"), "utf8");
 		const withComments = Object.entries(sources)
 			.filter(([, src]) => src.includes("/comments"))
