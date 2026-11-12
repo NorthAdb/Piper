@@ -1,4 +1,4 @@
-// 冻结夹具评测（P1-3）：把晨间扫描的两条拍板规则钉在入库夹具上回归。
+// 冻结夹具评测（P1-3）：把晨间扫描的三条拍板规则钉在入库夹具上回归。
 // 用法（在 apps/piper 下）：npm run eval:scan（或 node dist/scripts/eval-scan.js）
 // 夹具在 test/fixtures/github/*.json，一文件一用例，格式：
 //   { name, description, scans（默认 1）, comment（可选，说明本用例覆盖边界，不参与断言）,
@@ -12,6 +12,7 @@
 //     历史项），时间按「几天前」相对评测运行时刻换算，evidenceUrl 按 type 从 repo+subject 推导。
 //   pullDetails: { "<PR号>": {…PR 对象…} }——不在 open 列表里的 PR 的单查结果（已合并/关闭等），
 //     供扫描前对账的 GET /pulls/:n 取用；open 列表里有的 PR 单查直接取列表项。
+//   issueDetails: { "<Issue号>": {…Issue 对象…} }——同上，对应 GET /issues/:n（Issue 已关闭等）。
 //   expect.created: 全部轮次累计新开条数（缺省 = expect.findings 条数，旧口径）。
 //   expect.createdPerScan: [n, n, ...]——逐轮新开条数（冷却类用例靠它区分「哪一轮开的」）。
 //   expect.expired: [{ repo, type, subject }]——结束时应恰好处于 expired 的 Finding 集合（对账退役）。
@@ -41,6 +42,7 @@ interface FixtureRepo {
 	pulls?: { number?: number | string }[];
 	reviews?: Record<string, { error?: number } | unknown[]>;
 	pullDetails?: Record<string, unknown>;
+	issueDetails?: Record<string, unknown>;
 }
 interface SeedFindingInput {
 	repo: string;
@@ -115,6 +117,13 @@ function installStub(repos: Record<string, FixtureRepo>) {
 			if (!one) return { ok: false, status: 404, json: async () => ({}) };
 			payload = one;
 		} else if (rest.startsWith("/pulls")) payload = pageOf(entry.pulls);
+		else if (rest.match(/^\/issues\/\d+$/)) {
+			// 单个 Issue 查询（Issue 分诊对账用）：先查 open 列表，再查 issueDetails，都没有回 404。
+			const num = rest.match(/^\/issues\/(\d+)$/)?.[1] ?? "";
+			const one = (entry.issues ?? []).find((i) => String((i as { number?: unknown })?.number) === num) ?? entry.issueDetails?.[num];
+			if (!one) return { ok: false, status: 404, json: async () => ({}) };
+			payload = one;
+		}
 		else if (rest.startsWith("/issues")) payload = pageOf(entry.issues);
 		else if (rest.startsWith("/actions/runs")) {
 			if (entry.runsError) return { ok: false, status: entry.runsError, json: async () => ({}) };

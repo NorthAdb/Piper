@@ -57,6 +57,7 @@ interface StubComment {
 const postCalls: { path: string; body: { body?: string }; auth: string }[] = [];
 const commentsByKey = new Map<string, StubComment[]>();
 let pullState = "open";
+let issueState = "open";
 let pullDraft = false;
 let pullReviews: { state?: string; user?: { login?: string }; commit_id?: string }[] = [];
 let postShouldFail = false;
@@ -103,6 +104,9 @@ globalThis.fetch = (async (url: unknown, init: StubInit = {}) => {
 	if (method === "GET" && /\/pulls\/\d+$/.test(u.pathname)) {
 		if (pullShouldFail) return { ok: false, status: 500, json: async () => ({}) };
 		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: pullDraft, head: { sha: "head-sha-1" } }) };
+	}
+	if (method === "GET" && /\/issues\/\d+$/.test(u.pathname)) {
+		return { ok: true, status: 200, json: async () => ({ state: issueState }) };
 	}
 	if (method === "GET" && u.pathname === "/user") {
 		return { ok: true, status: 200, json: async () => ({ login: "tester" }) };
@@ -159,7 +163,16 @@ try {
 	const auditFor = (id: string) => listAudit({ findingId: id });
 	const viewOf = (id: string) => listApprovals().find((a) => a.findingId === id);
 	// 调用点的 Finding 都带 writeIntent（makeFinding 恒给），沿用原 JS 的隐含假定取非空。
-	const snapOf = (f: Finding) => ({ kind: f.writeIntent!.kind, repo: f.repo, prNumber: f.writeIntent!.prNumber, body: f.writeIntent!.body });
+	const snapOf = (f: Finding) => {
+		const i = f.writeIntent!;
+		return {
+			kind: i.kind,
+			repo: f.repo,
+			prNumber: i.kind === "pr_comment" ? i.prNumber : null,
+			issueNumber: i.kind === "issue_comment" ? i.issueNumber : null,
+			body: i.body,
+		};
+	};
 	// 直接改 findings 文件里的 writeIntent（模拟存储被事后篡改，绕过 updateFinding 的字段保护）。
 	function tamperFindingFile(id: string, newBody: string) {
 		const file = process.env.PIPER_FINDINGS_FILE as string;
@@ -331,7 +344,7 @@ try {
 		const r = await gatewayExecuteWrite({
 			findingId: raw.id,
 			approvalId: "ap-direct",
-			snapshot: { kind: "merge_pr", repo: raw.repo, prNumber: 42, body: "x" },
+			snapshot: { kind: "merge_pr", repo: raw.repo, prNumber: 42, issueNumber: null, body: "x" },
 		});
 		check(
 			"不支持的意图被拒：kind 非 pr_comment → denied/unsupported_intent，写 API 0 次",
@@ -563,7 +576,8 @@ try {
 		const out1 = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
 		postCrashAfterSuccess = false;
 		// 调用点的 Finding 恒带 writeIntent（makeFinding 恒给），沿用原 JS 的隐含假定取非空。
-		const key = `${f.repo}#${f.writeIntent!.prNumber}`;
+		const wi = f.writeIntent!;
+		const key = `${f.repo}#${wi.kind === "pr_comment" ? wi.prNumber : wi.issueNumber}`;
 		const arr = commentsByKey.get(key) ?? [];
 		const markerComment = arr[arr.length - 1] as StubComment;
 		const fillers = Array.from({ length: total - 1 }, (_, i) => ({ body: `filler ${i}`, html_url: `https://example.invalid/filler-${i}` }));
@@ -885,6 +899,81 @@ try {
 			noRepos.includes("没有绑定任何 GitHub 仓库") && !noRepos.includes("晨间仓库扫描例程挂在你名下"),
 			noRepos,
 		);
+	}
+
+	// ---- 场景 J（Issue 分诊）：issue_comment 经网关执行 ----
+	const ISSUE_BODY = "分诊提醒：这个 Issue 已打开 6 天，尚无人回应。";
+	const makeIssueFinding = () =>
+		makeFinding({
+			type: "issue_untriaged",
+			subject: "7",
+			title: "Issue 待分诊：#7 导出崩溃（NorthAdb/LinkForge）",
+			evidenceUrl: "https://github.com/NorthAdb/LinkForge/issues/7",
+			writeIntent: { kind: "issue_comment", issueNumber: 7, body: ISSUE_BODY },
+		});
+	// J1：批准后执行——评论发到 /issues/7/comments、正文带幂等标记、事项 executed。
+	{
+		issueState = "open";
+		commentsByKey.delete("NorthAdb/LinkForge#7");
+		const f = makeIssueFinding();
+		const before = postCalls.length;
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		const posted = postCalls.slice(before);
+		check(
+			"场景J：issue_comment 批准后执行，评论发到 Issue 评论接口且带标记",
+			out.execution?.ok === true &&
+				out.execution?.result === "executed" &&
+				posted.length === 1 &&
+				posted[0].path === "/repos/NorthAdb/LinkForge/issues/7/comments" &&
+				String(posted[0].body.body).includes(ISSUE_BODY) &&
+				String(posted[0].body.body).includes("piper:approval=") &&
+				getFinding(f.id)?.status === "executed",
+			JSON.stringify(out.execution),
+		);
+	}
+	// J2：Issue 已关闭 → failed/issue_not_open，退回 approved，POST 0 次。
+	{
+		issueState = "closed";
+		const f = makeIssueFinding();
+		updateFinding(f.id, { status: "approved" });
+		const before = postCalls.length;
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-issue-closed", snapshot: snapOf(getFinding(f.id)!) });
+		check(
+			"场景J：Issue 已关闭时执行失败（issue_not_open）、退回 approved、不发评论",
+			r.ok === false && r.result === "failed" && r.reason === "issue_not_open" && postCalls.length === before && getFinding(f.id)?.status === "approved",
+			JSON.stringify(r),
+		);
+		issueState = "open";
+	}
+	// J3：已有人先评论（分诊已发生）→ failed/precondition_changed，POST 0 次。
+	{
+		commentsByKey.set("NorthAdb/LinkForge#7", [{ body: "我来看看这个问题。", html_url: "https://example.invalid/c1" }]);
+		const f = makeIssueFinding();
+		updateFinding(f.id, { status: "approved" });
+		const before = postCalls.length;
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-issue-triaged", snapshot: snapOf(getFinding(f.id)!) });
+		check(
+			"场景J：Issue 已有他人评论时不再发模板（precondition_changed）、退回 approved",
+			r.ok === false && r.result === "failed" && r.reason === "precondition_changed" && postCalls.length === before && getFinding(f.id)?.status === "approved",
+			JSON.stringify(r),
+		);
+		commentsByKey.delete("NorthAdb/LinkForge#7");
+	}
+	// J4：评论里已有本批准的幂等标记 → 复用记 executed，POST 0 次。
+	{
+		commentsByKey.set("NorthAdb/LinkForge#7", [
+			{ body: `${ISSUE_BODY}\n\n<!-- piper:approval=ap-issue-reuse -->`, html_url: "https://github.com/NorthAdb/LinkForge/issues/7#issuecomment-9" },
+		]);
+		const f = makeIssueFinding();
+		updateFinding(f.id, { status: "approved" });
+		const before = postCalls.length;
+		const r = await gatewayExecuteWrite({ findingId: f.id, approvalId: "ap-issue-reuse", snapshot: snapOf(getFinding(f.id)!) });
+		check(
+			"场景J：已有本批准标记的评论时复用记 executed、不重复发",
+			r.ok === true && r.result === "executed" && r.reused === true && postCalls.length === before && getFinding(f.id)?.status === "executed",
+			JSON.stringify(r),
+		);
+		commentsByKey.delete("NorthAdb/LinkForge#7");
 	}
 } finally {
 	globalThis.fetch = realFetch;

@@ -7,7 +7,7 @@ import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { DATA_DIR, ensureData, writeFileAtomicSync } from "./store.ts";
 
-export const FINDING_TYPES = ["ci_failed", "pr_needs_review"] as const;
+export const FINDING_TYPES = ["ci_failed", "pr_needs_review", "issue_untriaged"] as const;
 export type FindingType = (typeof FINDING_TYPES)[number];
 export const FINDING_STATUSES = ["open", "approved", "rejected", "expired", "executed", "executing"] as const;
 export type FindingStatus = (typeof FINDING_STATUSES)[number];
@@ -23,14 +23,15 @@ export const FINDING_TRANSITIONS: Record<FindingStatus, FindingStatus[]> = {
 	expired: [],
 	executed: [],
 };
-// 本批只允许一种写意图（P1-6 网关放行）：给指定 PR 发表一条评论。
-export const FINDING_WRITE_INTENT_KINDS = ["pr_comment"] as const;
+// 写意图（P1-6 起，Issue 分诊起泛化为多动作）：网关按 kind 分发执行。
+// pr_comment 给指定 PR 发评论；issue_comment 给指定 Issue 发评论——两者都是
+// 「经人批准后在对话串里留一条话」，快照/哈希/幂等口径完全一致。新增动作
+// 必须先在这里立 kind 并在网关实现对应的执行前复检，不许只声明不执行。
+export const FINDING_WRITE_INTENT_KINDS = ["pr_comment", "issue_comment"] as const;
 
-export interface WriteIntent {
-	kind: string;
-	prNumber: number;
-	body: string;
-}
+export type WriteIntent =
+	| { kind: "pr_comment"; prNumber: number; body: string }
+	| { kind: "issue_comment"; issueNumber: number; body: string };
 
 // 拍板详情（切片二）：开单时刻为「拍板的人」取证的 PR 证据快照——描述摘录、
 // 分支、改动规模与文件清单、每位审查人的最新表态。与 headSha 同类：立住后
@@ -48,6 +49,17 @@ export interface FindingDetail {
 	reviewers: { login: string; state: string; stale: boolean }[];
 }
 
+// Issue 拍板详情（Issue 分诊）：与 FindingDetail 同类——开单时刻的证据快照、
+// 立住后不可改。字段口径对应「未分诊」判定：正文摘录、当前标签、认领人、
+// 评论数（开单时必为 0，留在快照里供拍板时核对判定前提）。
+export interface IssueDetail {
+	bodyExcerpt: string;
+	labels: string[];
+	assignees: string[];
+	commentCount: number;
+	authorLogin: string;
+}
+
 export interface Finding {
 	id: string;
 	repo: string;
@@ -59,6 +71,7 @@ export interface Finding {
 	suggestedAction: string;
 	writeIntent: WriteIntent | null;
 	detail: FindingDetail | null;
+	issueDetail: IssueDetail | null;
 	expiresAt: string | null;
 	status: FindingStatus;
 	botId: string;
@@ -79,6 +92,7 @@ export interface FindingInput {
 	suggestedAction?: unknown;
 	writeIntent?: unknown;
 	detail?: unknown;
+	issueDetail?: unknown;
 	expiresAt?: unknown;
 	status?: unknown;
 	botId?: unknown;
@@ -141,15 +155,20 @@ function validateEvidenceUrl(value: unknown): string {
 function validateWriteIntent(value: unknown): WriteIntent | null {
 	if (value === undefined || value === null) return null;
 	if (typeof value !== "object" || Array.isArray(value)) throw badRequest("Finding.writeIntent 须为对象或 null");
-	const v = value as { kind?: unknown; body?: unknown; prNumber?: unknown };
+	const v = value as { kind?: unknown; body?: unknown; prNumber?: unknown; issueNumber?: unknown };
 	if (!(FINDING_WRITE_INTENT_KINDS as readonly unknown[]).includes(v.kind)) {
-		throw badRequest(`Finding.writeIntent.kind 非法: ${v.kind}（本批只允许 ${FINDING_WRITE_INTENT_KINDS.join("/")}）`);
+		throw badRequest(`Finding.writeIntent.kind 非法: ${v.kind}（只允许 ${FINDING_WRITE_INTENT_KINDS.join("/")}）`);
 	}
-	// pr_comment：仓库沿用 Finding.repo，正文与 PR 号必须齐全（PR 号即 subject，但意图里再存一份供网关独立校验）。
+	// 仓库沿用 Finding.repo；编号即 subject，但意图里再存一份供网关独立校验。
 	const body = requireNonEmptyString(v.body, "writeIntent.body");
+	if (v.kind === "issue_comment") {
+		const issueNumber = Number(v.issueNumber);
+		if (!Number.isInteger(issueNumber) || issueNumber <= 0) throw badRequest("Finding.writeIntent.issueNumber 须为正整数");
+		return { kind: "issue_comment", issueNumber, body };
+	}
 	const prNumber = Number(v.prNumber);
 	if (!Number.isInteger(prNumber) || prNumber <= 0) throw badRequest("Finding.writeIntent.prNumber 须为正整数");
-	return { kind: v.kind as string, prNumber, body };
+	return { kind: "pr_comment", prNumber, body };
 }
 
 // 详情逐字段收窄：类型不对的字段回落安全缺省（字符串 ""、计数 0、列表 []、
@@ -181,6 +200,21 @@ function validateDetail(value: unknown): FindingDetail | null {
 		deletions: num(v.deletions),
 		files,
 		reviewers,
+	};
+}
+
+// Issue 详情逐字段收窄（与 validateDetail 同口径：坏字段回落缺省，不整条失败）。
+function validateIssueDetail(value: unknown): IssueDetail | null {
+	if (value === undefined || value === null) return null;
+	if (typeof value !== "object" || Array.isArray(value)) throw badRequest("Finding.issueDetail 须为对象或 null");
+	const v = value as Record<string, unknown>;
+	const strList = (x: unknown): string[] => (Array.isArray(x) ? x.filter((s): s is string => typeof s === "string" && s.length > 0) : []);
+	return {
+		bodyExcerpt: typeof v.bodyExcerpt === "string" ? v.bodyExcerpt : "",
+		labels: strList(v.labels),
+		assignees: strList(v.assignees),
+		commentCount: typeof v.commentCount === "number" && Number.isFinite(v.commentCount) && v.commentCount >= 0 ? Math.floor(v.commentCount) : 0,
+		authorLogin: typeof v.authorLogin === "string" ? v.authorLogin : "",
 	};
 }
 
@@ -217,6 +251,7 @@ function buildFinding(input: FindingInput): FindingDraft {
 		suggestedAction: typeof input.suggestedAction === "string" ? input.suggestedAction : "",
 		writeIntent: validateWriteIntent(input.writeIntent),
 		detail: validateDetail(input.detail),
+		issueDetail: validateIssueDetail(input.issueDetail),
 		expiresAt: validateExpiresAt(input.expiresAt),
 		status: status as FindingStatus,
 		botId: requireNonEmptyString(input.botId, "botId"),

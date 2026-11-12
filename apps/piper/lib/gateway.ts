@@ -1,14 +1,16 @@
-// 薄网关（P1-6 + R1 返工）：apps/piper 层所有对外写副作用的唯一入口。默认拒绝，本批只放行
-// 一种写意图 pr_comment（给指定 PR 发表一条评论）。通用形状：网关只认「批准记录 + 关联
-// Finding」，不认调用方是谁——扫描与对话层没有任何直达 GitHub 写接口的路径（绕过断言
-// 在 scripts/test-gateway.ts 里以源码检索钉死）。
+// 薄网关（P1-6 + R1 返工）：apps/piper 层所有对外写副作用的唯一入口。默认拒绝，放行
+// 两种写意图：pr_comment（给指定 PR 发评论）与 issue_comment（给指定 Issue 发评论，
+// Issue 分诊起）——两者共用同一套快照/幂等/审计机制，分发只在执行前复检处分叉
+// （PR 查状态+审查前提；Issue 查状态+「仍无人回应」前提）。通用形状：网关只认
+// 「批准记录 + 关联 Finding」，不认调用方是谁——扫描与对话层没有任何直达 GitHub
+// 写接口的路径（绕过断言在 scripts/test-gateway.ts 里以源码检索钉死）。
 // R1 起网关只执行批准时刻的意图快照（approvals 的批准记录），不执行 Finding 里现存的
 // writeIntent 本身：执行前拿快照与当前 writeIntent 逐字比对，不一致 denied/intent_changed，
 // 批准之后被改过的内容发不出去。
 // 放行条件（领取执行前的同步复检，任一不满足即拒绝并写审计，绝不调用写 API）：
 //   1. Finding 存在，且带批准记录 id 与意图快照；
-//   2. 快照恰好等于 Finding 当前 writeIntent（kind / repo / prNumber / body 逐字一致）；
-//   3. 意图种类是 pr_comment；
+//   2. 快照恰好等于 Finding 当前 writeIntent（kind / repo / 编号 / body 逐字一致）；
+//   3. 意图种类是 pr_comment 或 issue_comment；
 //   4. 目标仓库在该 Finding 所属 bot 的绑定仓内；
 //   5. Finding 已被批准（status=approved）——未经批准的直调一律拒绝；已在 executing
 //      说明有另一路正在执行，拒绝防并发双发；
@@ -19,6 +21,8 @@
 // 领取与执行（领取 = approved→executing 的同步段，单进程内即互斥）：
 //   - 领取后先写一条审计 executing，再做网络调用——进程崩溃后能看到「发到一半」；
 //   - 执行前现查目标 PR 仍为 open，否则 failed/pr_not_open，退回 approved 可重试；
+//     issue_comment 同理查 Issue 仍 open（failed/issue_not_open），且评论查重时
+//     发现除本批准标记外已有任何评论 → 已有人分诊，failed/precondition_changed；
 //   - 再复检触发规则前提（R5）：PR 非 draft、且按与扫描同一套「已批准」判定
 //     （lib/pr-review.ts）仍待审——批准后 PR 已被批准的，不再发过时催办评论，
 //     failed/precondition_changed 退回 approved；复检取证失败同样退回，不误发；
@@ -44,7 +48,8 @@ import { ghPage, PAGE_CAPS } from "./scan.ts";
 export interface IntentSnapshot {
 	kind: string;
 	repo: string;
-	prNumber: number;
+	prNumber: number | null;
+	issueNumber: number | null;
 	body: string;
 }
 
@@ -108,12 +113,10 @@ async function fetchCommentsForCheck(repo: string, prNumber: number, token: stri
 function sameIntent(snapshot: IntentSnapshot | null | undefined, finding: Finding | null | undefined): boolean {
 	const current = finding?.writeIntent;
 	if (!snapshot || !current) return false;
-	return (
-		snapshot.kind === current.kind &&
-		snapshot.repo === finding.repo &&
-		Number(snapshot.prNumber) === Number(current.prNumber) &&
-		snapshot.body === current.body
-	);
+	if (snapshot.kind !== current.kind || snapshot.repo !== finding.repo || snapshot.body !== current.body) return false;
+	// 编号按 kind 比对（另一种编号在快照里恒为 null，不参与）。
+	if (current.kind === "issue_comment") return Number(snapshot.issueNumber) === Number(current.issueNumber);
+	return Number(snapshot.prNumber) === Number(current.prNumber);
 }
 
 export async function gatewayExecuteWrite({
@@ -144,7 +147,7 @@ export async function gatewayExecuteWrite({
 	if (!snapshot) return denied("missing_snapshot");
 	if (!finding.writeIntent) return denied("no_write_intent");
 	if (!sameIntent(snapshot, finding)) return denied("intent_changed");
-	if (snapshot.kind !== "pr_comment") return denied("unsupported_intent");
+	if (snapshot.kind !== "pr_comment" && snapshot.kind !== "issue_comment") return denied("unsupported_intent");
 
 	const bot = getBot(finding.botId);
 	if (!bot) return denied("bot_not_found");
@@ -166,34 +169,59 @@ export async function gatewayExecuteWrite({
 	updateFinding(finding.id, { status: "executing" });
 	appendAudit({ ...base, result: "executing" });
 
-	let pr: any;
-	try {
-		pr = await ghJson(`/repos/${finding.repo}/pulls/${snapshot.prNumber}`, { token });
-	} catch (err) {
-		rollback();
-		return failed(`pr_check_failed: ${(err as Error).message}`);
-	}
-	if (pr.state !== "open") {
-		rollback();
-		return failed("pr_not_open");
-	}
-	// 规则前提复检（R5）：与扫描共用 lib/pr-review.ts 的「已批准」判定。
-	if (pr.draft) {
-		rollback();
-		return failed("precondition_changed");
-	}
-	let reviews: any[];
-	try {
-		// 复检取 reviews 与扫描共用同一翻页函数（F2 顺手项）：一页 100 条装不下时
-		// 只看第一页会漏掉靠后的 APPROVED / CHANGES_REQUESTED，判定会错。
-		reviews = (await ghPage(`/repos/${finding.repo}/pulls/${snapshot.prNumber}/reviews`, PAGE_CAPS.reviews)).items;
-	} catch (err) {
-		rollback();
-		return failed(`precondition_check_failed: ${(err as Error).message}`);
-	}
-	if (evaluateReviews(reviews, pr.head?.sha).approved) {
-		rollback();
-		return failed("precondition_changed");
+	// 评论目标编号：PR 与 Issue 的评论接口同形（/issues/:n/comments），只有
+	// 执行前复检分叉。编号已由 sameIntent 与当前 writeIntent 比对过，必非空。
+	const targetNumber = (snapshot.kind === "issue_comment" ? snapshot.issueNumber : snapshot.prNumber) as number;
+
+	if (snapshot.kind === "pr_comment") {
+		let pr: any;
+		try {
+			pr = await ghJson(`/repos/${finding.repo}/pulls/${targetNumber}`, { token });
+		} catch (err) {
+			rollback();
+			return failed(`pr_check_failed: ${(err as Error).message}`);
+		}
+		if (pr.state !== "open") {
+			rollback();
+			return failed("pr_not_open");
+		}
+		// 规则前提复检（R5）：与扫描共用 lib/pr-review.ts 的「已批准」判定。
+		if (pr.draft) {
+			rollback();
+			return failed("precondition_changed");
+		}
+		let reviews: any[];
+		try {
+			// 复检取 reviews 与扫描共用同一翻页函数（F2 顺手项）：一页 100 条装不下时
+			// 只看第一页会漏掉靠后的 APPROVED / CHANGES_REQUESTED，判定会错。
+			reviews = (await ghPage(`/repos/${finding.repo}/pulls/${targetNumber}/reviews`, PAGE_CAPS.reviews)).items;
+		} catch (err) {
+			rollback();
+			return failed(`precondition_check_failed: ${(err as Error).message}`);
+		}
+		if (evaluateReviews(reviews, pr.head?.sha).approved) {
+			rollback();
+			return failed("precondition_changed");
+		}
+	} else {
+		// issue_comment 复检：Issue 仍 open、且确实是 Issue 不是 PR（编号串了线
+		// 时宁可不发）；「仍无人回应」的前提由下面的评论查重一并验证——除本批准
+		// 的幂等标记外只要已有任何评论，就说明已有人分诊，模板评论不再发。
+		let issue: any;
+		try {
+			issue = await ghJson(`/repos/${finding.repo}/issues/${targetNumber}`, { token });
+		} catch (err) {
+			rollback();
+			return failed(`issue_check_failed: ${(err as Error).message}`);
+		}
+		if (issue.pull_request) {
+			rollback();
+			return failed("not_an_issue");
+		}
+		if (issue.state !== "open") {
+			rollback();
+			return failed("issue_not_open");
+		}
 	}
 
 	// 幂等查重：同一批准若已留过评论（例如上次 POST 成功后进程崩溃），直接复用，不再发第二条。
@@ -201,9 +229,11 @@ export async function gatewayExecuteWrite({
 	const marker = `<!-- piper:approval=${approvalId} -->`;
 	let existing: any = null;
 	let commentsComplete = true;
+	let checkedComments: any[] = [];
 	try {
-		const checked = await fetchCommentsForCheck(finding.repo, snapshot.prNumber, token);
+		const checked = await fetchCommentsForCheck(finding.repo, targetNumber, token);
 		commentsComplete = checked.complete;
+		checkedComments = checked.comments;
 		existing = checked.comments.find((c) => typeof c?.body === "string" && c.body.includes(marker)) ?? null;
 	} catch (err) {
 		rollback();
@@ -213,6 +243,10 @@ export async function gatewayExecuteWrite({
 		rollback();
 		return failed("comments_check_incomplete");
 	}
+	if (!existing && snapshot.kind === "issue_comment" && checkedComments.length > 0) {
+		rollback();
+		return failed("precondition_changed");
+	}
 	if (existing) {
 		appendAudit({ ...base, result: "executed", commentUrl: existing.html_url ?? null });
 		const updated = updateFinding(finding.id, { status: "executed" });
@@ -221,7 +255,7 @@ export async function gatewayExecuteWrite({
 
 	let comment: any;
 	try {
-		comment = await ghJson(`/repos/${finding.repo}/issues/${snapshot.prNumber}/comments`, {
+		comment = await ghJson(`/repos/${finding.repo}/issues/${targetNumber}/comments`, {
 			method: "POST",
 			token,
 			body: { body: `${snapshot.body}\n\n${marker}` },

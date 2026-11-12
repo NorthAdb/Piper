@@ -149,11 +149,9 @@ export type GithubSelfCheck = {
 	error: string | null;
 };
 
-export type WriteIntent = {
-	kind: string;
-	prNumber: number;
-	body: string;
-};
+export type WriteIntent =
+	| { kind: "pr_comment"; prNumber: number; body: string }
+	| { kind: "issue_comment"; issueNumber: number; body: string };
 
 // 拍板详情（切片二）：开单时刻的 PR 证据快照，形状与后端 FindingDetail 对齐；
 // 旧数据或详情取证失败时为 null，界面回落到只有摘要 + 证据链接
@@ -180,6 +178,14 @@ export type Approval = {
 	suggestedAction: string;
 	writeIntent: WriteIntent;
 	detail: FindingDetail | null;
+	// Issue 拍板详情（Issue 分诊）：仅 issue_untriaged 事项有，其余为 null
+	issueDetail: {
+		bodyExcerpt: string;
+		labels: string[];
+		assignees: string[];
+		commentCount: number;
+		authorLogin: string;
+	} | null;
 	status: string;
 	expiresAt: string | null;
 	createdAt: string;

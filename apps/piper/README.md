@@ -199,7 +199,7 @@ bot CRUD / 例程 / 产物等 API 不受影响。无模型 Key 时 `streamChat` 
 `{name, systemPrompt, tools, repos, memoryScope, source}`，经 `POST /api/bots/draft-confirm` 确认才落库；
 `GET /api/approvals` 自 P1-5 起读真实存储：待批项即带 `writeIntent` 的 open/approved/executing
 Finding 的审批视图（不另存一份），每条带批准记录 id 与 intentHash；`POST /api/approvals/:id/approve`
-自 P1-6 起批准后经薄网关（`lib/gateway.ts`，默认拒绝、只放行 `pr_comment` 一种写）真正执行，
+自 P1-6 起批准后经薄网关（`lib/gateway.ts`，默认拒绝、只放行评论类写意图：`pr_comment` 与 `issue_comment`）真正执行，
 R1 起必须带回 intentHash（不一致回 409）且网关只执行批准时刻的意图快照、靠评论里的
 幂等标记防重复发送，`reject` 只改状态不产生写操作。
 定时调度（P1-4）：`server.ts` 进程内调度晨间扫描，每天 `routines.schedule` 的时刻
@@ -302,12 +302,14 @@ npm run test:gateway    # 或 node dist/scripts/test-gateway.js
 npm run test:scan    # 或 node dist/scripts/test-scan.js
 ```
 
-覆盖两条规则的命中与证据链接、跳过进行中 run / 别分支 run / draft PR（且不查其审查）、
-日报清单在观察之前、连扫两次不重复开、单仓 API 失败不拖垮整轮、安静仓零 Finding。
+覆盖三条规则的命中与证据链接、跳过进行中 run / 别分支 run / draft PR（且不查其审查）、
+日报清单在观察之前、连扫两次不重复开、单仓 API 失败不拖垮整轮、安静仓零 Finding；
+场景 I 覆盖 Issue 规则的年龄门与「已分诊」判定（评论/标签/认领任一出现即不开单）
+及两种对账退役（issue_triaged / issue_closed）。
 
 ## 冻结夹具评测（P1-3）
 
-把两条规则钉在入库的 GitHub 响应夹具上回归，改规则先看评测变红：
+把三条规则钉在入库的 GitHub 响应夹具上回归，改规则先看评测变红：
 
 ```bash
 cd apps/piper
@@ -2184,3 +2186,53 @@ webfetch 48、trace 24、eval:scan 21、regression 72），聚合 npm run test
 - 明确不做：不改 Finding 状态机、去重冷却（14 天）与网关任何口径；不加
   「撤销驳回」入口（本切片以确认 + 留痕解决误点与无声消失，撤销入口如仍
   需要另议）；通知文件结构不变（findingId 自 P1-6 起已有）。
+
+## Issue 分诊实测（分诊环收官，2026-11-12）
+
+拍板清单此前只有 PR 待审与 CI 失败两类，Issue 只出现在日报「其余观察」
+里、不能拍板也不能处理。本切片补上第三条规则与第二种写动作，分诊环
+（PR / CI / Issue）就此完整：
+
+- **规则三 issue_untriaged**（lib/scan.ts）：open 的 Issue（非 PR），打开
+  满 48 小时（给维护者留自然处理窗口），且无人评论、无标签、无认领人
+  ——三者任一出现即视为已分诊。Issue 列表改走分页取证（上限 200 条，
+  超限在日报注明）。开单附 Issue 详情快照（Finding.issueDetail：正文
+  摘录、标签、认领人、评论数、作者；与 PR 详情同口径，立住不可改、坏
+  字段逐个回落缺省）与分诊评论模板（writeIntent.kind=issue_comment）。
+- **对账退役**：Issue 已关闭（reconciled:issue_closed）或已有人评论/
+  打标签/认领（reconciled:issue_triaged）时，open/approved 事项在下一轮
+  扫描前对账自动 expired；不在 open 列表的候选单查 GET /issues/:n 取证，
+  取证失败不退役。驳回冷却沿用锁定口径：Issue 无 head，头部恒为未变，
+  14 天内不重开。
+- **网关多动作**：WriteIntent 泛化为判别联合（pr_comment / issue_comment），
+  IntentSnapshot 同步带 prNumber / issueNumber（另一种恒 null）；网关公共
+  段（快照比对、绑定仓、批准态、过期、秘密检查、领取）不变，执行前复检
+  按 kind 分叉——issue_comment 查 Issue 仍 open 且不是 PR，并借评论查重
+  一并验证「仍无人回应」：除本批准幂等标记外已有任何评论即
+  failed/precondition_changed；Issue 已关闭回 failed/issue_not_open。
+  评论接口同形（/issues/:n/comments），幂等标记与复用逻辑原样共用。
+- **收件箱与通知**：Issue 事项渲染详情块（作者、开单时评论数、标签、
+  认领人、正文摘录）与「Issue #N」评论目标；驳回确认与已关闭原因文案
+  按类型分开（Issue 无「头部变化重开」概念，明说 14 天）；晨扫完成通知
+  的待批写操作文案同样按 kind 给目标。
+
+实测（本地，含聚合全链）：test:findings 27→30（issue_comment 意图归一、
+缺 issueNumber 被拒、issueDetail 坏字段回落），test:scan 16→20（场景 I：
+年龄门与已分诊判定恰开 1 条、详情与写意图齐全、被评论退役
+issue_triaged、关闭退役 issue_closed），test:gateway 39→43（场景 J：
+批准执行发到 Issue 评论接口且带标记、已关闭 issue_not_open、他人已
+评论 precondition_changed、标记复用不重发），eval:scan 21→23（新夹具
+issue-untriaged、issue-retired-when-triaged（phases 两轮）；
+quiet-no-findings 的示例 Issue 改为已打标签——原夹具的立意是「安静仓
+零开单」，其描述里明写的前提「issue 不在两条规则内」已随规则三失效，
+改为已分诊状态以保持零开单的钉子作用，描述同步更新）；其余各套不变
+（pr-review 16、schedule 14、recovery 7、listen 9、badtz 4、secrets 21、
+model-stub 11、model-providers 57、r10 22、webfetch 48、trace 24、
+regression 72），聚合 npm run test 退出码 0；根级 npm run check 退出
+码 0；npm run shots 20 张全过，字节差为时间戳/种子渲染抖动已还原
+（shots 种子数据无 Issue 事项，Issue 详情块的界面由组件类型检查与
+test:scan/test:gateway 数据面钉住，无对应截图位）。
+- 明确不做：Issue 打标签动作（issue_label）未立 kind——本切片只做评论
+  一种分诊动作，网关分发结构已按 kind 留好位置，立新动作时必须同时落
+  执行与复检，不做半成品声明；即席开单仍只支持 PR；CI 失败一键重跑
+  未做（网关第三种动作，另议）；不改去重冷却、批准快照与状态机口径。

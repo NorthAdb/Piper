@@ -37,6 +37,7 @@ interface ScenarioRepo {
 	reviews?: Record<string, { error?: number } | unknown[]>;
 	pullDetails?: Record<string, unknown>;
 	prFiles?: Record<string, { error?: number } | unknown[]>;
+	issueDetails?: Record<string, unknown>;
 }
 function installStub(scenario: Record<string, ScenarioRepo>) {
 	requested.length = 0;
@@ -71,6 +72,12 @@ function installStub(scenario: Record<string, ScenarioRepo>) {
 			if (!Array.isArray(fl) && fl?.error) return { ok: false, status: fl.error, json: async () => ({}) };
 			payload = pageOf(Array.isArray(fl) ? fl : []);
 		} else if (rest.startsWith("/pulls")) payload = pageOf(entry.pulls);
+		else if (rest.match(/^\/issues\/\d+$/)) {
+			const num = rest.match(/^\/issues\/(\d+)$/)?.[1] ?? "";
+			const one = (entry.issues ?? []).find((i) => String((i as { number?: unknown }).number) === num) ?? entry.issueDetails?.[num];
+			if (!one) return { ok: false, status: 404, json: async () => ({}) };
+			payload = one;
+		}
 		else if (rest.startsWith("/issues")) payload = pageOf(entry.issues);
 		else if (rest.startsWith("/actions/runs")) {
 			if (entry.runsError) return { ok: false, status: entry.runsError, json: async () => ({}) };
@@ -385,6 +392,73 @@ try {
 		"场景H：已批准 PR 回 refusal=pr_approved、已合并 PR 回 refusal=pr_merged，均不开单",
 		h3.created === null && h3.refusal === "pr_approved" && h4.created === null && h4.refusal === "pr_merged",
 		`h3=${h3.refusal} h4=${h4.refusal}`,
+	);
+
+	// ---- 场景 I（Issue 分诊）：规则三开单 + 两种对账退役 ----
+	// 年龄门用相对时间构造年轻 Issue（12 小时前），老 Issue 用固定旧日期（恒 >48h）。
+	process.env.PIPER_FINDINGS_FILE = join(tmp, "i.jsonl");
+	const youngIso = new Date(Date.now() - 12 * 3600 * 1000).toISOString();
+	const issueScenario: Record<string, ScenarioRepo> = {
+		"Acme/Issues": {
+			runs: [],
+			pulls: [],
+			reviews: {},
+			issues: [
+				{ number: 1, title: "导出崩溃", body: "点导出就崩溃，日志见附件。", comments: 0, labels: [], assignees: [], created_at: "2026-11-06T09:00:00Z", html_url: "https://github.com/Acme/Issues/issues/1", user: { login: "carol" } },
+				{ number: 2, title: "已有人回复的老 Issue", body: "x", comments: 2, labels: [], assignees: [], created_at: "2026-11-06T09:00:00Z", html_url: "https://github.com/Acme/Issues/issues/2", user: { login: "dan" } },
+				{ number: 3, title: "已打标签的老 Issue", body: "x", comments: 0, labels: [{ name: "bug" }], assignees: [], created_at: "2026-11-06T09:00:00Z", html_url: "https://github.com/Acme/Issues/issues/3", user: { login: "dan" } },
+				{ number: 4, title: "刚提的新 Issue", body: "x", comments: 0, labels: [], assignees: [], created_at: youngIso, html_url: "https://github.com/Acme/Issues/issues/4", user: { login: "erin" } },
+				{ number: 5, title: "已被认领的老 Issue", body: "x", comments: 0, labels: [], assignees: [{ login: "frank" }], created_at: "2026-11-06T09:00:00Z", html_url: "https://github.com/Acme/Issues/issues/5", user: { login: "dan" } },
+			],
+		},
+	};
+	installStub(issueScenario);
+	const i1 = await runMorningScan({ repos: ["Acme/Issues"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const iFindings = findingsMod.listFindings({ repo: "Acme/Issues" }).filter((f) => f.type === "issue_untriaged");
+	const iF = iFindings[0];
+	check(
+		"场景I：只有满 48 小时且无人评论/无标签/无认领人的 Issue 开单（恰 1 条）",
+		i1.findings.length === 1 && iFindings.length === 1 && iF?.subject === "1",
+		`created=${JSON.stringify(i1.findings.map((f) => f.subject))}`,
+	);
+	check(
+		"场景I：事项带 issue_comment 写意图与 Issue 详情快照、日报列为 Issue 待分诊",
+		iF?.writeIntent?.kind === "issue_comment" &&
+			iF.writeIntent.issueNumber === 1 &&
+			iF.issueDetail?.authorLogin === "carol" &&
+			iF.issueDetail?.commentCount === 0 &&
+			(iF.issueDetail?.bodyExcerpt ?? "").includes("点导出就崩溃") &&
+			i1.report.includes("Issue 待分诊"),
+		JSON.stringify(iF?.issueDetail),
+	);
+	// 第二轮：Issue #1 有人评论了 → 对账退役 issue_triaged，不重开。
+	(issueScenario["Acme/Issues"].issues as Array<Record<string, unknown>>)[0].comments = 1;
+	installStub(issueScenario);
+	const auditMod = await import("../lib/audit.ts");
+	const i2 = await runMorningScan({ repos: ["Acme/Issues"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景I：Issue 被评论后对账退役（reconciled:issue_triaged）、不重开",
+		i2.findings.length === 0 &&
+			findingsMod.getFinding(iF.id)?.status === "expired" &&
+			auditMod.listAudit({ findingId: iF.id }).some((x) => x.reason === "reconciled:issue_triaged"),
+		`status=${findingsMod.getFinding(iF.id)?.status}`,
+	);
+	// 第三轮：新开一条（重置为无人处理后先开单），再把 Issue 关掉 → issue_closed。
+	(issueScenario["Acme/Issues"].issues as Array<Record<string, unknown>>)[0].comments = 0;
+	installStub(issueScenario);
+	const i3 = await runMorningScan({ repos: ["Acme/Issues"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	const iF2 = i3.findings.find((f) => f.type === "issue_untriaged");
+	issueScenario["Acme/Issues"].issues = [];
+	issueScenario["Acme/Issues"].issueDetails = { "1": { number: 1, state: "closed", comments: 0, labels: [], assignees: [] } };
+	installStub(issueScenario);
+	const i4 = await runMorningScan({ repos: ["Acme/Issues"], botId: "repo-keeper", saveArtifact: saveArtifactStub });
+	check(
+		"场景I：Issue 关闭后对账退役（reconciled:issue_closed）",
+		Boolean(iF2) &&
+			i4.findings.length === 0 &&
+			findingsMod.getFinding(iF2!.id)?.status === "expired" &&
+			auditMod.listAudit({ findingId: iF2!.id }).some((x) => x.reason === "reconciled:issue_closed"),
+		`f2=${iF2?.id} status=${iF2 ? findingsMod.getFinding(iF2.id)?.status : "-"}`,
 	);
 } finally {
 	globalThis.fetch = realFetch;
