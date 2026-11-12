@@ -62,6 +62,15 @@ export type AgentToolCall = Extract<AssistantMessage["content"][number], { type:
  *
  * Returning `{ block: true }` prevents the tool from executing. The loop emits an error tool result instead.
  * `reason` becomes the text shown in that error result. If omitted, a default blocked message is used.
+ *
+ * `decision` is the explicit form of the same gate:
+ * - `"deny"` is equivalent to `{ block: true }` and wins over every other field.
+ * - `"ask"` suspends the call until {@link AgentLoopConfig.waitForToolApproval} resolves it; the loop
+ *   awaits {@link AgentLoopConfig.onToolApprovalPending} first so the host can persist the pending call.
+ * - `"allow"` (or omitting `decision`) lets the call proceed.
+ *
+ * `arguments`, when present on an allow or ask outcome, replaces the validated arguments. The replacement
+ * is validated against the tool schema again; if it fails validation the call is denied.
  */
 export interface BeforeToolCallResult {
 	block?: boolean;
@@ -71,6 +80,49 @@ export interface BeforeToolCallResult {
 	 * Early termination only happens when every finalized tool result in the batch sets this to true.
 	 */
 	terminate?: boolean;
+	/** Explicit gate decision for this call. `"deny"` is equivalent to `block: true`. */
+	decision?: "allow" | "deny" | "ask";
+	/** Replacement arguments for this call; re-validated against the tool schema before use. */
+	arguments?: unknown;
+}
+
+/** Context passed to `onToolApprovalPending`, before the loop starts waiting for a decision. */
+export interface ToolApprovalPendingContext {
+	/** The tool call that is about to be suspended. */
+	toolCallId: string;
+	/** Name of the tool being called. */
+	toolName: string;
+	/** Final validated arguments the approval applies to (the approval snapshot). */
+	args: unknown;
+	/** The assistant message that requested the tool call. */
+	assistantMessage: AssistantMessage;
+}
+
+/** Context passed to `waitForToolApproval` while a tool call is suspended. */
+export interface ToolApprovalWaitContext {
+	/** The suspended tool call. */
+	toolCallId: string;
+	/** Name of the tool being called. */
+	toolName: string;
+	/** The approval snapshot arguments. */
+	args: unknown;
+}
+
+/**
+ * Decision that releases a suspended tool call.
+ *
+ * `arguments`, when present, is treated as the final approved snapshot and replaces the pending
+ * arguments; it is validated against the tool schema again before execution.
+ *
+ * Restart contract: a transcript only ever holds the model's original arguments. If
+ * `beforeToolCall` rewrote the arguments when it suspended the call, the rewritten snapshot
+ * exists only in the host's persisted approval record. A host resuming after a restart must
+ * pass that snapshot back as `arguments`; an allow without `arguments` executes the
+ * transcript arguments, not the rewritten snapshot.
+ */
+export interface ToolApprovalResolution {
+	decision: "allow" | "deny";
+	arguments?: unknown;
 }
 
 /**
@@ -326,6 +378,25 @@ export interface AgentLoopConfig extends SimpleStreamOptions {
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 
 	/**
+	 * Called when `beforeToolCall` suspends a call with `decision: "ask"`, before the loop starts waiting.
+	 *
+	 * The returned promise is awaited, so the host can persist the pending call (with its argument snapshot)
+	 * before anyone can approve it. If this hook throws, the call is denied and never executes.
+	 * The loop then emits `tool_approval_pending` and awaits `waitForToolApproval`.
+	 */
+	onToolApprovalPending?: (context: ToolApprovalPendingContext, signal?: AbortSignal) => Promise<void>;
+
+	/**
+	 * Waits for the decision that releases a suspended tool call.
+	 *
+	 * Only called after `onToolApprovalPending` has settled. Resolving with `{ decision: "allow" }`
+	 * executes the call with the pending snapshot (or with `arguments` as the final snapshot);
+	 * `{ decision: "deny" }` produces an error tool result instead. If this hook is not configured,
+	 * an `"ask"` decision is treated as a denial. Aborting the signal cancels the wait and the call.
+	 */
+	waitForToolApproval?: (context: ToolApprovalWaitContext, signal?: AbortSignal) => Promise<ToolApprovalResolution>;
+
+	/**
 	 * Called after a tool finishes executing, before `tool_execution_end` and tool-result message events are emitted.
 	 *
 	 * Return an `AfterToolCallResult` to override parts of the executed tool result:
@@ -538,6 +609,7 @@ export type AgentEvent =
 	| { type: "message_update"; message: AgentMessage; assistantMessageEvent: AssistantMessageEvent }
 	| { type: "message_end"; message: AgentMessage }
 	// Tool execution lifecycle
+	| { type: "tool_approval_pending"; toolCallId: string; toolName: string; args: unknown }
 	| { type: "tool_execution_start"; toolCallId: string; toolName: string; args: any }
 	| { type: "tool_execution_update"; toolCallId: string; toolName: string; args: any; partialResult: any }
 	| {

@@ -12,7 +12,7 @@ import {
 	type Transport,
 	toToolDeclaration,
 } from "@earendil-works/pi-ai";
-import { runAgentLoop, runAgentLoopContinue } from "./agent-loop.ts";
+import { runAgentLoop, runAgentLoopContinue, runAgentLoopResolveToolCall } from "./agent-loop.ts";
 import { getDefaultStreamFn } from "./stream-fn.ts";
 import type {
 	AfterToolCallContext,
@@ -31,6 +31,9 @@ import type {
 	PrepareRequest,
 	QueueMode,
 	StreamFn,
+	ToolApprovalPendingContext,
+	ToolApprovalResolution,
+	ToolApprovalWaitContext,
 	ToolExecutionMode,
 } from "./types.ts";
 
@@ -123,6 +126,8 @@ export interface AgentOptions {
 	onProviderStreamEvent?: SimpleStreamOptions["onProviderStreamEvent"];
 	beforeToolCall?: (context: BeforeToolCallContext, signal?: AbortSignal) => Promise<BeforeToolCallResult | undefined>;
 	afterToolCall?: (context: AfterToolCallContext, signal?: AbortSignal) => Promise<AfterToolCallResult | undefined>;
+	onToolApprovalPending?: (context: ToolApprovalPendingContext, signal?: AbortSignal) => Promise<void>;
+	waitForToolApproval?: (context: ToolApprovalWaitContext, signal?: AbortSignal) => Promise<ToolApprovalResolution>;
 	finishTurn?: FinishTurn;
 	prepareRequest?: PrepareRequest;
 	prepareNextTurn?: (
@@ -212,6 +217,11 @@ export class Agent {
 		context: AfterToolCallContext,
 		signal?: AbortSignal,
 	) => Promise<AfterToolCallResult | undefined>;
+	public onToolApprovalPending?: (context: ToolApprovalPendingContext, signal?: AbortSignal) => Promise<void>;
+	public waitForToolApproval?: (
+		context: ToolApprovalWaitContext,
+		signal?: AbortSignal,
+	) => Promise<ToolApprovalResolution>;
 	public finishTurn?: FinishTurn;
 	public prepareRequest?: PrepareRequest;
 	public prepareNextTurn?: (
@@ -222,6 +232,14 @@ export class Agent {
 		signal?: AbortSignal,
 	) => Promise<AgentLoopTurnUpdate | undefined> | AgentLoopTurnUpdate | undefined;
 	private activeRun?: ActiveRun;
+	/** Resolvers of tool calls the active run is currently suspended on, keyed by tool call id. */
+	private readonly toolApprovalWaiters = new Map<string, (resolution: ToolApprovalResolution) => void>();
+	/** Decisions delivered by `resolveToolCall` before the active run started waiting on that call. */
+	private readonly toolApprovalResolutions = new Map<string, ToolApprovalResolution>();
+	/** Tool call ids the active run's model has issued (registered as their assistant messages land). */
+	private readonly runToolCallIds = new Set<string>();
+	/** Tool call ids of the active run whose outcome is already decided (wait settled or result written). */
+	private readonly settledToolCallIds = new Set<string>();
 	/** Session identifier forwarded to providers for cache-aware backends. */
 	public sessionId?: string;
 	/** Optional per-level thinking token budgets forwarded to the stream function. */
@@ -248,6 +266,8 @@ export class Agent {
 		this.onProviderStreamEvent = runtimeOptions.onProviderStreamEvent;
 		this.beforeToolCall = runtimeOptions.beforeToolCall;
 		this.afterToolCall = runtimeOptions.afterToolCall;
+		this.onToolApprovalPending = runtimeOptions.onToolApprovalPending;
+		this.waitForToolApproval = runtimeOptions.waitForToolApproval;
 		this.finishTurn = runtimeOptions.finishTurn;
 		this.prepareRequest = runtimeOptions.prepareRequest;
 		this.prepareNextTurn = runtimeOptions.prepareNextTurn;
@@ -419,6 +439,74 @@ export class Agent {
 		await this.runContinuation();
 	}
 
+	/**
+	 * Release a tool call that `beforeToolCall` suspended with `decision: "ask"`.
+	 *
+	 * If a run is active, the decision is delivered to that run's approval wait for this call
+	 * (or held for it if the run has not reached the call yet) and this method returns without
+	 * waiting for the run to finish; use `waitForIdle()` to observe completion.
+	 *
+	 * If no run is active, the transcript must end with the assistant message that issued the
+	 * call, with no tool result for it yet - the state a process restart leaves behind. The
+	 * suspended batch is then settled with this decision, tool results are appended, and the
+	 * loop continues from there. This is the only supported resume for that transcript shape:
+	 * `continue()` rejects it by design.
+	 *
+	 * Snapshot contract for the restart path: the transcript holds the model's original
+	 * arguments. If `beforeToolCall` rewrote the arguments when it suspended the call, the
+	 * rewritten snapshot exists only in the host's persisted approval record, and the host
+	 * must pass it back as `result.arguments`. An allow without `arguments` executes the
+	 * transcript arguments, not the rewritten snapshot.
+	 */
+	async resolveToolCall(toolCallId: string, result: ToolApprovalResolution): Promise<void> {
+		if (this.activeRun) {
+			const waiter = this.toolApprovalWaiters.get(toolCallId);
+			if (waiter) {
+				// Settle synchronously: a second resolve in the same task window must hit the
+				// settled check below, not find this waiter again and silently no-op.
+				this.toolApprovalWaiters.delete(toolCallId);
+				this.settledToolCallIds.add(toolCallId);
+				waiter(result);
+				return;
+			}
+			if (this.settledToolCallIds.has(toolCallId)) {
+				throw new Error(`Cannot resolve tool call ${toolCallId}: it has already been settled in this run`);
+			}
+			if (!this.runToolCallIds.has(toolCallId)) {
+				throw new Error(`Cannot resolve tool call ${toolCallId}: no such tool call in the current run`);
+			}
+			// The run has issued this call but has not reached its approval wait yet (for
+			// example, the preflight hook is still running). Hold the decision for the wait.
+			this.toolApprovalResolutions.set(toolCallId, result);
+			return;
+		}
+
+		const messages = this._state.messages;
+		const lastMessage = messages[messages.length - 1];
+		if (!lastMessage || lastMessage.role !== "assistant") {
+			throw new Error(
+				`Cannot resolve tool call ${toolCallId}: the transcript does not end with a pending assistant tool call`,
+			);
+		}
+		if (!lastMessage.content.some((c) => c.type === "toolCall" && c.id === toolCallId)) {
+			throw new Error(`Cannot resolve tool call ${toolCallId}: no such tool call in the last assistant message`);
+		}
+		if (messages.some((m) => m.role === "toolResult" && m.toolCallId === toolCallId)) {
+			throw new Error(`Cannot resolve tool call ${toolCallId}: a tool result already exists for it`);
+		}
+
+		await this.runWithLifecycle(async (signal) => {
+			await runAgentLoopResolveToolCall(
+				this.createContextSnapshot(),
+				this.createLoopConfig(),
+				(event) => this.processEvents(event),
+				signal,
+				this.streamFunction,
+				{ toolCallId, decision: result.decision, arguments: result.arguments },
+			);
+		});
+	}
+
 	private normalizePromptInput(
 		input: string | AgentMessage | AgentMessage[],
 		images?: ImageContent[],
@@ -489,6 +577,35 @@ export class Agent {
 			toolExecution: this.toolExecution,
 			beforeToolCall: this.beforeToolCall,
 			afterToolCall: this.afterToolCall,
+			onToolApprovalPending: this.onToolApprovalPending,
+			waitForToolApproval: async (context, signal) => {
+				// Bridge between the loop's approval wait and `resolveToolCall`: the host's own
+				// wait implementation races a decision delivered through `resolveToolCall`, and
+				// an abort settles the wait so the loop can close the call out as cancelled.
+				const early = this.toolApprovalResolutions.get(context.toolCallId);
+				if (early) {
+					this.toolApprovalResolutions.delete(context.toolCallId);
+					return early;
+				}
+				const delivered = new Promise<ToolApprovalResolution>((resolve) => {
+					this.toolApprovalWaiters.set(context.toolCallId, resolve);
+					if (signal) {
+						if (signal.aborted) {
+							resolve({ decision: "deny" });
+						} else {
+							signal.addEventListener("abort", () => resolve({ decision: "deny" }), { once: true });
+						}
+					}
+				});
+				try {
+					return this.waitForToolApproval
+						? await Promise.race([this.waitForToolApproval(context, signal), delivered])
+						: await delivered;
+				} finally {
+					this.toolApprovalWaiters.delete(context.toolCallId);
+					this.settledToolCallIds.add(context.toolCallId);
+				}
+			},
 			finishTurn: this.finishTurn,
 			prepareRequest: this.prepareRequest,
 			prepareNextTurn:
@@ -525,6 +642,10 @@ export class Agent {
 			resolvePromise = resolve;
 		});
 		this.activeRun = { promise, resolve: resolvePromise, abortController };
+		// Decisions held for a previous run must not leak into this one.
+		this.toolApprovalResolutions.clear();
+		this.runToolCallIds.clear();
+		this.settledToolCallIds.clear();
 
 		this._state.isStreaming = true;
 		this._state.streamingMessage = undefined;
@@ -585,6 +706,16 @@ export class Agent {
 			case "message_end":
 				this._state.streamingMessage = undefined;
 				this._state.messages.push(event.message);
+				if (event.message.role === "assistant") {
+					for (const content of event.message.content) {
+						if (content.type === "toolCall") {
+							this.runToolCallIds.add(content.id);
+						}
+					}
+				}
+				if (event.message.role === "toolResult") {
+					this.settledToolCallIds.add(event.message.toolCallId);
+				}
 				break;
 
 			case "tool_execution_start": {

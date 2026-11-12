@@ -60,13 +60,24 @@ describe("#8935 parallel preflight abort", () => {
 
 		const starts = harness.eventsOfType("tool_execution_start");
 		const ends = harness.eventsOfType("tool_execution_end");
-		expect(starts).toHaveLength(2);
+		// Piper P2-1 event contract: `tool_execution_start` fires only once a call is actually
+		// about to execute (in the parallel path, inside the execution thunk, after the abort
+		// check). Neither call executes in this scenario, so there are no starts at all.
+		// Upstream #8935 pinned two starts under the old preflight-start timing; the regression
+		// property (no prepared tool executes) is unchanged.
+		expect(starts).toHaveLength(0);
 		expect(ends).toHaveLength(2);
-		expect(new Set(ends.map((event) => event.toolCallId))).toEqual(new Set(starts.map((event) => event.toolCallId)));
 		expect(ends.every((event) => event.isError)).toBe(true);
+		for (const start of starts) {
+			expect(ends.map((event) => event.toolCallId)).toContain(start.toolCallId);
+		}
 
+		const assistantMessage = harness.session.messages.find((message) => message.role === "assistant");
+		const issuedIds = (assistantMessage?.content ?? []).flatMap((content) =>
+			content.type === "toolCall" ? [content.id] : [],
+		);
 		const toolResults = harness.session.messages.filter((message) => message.role === "toolResult");
-		expect(toolResults.map((message) => message.toolCallId)).toEqual(starts.map((event) => event.toolCallId));
+		expect(toolResults.map((message) => message.toolCallId)).toEqual(issuedIds);
 		expect(toolResults.map(getMessageText)).toEqual(["Operation aborted", "Operation aborted"]);
 	});
 });

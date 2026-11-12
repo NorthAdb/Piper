@@ -30,6 +30,7 @@ import type {
 	AgentToolResult,
 	PrepareNextTurnContext,
 	StreamFn,
+	ToolApprovalResolution,
 } from "./types.ts";
 
 export type AgentEventSink = (event: AgentEvent) => Promise<void> | void;
@@ -155,6 +156,155 @@ export async function runAgentLoopContinue(
 	await emit({ type: "agent_start" });
 	await emit({ type: "turn_start" });
 
+	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
+	return newMessages;
+}
+
+/**
+ * Resume a loop whose transcript ends with an assistant message that issued tool calls which
+ * were suspended for approval (`decision: "ask"`) and never produced tool results - for example
+ * because the process exited while the approval was pending.
+ *
+ * The named call is settled with the given resolution directly: it was already preflighted
+ * before it was suspended, so `beforeToolCall` is not consulted again. Any other still-pending
+ * calls from the same assistant message are prepared in order through the normal path, approval
+ * gate included. Tool results are appended, the suspended turn is closed, and the loop then
+ * continues exactly like {@link runAgentLoopContinue}. Calling the plain continuation for this
+ * transcript shape is an error; this entry point exists so a result is always written first.
+ */
+export function agentLoopResolveToolCall(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+	resolution: ToolApprovalResolution & { toolCallId: string },
+): EventStream<AgentEvent, AgentMessage[]> {
+	const stream = createAgentStream();
+
+	void runAgentLoopResolveToolCall(
+		context,
+		config,
+		async (event) => {
+			stream.push(event);
+		},
+		signal,
+		streamFn,
+		resolution,
+	).then((messages) => {
+		stream.end(messages);
+	});
+
+	return stream;
+}
+
+export async function runAgentLoopResolveToolCall(
+	context: AgentContext,
+	config: AgentLoopConfig,
+	emit: AgentEventSink,
+	signal: AbortSignal | undefined,
+	streamFn: StreamFn,
+	resolution: ToolApprovalResolution & { toolCallId: string },
+): Promise<AgentMessage[]> {
+	const lastMessage = context.messages[context.messages.length - 1];
+	if (!lastMessage || lastMessage.role !== "assistant") {
+		throw new Error("Cannot resolve a tool call: the last message is not an assistant message");
+	}
+	const assistantMessage = lastMessage;
+	const toolCalls = assistantMessage.content.filter((c) => c.type === "toolCall");
+	if (!toolCalls.some((c) => c.id === resolution.toolCallId)) {
+		throw new Error(
+			`Cannot resolve tool call ${resolution.toolCallId}: no such tool call in the last assistant message`,
+		);
+	}
+	if (context.messages.some((m) => m.role === "toolResult" && m.toolCallId === resolution.toolCallId)) {
+		throw new Error(`Cannot resolve tool call ${resolution.toolCallId}: a tool result already exists for it`);
+	}
+
+	const newMessages: AgentMessage[] = [];
+	const currentContext: AgentContext = {
+		...context,
+		messages: [...context.messages],
+	};
+
+	await emit({ type: "agent_start" });
+
+	const pendingCalls = toolCalls.filter(
+		(toolCall) => !context.messages.some((m) => m.role === "toolResult" && m.toolCallId === toolCall.id),
+	);
+	const finalizedCalls: FinalizedToolCallOutcome[] = [];
+	const toolResults: ToolResultMessage[] = [];
+	for (const toolCall of pendingCalls) {
+		let finalized: FinalizedToolCallOutcome;
+		if (toolCall.id === resolution.toolCallId) {
+			finalized = await executeResolvedToolCall(
+				currentContext,
+				assistantMessage,
+				toolCall,
+				resolution,
+				config,
+				signal,
+				emit,
+			);
+		} else {
+			const preparation = await prepareToolCall(
+				currentContext,
+				assistantMessage,
+				toolCall,
+				config,
+				signal,
+				undefined,
+				emit,
+			);
+			if (preparation.kind === "immediate") {
+				finalized = {
+					toolCall,
+					result: preparation.result,
+					isError: preparation.isError,
+				};
+			} else {
+				await emit({
+					type: "tool_execution_start",
+					toolCallId: toolCall.id,
+					toolName: toolCall.name,
+					args: preparation.args,
+				});
+				const executed = await executePreparedToolCall(
+					preparation,
+					signal,
+					emitToolExecutionUpdate(toolCall, emit),
+				);
+				finalized = await finalizeExecutedToolCall(
+					currentContext,
+					assistantMessage,
+					preparation,
+					executed,
+					config,
+					signal,
+				);
+			}
+		}
+
+		await emitToolExecutionEnd(finalized, emit);
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		finalizedCalls.push(finalized);
+		toolResults.push(toolResultMessage);
+		currentContext.messages.push(toolResultMessage);
+		newMessages.push(toolResultMessage);
+
+		if (signal?.aborted) {
+			break;
+		}
+	}
+
+	await emit({ type: "turn_end", message: assistantMessage, toolResults });
+
+	if (signal?.aborted || shouldTerminateToolBatch(finalizedCalls)) {
+		await emit({ type: "agent_end", messages: newMessages });
+		return newMessages;
+	}
+
+	await emit({ type: "turn_start" });
 	await runLoop(currentContext, newMessages, config, signal, emit, streamFn ?? getDefaultStreamFn());
 	return newMessages;
 }
@@ -549,14 +699,15 @@ async function executeToolCallsSequential(
 	const messages: ToolResultMessage[] = [];
 
 	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
-		});
-
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(
+			currentContext,
+			assistantMessage,
+			toolCall,
+			config,
+			signal,
+			undefined,
+			emit,
+		);
 		let finalized: FinalizedToolCallOutcome;
 		if (preparation.kind === "immediate") {
 			finalized = {
@@ -565,6 +716,12 @@ async function executeToolCallsSequential(
 				isError: preparation.isError,
 			};
 		} else {
+			await emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: preparation.args,
+			});
 			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
 			finalized = await finalizeExecutedToolCall(
 				currentContext,
@@ -604,14 +761,15 @@ async function executeToolCallsParallel(
 	const finalizedCalls: FinalizedToolCallEntry[] = [];
 
 	for (const toolCall of toolCalls) {
-		await emit({
-			type: "tool_execution_start",
-			toolCallId: toolCall.id,
-			toolName: toolCall.name,
-			args: toolCall.arguments,
-		});
-
-		const preparation = await prepareToolCall(currentContext, assistantMessage, toolCall, config, signal);
+		const preparation = await prepareToolCall(
+			currentContext,
+			assistantMessage,
+			toolCall,
+			config,
+			signal,
+			undefined,
+			emit,
+		);
 		if (preparation.kind === "immediate") {
 			const finalized = {
 				toolCall,
@@ -636,6 +794,14 @@ async function executeToolCallsParallel(
 				await emitToolExecutionEnd(finalized, emit);
 				return finalized;
 			}
+			// Start fires here, not during preflight: a prepared call whose batch is aborted
+			// before its execution begins emits an end without a start.
+			await emit({
+				type: "tool_execution_start",
+				toolCallId: toolCall.id,
+				toolName: toolCall.name,
+				args: preparation.args,
+			});
 			const executed = await executePreparedToolCall(preparation, signal, emitToolExecutionUpdate(toolCall, emit));
 			const finalized = await finalizeExecutedToolCall(
 				currentContext,
@@ -690,8 +856,11 @@ type ExecutedToolCallOutcome = {
 
 type FinalizedToolCallOutcome = AgentToolCallOutcome;
 
-/** The `beforeToolCall` and `afterToolCall` hooks of {@link AgentLoopConfig}. */
-export type ToolCallHooks = Pick<AgentLoopConfig, "beforeToolCall" | "afterToolCall">;
+/** The tool-call hooks of {@link AgentLoopConfig}: preflight, approval gate, and post-execution. */
+export type ToolCallHooks = Pick<
+	AgentLoopConfig,
+	"beforeToolCall" | "afterToolCall" | "onToolApprovalPending" | "waitForToolApproval"
+>;
 
 type ToolUpdateSink = (partialResult: AgentToolResult<any>) => Promise<void> | void;
 
@@ -722,6 +891,7 @@ async function prepareToolCall(
 	config: ToolCallHooks,
 	signal: AbortSignal | undefined,
 	tools: readonly AgentTool<any>[] = currentContext.tools ?? [],
+	emit?: AgentEventSink,
 ): Promise<PreparedToolCall | ImmediateToolCallOutcome> {
 	const tool = tools.find((t) => t.name === toolCall.name);
 	if (!tool) {
@@ -734,7 +904,7 @@ async function prepareToolCall(
 
 	try {
 		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
-		const validatedArgs = validateToolArguments(tool, preparedToolCall);
+		let validatedArgs = validateToolArguments(tool, preparedToolCall);
 		if (config.beforeToolCall) {
 			const beforeResult = await config.beforeToolCall(
 				{
@@ -752,7 +922,7 @@ async function prepareToolCall(
 					isError: true,
 				};
 			}
-			if (beforeResult?.block) {
+			if (beforeResult?.decision === "deny" || beforeResult?.block) {
 				const result = createErrorToolResult(beforeResult.reason || "Tool execution was blocked");
 				if (beforeResult.terminate === true) {
 					result.terminate = true;
@@ -762,6 +932,29 @@ async function prepareToolCall(
 					result,
 					isError: true,
 				};
+			}
+			if (beforeResult?.arguments !== undefined) {
+				// A hook-rewritten argument set replaces the validated one and is validated again;
+				// a set that fails validation throws here and becomes an error outcome below.
+				validatedArgs = validateToolArguments(tool, {
+					...preparedToolCall,
+					arguments: beforeResult.arguments as Record<string, any>,
+				});
+			}
+			if (beforeResult?.decision === "ask") {
+				const approval = await awaitToolApproval(
+					config,
+					tool,
+					{ ...preparedToolCall, arguments: validatedArgs },
+					assistantMessage,
+					beforeResult.reason,
+					signal,
+					emit,
+				);
+				if (approval.kind === "immediate") {
+					return approval;
+				}
+				validatedArgs = approval.args;
 			}
 		}
 		if (signal?.aborted) {
@@ -784,6 +977,158 @@ async function prepareToolCall(
 			isError: true,
 		};
 	}
+}
+
+/**
+ * Suspend one tool call until the host's approval decision arrives.
+ *
+ * Order is part of the contract: `onToolApprovalPending` is awaited first (the host persists the
+ * pending call and its argument snapshot), then `tool_approval_pending` is emitted, then
+ * `waitForToolApproval` is awaited. Execution only proceeds on an allow decision. A persistence
+ * failure, a missing wait hook, a denial, or an abort all come back as an immediate error
+ * outcome; the tool never executes on those paths. Arguments supplied with an allow decision
+ * are the final snapshot and are validated against the tool schema again.
+ */
+async function awaitToolApproval(
+	config: ToolCallHooks,
+	tool: AgentTool<any>,
+	toolCall: AgentToolCall,
+	assistantMessage: AssistantMessage,
+	reason: string | undefined,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink | undefined,
+): Promise<{ kind: "approved"; args: unknown } | ImmediateToolCallOutcome> {
+	try {
+		await config.onToolApprovalPending?.(
+			{ toolCallId: toolCall.id, toolName: toolCall.name, args: toolCall.arguments, assistantMessage },
+			signal,
+		);
+	} catch (error) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+	if (signal?.aborted) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult("Operation aborted"),
+			isError: true,
+		};
+	}
+	await emit?.({
+		type: "tool_approval_pending",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
+		args: toolCall.arguments,
+	});
+	if (!config.waitForToolApproval) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(
+				`Tool "${toolCall.name}" requires approval, but no approval handler is configured`,
+			),
+			isError: true,
+		};
+	}
+	let resolution: ToolApprovalResolution;
+	try {
+		resolution = await config.waitForToolApproval(
+			{ toolCallId: toolCall.id, toolName: toolCall.name, args: toolCall.arguments },
+			signal,
+		);
+	} catch (error) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+	if (signal?.aborted) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult("Operation aborted"),
+			isError: true,
+		};
+	}
+	if (resolution.decision === "deny") {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(reason || "Tool execution was denied"),
+			isError: true,
+		};
+	}
+	if (resolution.arguments === undefined) {
+		return { kind: "approved", args: toolCall.arguments };
+	}
+	try {
+		return {
+			kind: "approved",
+			args: validateToolArguments(tool, { ...toolCall, arguments: resolution.arguments as Record<string, any> }),
+		};
+	} catch (error) {
+		return {
+			kind: "immediate",
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+}
+
+/**
+ * Settle a suspended tool call with a caller-supplied resolution, without consulting
+ * `beforeToolCall` again: the call was preflighted before it was suspended. A denial produces
+ * an error result; an allow validates the final arguments (the resolution's `arguments` when
+ * given, otherwise the call's own) and executes exactly once.
+ */
+async function executeResolvedToolCall(
+	currentContext: AgentContext,
+	assistantMessage: AssistantMessage,
+	toolCall: AgentToolCall,
+	resolution: ToolApprovalResolution,
+	config: ToolCallHooks,
+	signal: AbortSignal | undefined,
+	emit: AgentEventSink,
+): Promise<FinalizedToolCallOutcome> {
+	if (resolution.decision === "deny") {
+		return {
+			toolCall,
+			result: createErrorToolResult("Tool execution was denied"),
+			isError: true,
+		};
+	}
+	const tool = (currentContext.tools ?? []).find((t) => t.name === toolCall.name);
+	if (!tool) {
+		return {
+			toolCall,
+			result: createErrorToolResult(`Tool ${toolCall.name} not found`),
+			isError: true,
+		};
+	}
+	let args: unknown;
+	try {
+		const preparedToolCall = prepareToolCallArguments(tool, toolCall);
+		args = validateToolArguments(tool, {
+			...preparedToolCall,
+			arguments: (resolution.arguments ?? preparedToolCall.arguments) as Record<string, any>,
+		});
+	} catch (error) {
+		return {
+			toolCall,
+			result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+			isError: true,
+		};
+	}
+	await emit({
+		type: "tool_execution_start",
+		toolCallId: toolCall.id,
+		toolName: toolCall.name,
+		args,
+	});
+	const prepared: PreparedToolCall = { kind: "prepared", toolCall, tool, args };
+	const executed = await executePreparedToolCall(prepared, signal, emitToolExecutionUpdate(toolCall, emit));
+	return finalizeExecutedToolCall(currentContext, assistantMessage, prepared, executed, config, signal);
 }
 
 function emitToolExecutionUpdate(toolCall: AgentToolCall, emit: AgentEventSink): ToolUpdateSink {
@@ -811,12 +1156,13 @@ export interface RunToolCallOptions extends ToolCallHooks {
 
 /**
  * Run one tool call through the same steps as a model-issued call: argument preparation, schema
- * validation, `beforeToolCall`, execution, and `afterToolCall`. Emits no events and adds no
- * messages. Tools that call other tools use this so the hooks (for example permission checks)
- * apply to those calls too.
+ * validation, `beforeToolCall`, the approval gate (a `decision: "ask"` result suspends the call
+ * through `onToolApprovalPending` / `waitForToolApproval`, without emitting events), execution,
+ * and `afterToolCall`. Emits no events and adds no messages. Tools that call other tools use this
+ * so the hooks (for example permission checks and approvals) apply to those calls too.
  *
- * Never rejects for tool failures: unknown tools, validation errors, blocked calls, and thrown
- * errors come back as `isError: true`.
+ * Never rejects for tool failures: unknown tools, validation errors, blocked or denied calls,
+ * and thrown errors come back as `isError: true`.
  */
 export async function runToolCall(toolCall: AgentToolCall, options: RunToolCallOptions): Promise<AgentToolCallOutcome> {
 	const { assistantMessage, context, signal } = options;
