@@ -2031,3 +2031,44 @@ web 抓取与工具卡口径、未动挡位词表/clamp 口径。
   `lib/gateway.ts` 注释与 `.gitignore` 注释里的 `.mjs`/`server.mjs` 残留改现行口径
   （MINOR-2）；删 `scripts/test-r10.ts` 未使用的 `SCRIPT` 常量（NOTE-1）。纯文档与
   注释，不改行为；聚合 `npm run test` 计数与基线逐项一致（见 PR #27）。
+
+### P1-7 真仓库试用实测（2026-11-12，用户本机实例 + NorthAdb/piper-dogfood）
+
+- 环境口径：试用在用户自己的 Windows 电脑上的实例进行（本仓库 VM 内的实例不是
+  用户的日常实例，早先以 VM 实例数据为准的说法已作废）。试用仓
+  NorthAdb/piper-dogfood（公开），PR #1「dogfood：待审测试 PR（P1-7）」，
+  试用时 head 8556a98；仓库管家绑定 LinkForge、Loom、piper-dogfood 三仓。
+- 真 Key 对话：用户在本机设置页录入 DeepSeek Key，仓库管家对话带思考链流式
+  回复，真 Key 链路在用户实例上确认可用（用户截图为据）。对照 README 五步
+  验收清单：第 5 步（清空 Key 回到 MODEL_NOT_CONFIGURED）本轮未在用户实例
+  重跑——避免抹除用户刚录入的 Key，如实标注为未覆盖。
+- 扫描开单：2026-11-12 14:27（HKT）扫描对 PR #1 开出 pr_needs_review
+  Finding 1 条（headSha=8556a98；PR 当时唯一 review 为 Copilot 的 COMMENTED，
+  按锁定语义不算表态）。
+- 第一轮批准执行（旧令牌）：14:29 与 14:30 两次批准执行均在网关 POST 评论
+  处得 GitHub 403（旧 PAT 权限不足），Finding 两次均按设计回滚到 approved
+  保持可重试，通知带回失败原因。批准本身两次都成立，失败在执行段。
+- 定性（试用中段一度误判为「事项丢失」）：用户贴出本机 data/findings.jsonl
+  与 data/audit.jsonl 后定性——14:32:57 有 rejected_by_user 记录，事项是被
+  用户误点「驳回」关闭的；之后各轮扫描新开 0 条，是去重冷却按锁定语义生效
+  （rejected 且头部未变且 <14 天不重开），不是数据丢失。审计流水完整给出
+  approved → executing → failed → executing → failed → rejected 全链，
+  证据链按设计工作。
+- 令牌修复与恢复：用户按最小权限清单重新申请 fine-grained PAT（仓库范围
+  含 piper-dogfood；Contents 只读、Pull requests 读写、Actions 只读、
+  Metadata 只读）并在设置页覆盖旧令牌（单令牌槽，保存即覆盖）；给 PR 分支
+  推送头部变更提交 942734e（一行文档）解除驳回冷却；重扫新开 Finding，
+  批准并执行后网关真写成功。GitHub 侧核验：PR #1 有且仅有 1 条评论，署名
+  NorthAdb（令牌身份），2026-11-12T06:59:40Z，正文与批准快照逐字一致、
+  带 piper:approval 幂等标记。
+- 结论：P1-7 主链（真 Key 对话、真扫描开单、收件箱人闸批准、薄网关真写、
+  审计留痕）在用户真实实例上贯通，第一件（Layer 0 + P1-1–P1-6）验收关闭
+  的最后一道闸通过。
+- 试用暴露的问题（已立项为后续三个修复切片，不属本记录范围）：执行失败后
+  恢复路径不直观（重试入口不显眼、通知不直达事项、驳回与重试并排且误点
+  代价为 14 天冷却、无撤销入口、关闭事项在界面无痕）；403 报错不带 GitHub
+  返回的权限细节、设置页无令牌自检、令牌范围与绑定仓库无对账提示；事项
+  评论正文为固定模板不可编辑；事项详情过薄（PR 描述/变更文件/审查态势需
+  跳 GitHub 查看，拍板信息不足）；PR 状态只能经扫描获得、无即席处理指定
+  PR 的入口；对话中的 bot 不知自身绑定与扫描子系统、曾在对话中向用户
+  索要 PAT（令牌只应走设置页）。
