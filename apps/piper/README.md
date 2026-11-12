@@ -2236,3 +2236,71 @@ test:scan/test:gateway 数据面钉住，无对应截图位）。
   一种分诊动作，网关分发结构已按 kind 留好位置，立新动作时必须同时落
   执行与复检，不做半成品声明；即席开单仍只支持 PR；CI 失败一键重跑
   未做（网关第三种动作，另议）；不改去重冷却、批准快照与状态机口径。
+
+## P2-1 循环工具调用状态机实测（第二件切片一，2026-11-12）
+
+第二件第一张切片，也是源码导入以来第一处基座内部改动：只改
+`packages/agent/src/types.ts`、`agent-loop.ts`、`agent.ts` 三个文件（补丁面
+按切片 §1 锁定），新增 `packages/agent/test/tool-approval.test.ts`；未动
+`apps/piper` 的策略与界面（本切片用测试里的假宿主验收）。改基座的原因：
+工具调用闸必须在循环的 prepare 与 execute 之间生效——未批一次都执行不到、
+`tool_execution_start` 只能在真正执行前发出、进程重启后凭 transcript 恢复，
+这三条在宿主侧拦截都做不到，只能改循环本身。
+
+- **接口（按切片 §1.1）**：`BeforeToolCallResult` 增 `decision`
+  （`"allow" | "deny" | "ask"`，deny 与旧 `block: true` 等价且优先）与
+  `arguments`（改写后必须再过一遍 schema 校验，失败按拒绝处理）；
+  `AgentEvent` 增 `tool_approval_pending`；`AgentLoopConfig` 增
+  `onToolApprovalPending` / `waitForToolApproval`；`Agent` 新增
+  `resolveToolCall(toolCallId, { decision, arguments? })`，现有 `continue()`
+  的抛错语义刻意不动。
+- **闸门顺序**：参数校验 → `beforeToolCall` → ask 时先 `await`
+  `onToolApprovalPending`（宿主落盘）→ 发 `tool_approval_pending` →
+  `await waitForToolApproval` → allow 才发 `tool_execution_start` 并
+  `execute()`。deny / 落盘失败 / 未配置等待处理器（裸循环层）/ 中止，
+  一律写错误 tool result 收尾，不发 start。本件起 `tool_execution_start`
+  改到预检通过后才发（带最终校验后的参数），与第一件前「先发 start 再
+  block」的顺序不同，是切片明确要求改掉的；截断消息的
+  `failToolCallsFromTruncatedMessage` 仍保持先 start 再失败的原语义。
+- **恢复**：`resolveToolCall` 两条路径——活动 run 正在等待时直接交付决定
+  （宿主自己的等待实现与 `resolveToolCall` 竞速，先到者生效；中止同时
+  解除等待）；无活动 run 且 transcript 末条是带该 toolCall 的 assistant、
+  尚无 tool result 时（进程重启后的形状），新起一轮：解析的那次调用按
+  决定直接结算（它在挂起前已经预检过，不重复走 `beforeToolCall`），同批
+  其余未决调用按顺序走正常预检（含再次 ask），写完 tool result 后再进入
+  与 `continue()` 相同的后续循环。不得在未写 tool result 时调 `continue()`。
+- **批次纪律**：批次预检本来就是逐个顺序进行的，ask 挂起即挡住同批后续
+  调用的预检与执行，即使 `toolExecution: "parallel"` 也不会偷跑；
+  `runToolCall()`（嵌套调用）走同一套闸，只是不发事件。
+
+实测（本地）：新文件 15 个用例全绿，逐条对应切片验收 1–9——未批准执行
+计数 0 且事件只有 pending 没有 start、落盘先于等待；批准后恰好执行 1 次
+且参数等于快照、事件序 pending → start → end；宿主自有等待通道放行与
+拒绝；deny 不发 start 且错误文案用钩子 reason；裸循环层无等待处理器时
+默认拒绝；落盘钩子抛错即拒绝且不执行；钩子改参数生效、非法改写被拒；
+resolve 时提交的参数作为新快照执行；并行批次第一个 ask 时第二个执行
+计数 0、放行后各 1 次；等待中 abort 不执行、执行中 abort 工具收到信号
+且结果非成功；嵌套 `runToolCall` 未放行前内层执行 0；重启恢复一组：
+丢弃实例后新 Agent 凭同一份 transcript 恢复、执行恰 1 次且不再触发
+落盘钩子，deny 则写错误结果，未知 id 与已执行过的 id 再次 resolve 明确
+抛错，`continue()` 对同一 transcript 仍抛
+`Cannot continue from message role: assistant`。
+既有 `packages/agent` 测试 84/84 全绿（agent-loop / agent /
+agent-tool-typebox / proxy 四个文件），`start` 顺序变更未打破任何既有
+断言、未改一行旧测试。根级 `npm run check` 退出码 0。可复制命令：
+在 `packages/agent` 下跑
+`node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run test/tool-approval.test.ts`
+（或包内 `npm test`，含本文件）。
+
+- 落点说明（切片未写死、由实现定，已在此写清）：验收 4 的「过期批准」
+  在核心层落为——无活动 run 时对未知/已结算 id 的 resolve 明确抛错、
+  不执行；活动 run 中先于挂起到达的 resolve 会被暂存、等该调用挂起时
+  交付（收件箱点击与循环推进存在竞态，丢弃先到的批准会让真批准失效），
+  快照一致性比对由宿主在 P2-3 用 ToolApproval 记录与网关复检落。错误
+  文案沿用核心层既有英文串（如 `Tool execution was denied`），核心层不做
+  本地化。Agent 路径下等待桥始终安装，故「无等待处理器即拒绝」只在裸
+  `agentLoop` 层成立（已单测钉住）。
+- 明确不做（按切片）：Piper 侧策略、工作区闸、收件箱界面、
+  `github_comment`、GitHub 写入均未在本切片出现，分别归 P2-2 至 P2-4；
+  未向任何产品 bot 挂文件工具或 shell。CI 侧本 PR 改 `packages/**`，
+  `upstream-suites` 随 PR 触发，结果以 PR 检查为准。

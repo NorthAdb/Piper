@@ -30,3 +30,7 @@ Piper 基于开源项目 **Pi** 的源码进行二次开发（不是 SDK 嵌入�
 - 评估：实施方（Muse）实查了仓库的 Actions 运行记录与全部 15 个 workflow 的触发条件，结论是只有 `ci.yml` 本体在每次推送时真正通过且对本仓有用；其余 14 个或依赖上游 Earendil 的发布基础设施与密钥（在本仓必然失败）、或是上游的社区治理与定时机器（对单人项目无用），据此建议只保留 `ci.yml`、删除其余 14 个。
 - 批准与执行：用户在对话中明确批准该建议后，实施方才执行删除，并把删除清单与理由写入上面「CI 精简」节。
 - 本说明只补记过程，不改动那次删除本身；如审计不予追认，恢复哪些 workflow 由审计意见决定，实施方按意见另行处理。
+
+## 基座内部改动记录
+
+- 2026-11-12（第二件 P2-1，分支 feat/p2-1-tool-approval）：首次改 `packages/agent` 内部。改 `src/types.ts`、`src/agent-loop.ts`、`src/agent.ts`：工具调用在循环内走「提议 → 预检 → 允许 / 拒绝 / 挂起待批 → 恢复执行」状态机（`BeforeToolCallResult.decision`、事件 `tool_approval_pending`、`Agent.resolveToolCall`）。原因：未批不执行、执行事件只在真正执行前发出、重启后凭 transcript 恢复，这三条保证在宿主侧拦截无法成立，必须落在循环的 prepare 与 execute 之间。策略、工作区与 GitHub 写入不进基座，仍在 `apps/piper`。验收：`packages/agent/test/tool-approval.test.ts`（新增）+ 既有 agent 套件全绿，根级 `npm run check` 通过，CI 以 PR 的 `upstream-suites` 为准。
