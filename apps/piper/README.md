@@ -2152,6 +2152,35 @@ badtz 4、secrets 21、model-stub 11、model-providers 57、r10 22、webfetch
 PR 更新，其余字节差为时间戳抖动已还原。注意 shots 种子事项是直接落盘的，
 不带 detail 快照，详情区的渲染未被截图覆盖（数据面由 test:scan 场景 G
 钉住，渲染面待真实扫描数据目检）。
+
+## 令牌可排障切片实测（P1-7 复盘切片三，2026-11-12）
+
+P1-7 试用里最耗时的一段：旧 PAT 权限不足的两次 403 只显示状态码，用户
+对着「GitHub API 403」盲排近十分钟。三处补强：
+
+- **403 带回 GitHub 的原话**：网关与扫描的 GitHub 请求失败时，读取响应体
+  的 `message` 拼进错误（截断 200 字、先过 redact 抹令牌形状）——失败原因、
+  审计、通知与收件箱的 lastError 里从此能直接看到「Resource not accessible
+  by personal access token」这类原文，而不是只有一个状态码。
+- **令牌自检**：新模块 lib/github-check.ts + `POST /api/settings/connectors/
+  github/check`（只读）：GET /user 验令牌有效性与身份；令牌种类按前缀粗分
+  （github_pat_ 为 fine-grained、ghp_ 为 classic 等，种类未知不乱给指引）；
+  对全部绑定仓库逐仓 GET /repos/:repo 对账——可达性 + 有效写权限（仓库
+  响应 permissions.push）。结果不含令牌本身。
+- **设置页呈现**：GitHub 令牌卡新增「令牌自检」按钮与结果区：身份与种类、
+  每仓「可访问 · 可写/只读」或「够不着（状态码）」；fine-grained 且存在
+  只读/够不着仓库时，直接给出最小权限清单（Contents 只读、Pull requests
+  读写、Actions 只读、Metadata 只读）与修复路径。
+
+实测（本地，含聚合全链）：test:gateway 36→39（403 带回 message 且审计与
+lastError 同步可见；自检逐仓对账——只读仓 canPush=false、可写仓 true、
+不存在的仓 reachable=false/404；令牌种类前缀判定），其余各套与切片二
+收官时一致（findings 27、scan 16、pr-review 16、schedule 14、recovery 7、
+listen 9、badtz 4、secrets 21、model-stub 11、model-providers 57、r10 22、
+webfetch 48、trace 24、eval:scan 21、regression 72），聚合 npm run test
+退出码 0；根级 npm run check 退出码 0；npm run shots 20 张全过，字节差
+均为时间戳抖动已还原（本切片的设置页自检区没有对应截图位，未被 shots
+覆盖，数据面由 test:gateway 自检用例钉住）。
 - 明确不做：不改 Finding 状态机、去重冷却（14 天）与网关任何口径；不加
   「撤销驳回」入口（本切片以确认 + 留痕解决误点与无声消失，撤销入口如仍
   需要另议）；通知文件结构不变（findingId 自 P1-6 起已有）。

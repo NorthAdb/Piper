@@ -31,7 +31,7 @@
 //   - 任一网络步失败：Finding 从 executing 退回 approved、写审计 failed，错误可见可重试。
 // 凭证只经 lib/settings.ts 的 githubToken() 读取，本文件不直读环境变量与设置文件。
 import { githubToken } from "./settings.ts";
-import { containsSecret } from "./redact.ts";
+import { containsSecret, redact } from "./redact.ts";
 import { getBot } from "./store.ts";
 import { getFinding, updateFinding } from "./findings.ts";
 import type { Finding } from "./findings.ts";
@@ -63,6 +63,10 @@ function ghBase(): string {
 }
 
 // GitHub API 响应是外部边界：返回 any，由消费点逐字段取用（同 lib/scan.ts 口径）。
+// 失败时尽量带回 GitHub 自己的错误 message（切片三）：fine-grained PAT 权限不足
+// 的 403 只看状态码完全无从排障，message 里写着原因（如 Resource not accessible
+// by personal access token）。message 是外部文本：截断到 200 字防审计/通知被灌爆，
+// 并先经 redact 抹掉任何令牌形状的子串才拼进错误，不带凭据出门。
 async function ghJson(path: string, { method = "GET", token, body }: { method?: string; token?: string; body?: unknown } = {}): Promise<any> {
 	const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "piper-gateway" };
 	if (token) headers.Authorization = `Bearer ${token}`;
@@ -71,7 +75,16 @@ async function ghJson(path: string, { method = "GET", token, body }: { method?: 
 		headers,
 		body: body === undefined ? undefined : JSON.stringify(body),
 	});
-	if (!res.ok) throw new Error(`GitHub API ${res.status} ${method} ${path}`);
+	if (!res.ok) {
+		let detail = "";
+		try {
+			const j: any = await res.json();
+			if (typeof j?.message === "string" && j.message) detail = `：${redact(j.message.slice(0, 200))}`;
+		} catch {
+			// 响应体不是 JSON 就只报状态码，不因解析失败掩盖原始错误
+		}
+		throw Object.assign(new Error(`GitHub API ${res.status} ${method} ${path}${detail}`), { status: res.status });
+	}
 	return res.json();
 }
 

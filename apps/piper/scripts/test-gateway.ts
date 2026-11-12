@@ -14,6 +14,7 @@
 // 无 writeIntent 不入列）与 bot 自我事实（绑定清单如实、凭据红线在场）。
 // 拍板切片二新增：评论正文可编辑（改文冻结口径、approved 改文作废批准、
 // 含令牌正文保存即拒）。
+// 拍板切片三新增：403 带回 GitHub message、令牌自检逐仓对账、令牌种类判定。
 import { appendFileSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import type { ArtifactMeta } from "../lib/store.ts";
 import type { Finding } from "../lib/findings.ts";
@@ -59,6 +60,8 @@ let pullState = "open";
 let pullDraft = false;
 let pullReviews: { state?: string; user?: { login?: string }; commit_id?: string }[] = [];
 let postShouldFail = false;
+let postFailMessage: string | null = null;
+let repoAccessStub: Record<string, { push: boolean } | number> = {};
 let pullShouldFail = false;
 let fetchDelayMs = 0;
 let postCrashAfterSuccess = false;
@@ -88,6 +91,7 @@ globalThis.fetch = (async (url: unknown, init: StubInit = {}) => {
 		const comment = { body: body.body, html_url: `https://github.com/${commentsMatch[1]}/pull/${commentsMatch[2]}#issuecomment-4242` };
 		commentsByKey.set(key, [...(commentsByKey.get(key) ?? []), comment]);
 		if (postCrashAfterSuccess) throw new Error("simulated crash after POST succeeded");
+		if (postFailMessage !== null) return { ok: false, status: 403, json: async () => ({ message: postFailMessage }) };
 		if (postShouldFail) return { ok: false, status: 500, json: async () => ({}) };
 		return { ok: true, status: 201, json: async () => comment };
 	}
@@ -99,6 +103,16 @@ globalThis.fetch = (async (url: unknown, init: StubInit = {}) => {
 	if (method === "GET" && /\/pulls\/\d+$/.test(u.pathname)) {
 		if (pullShouldFail) return { ok: false, status: 500, json: async () => ({}) };
 		return { ok: true, status: 200, json: async () => ({ state: pullState, draft: pullDraft, head: { sha: "head-sha-1" } }) };
+	}
+	if (method === "GET" && u.pathname === "/user") {
+		return { ok: true, status: 200, json: async () => ({ login: "tester" }) };
+	}
+	const repoMatch = u.pathname.match(/^\/repos\/([^/]+\/[^/]+)$/);
+	if (method === "GET" && repoMatch) {
+		const entry = repoAccessStub[repoMatch[1]];
+		if (entry === undefined) return { ok: false, status: 404, json: async () => ({ message: "Not Found" }) };
+		if (typeof entry === "number") return { ok: false, status: entry, json: async () => ({}) };
+		return { ok: true, status: 200, json: async () => ({ permissions: { push: entry.push, pull: true } }) };
 	}
 	return { ok: false, status: 599, json: async () => ({}) };
 }) as typeof fetch;
@@ -800,7 +814,48 @@ try {
 		);
 	}
 
-	// 25. bot 自我事实（失败可恢复切片）：绑定仓库如实列出、扫描取证边界与凭据
+	// 25. 令牌可排障（拍板切片三）：403 带回 GitHub 的 message——失败原因与待批
+	//     视图的 lastError 里都能看到 GitHub 的原话，不再只有一个状态码；令牌自检
+	//     对账每个仓库的可达与可写，令牌种类按前缀分。
+	{
+		const f = makeFinding({ subject: "140" });
+		postFailMessage = "Resource not accessible by personal access token";
+		const out = await approveApproval(f.id, { intentHash: viewOf(f.id)?.intentHash, saveArtifactFn: saveArtifactStub });
+		postFailMessage = null;
+		const failedAudit = auditFor(f.id).find((x) => x.result === "failed");
+		check(
+			"令牌可排障：403 的失败原因带回 GitHub message（审计与 lastError 同步可见）",
+			out.execution.ok === false &&
+				(failedAudit?.reason ?? "").includes("comment_failed") &&
+				(failedAudit?.reason ?? "").includes("Resource not accessible by personal access token") &&
+				(viewOf(f.id)?.lastError ?? "").includes("Resource not accessible by personal access token"),
+			`reason=${failedAudit?.reason}`,
+		);
+	}
+	{
+		const { checkGithubToken, tokenKindOf } = await import("../lib/github-check.ts");
+		repoAccessStub = { "NorthAdb/LinkForge": { push: false }, "NorthAdb/Loom": { push: true } };
+		const r = await checkGithubToken(["NorthAdb/LinkForge", "NorthAdb/Loom", "NorthAdb/Ghost"]);
+		check(
+			"令牌可排障：自检给出身份与逐仓对账（只读仓 canPush=false、可写仓 true、不存在的仓 reachable=false/404）",
+			r.configured === true &&
+				r.login === "tester" &&
+				r.error === null &&
+				r.repos.find((x) => x.repo === "NorthAdb/LinkForge")?.canPush === false &&
+				r.repos.find((x) => x.repo === "NorthAdb/Loom")?.canPush === true &&
+				r.repos.find((x) => x.repo === "NorthAdb/Ghost")?.reachable === false &&
+				r.repos.find((x) => x.repo === "NorthAdb/Ghost")?.status === 404,
+			JSON.stringify(r),
+		);
+		check(
+			"令牌可排障：令牌种类按前缀分（github_pat_ 为 fine-grained、ghp_ 为 classic、其余 unknown）",
+			tokenKindOf("github_pat_abc") === "fine-grained" && tokenKindOf("ghp_abc") === "classic" && tokenKindOf("plain-token") === "unknown",
+			"",
+		);
+		repoAccessStub = {};
+	}
+
+	// 26. bot 自我事实（失败可恢复切片）：绑定仓库如实列出、扫描取证边界与凭据
 	//     红线在场；无绑定时明说未绑定，不编造。
 	{
 		const base = {

@@ -29,6 +29,7 @@ import { createFinding, findBlockingFinding, listFindings, updateFinding } from 
 import type { Finding, FindingDetail, FindingInput } from "./findings.ts";
 import { evaluateReviews, latestReviewStances, prNeedsReview } from "./pr-review.ts";
 import { appendAudit } from "./audit.ts";
+import { redact } from "./redact.ts";
 import type { ArtifactMeta } from "./store.ts";
 
 // 一仓取证的汇总。info / commits / pulls / issues / runs 是 GitHub REST 的原始
@@ -58,12 +59,23 @@ function ghBase(): string {
 }
 
 // GitHub API 响应是外部边界：返回 any，由各消费点按接口文档逐字段取用。
+// 失败同 gateway 口径带回 GitHub 的 message（截断 200 字），日报里能直接看到
+// 403 的原因而不是只有一个状态码。
 async function gh(path: string): Promise<any> {
 	const headers: Record<string, string> = { Accept: "application/vnd.github+json", "User-Agent": "piper-morning-scan" };
 	const token = githubToken();
 	if (token) headers.Authorization = `Bearer ${token}`;
 	const res = await fetch(`${ghBase()}${path}`, { headers });
-	if (!res.ok) throw Object.assign(new Error(`GitHub API ${res.status} ${path}`), { status: res.status });
+	if (!res.ok) {
+		let detail = "";
+		try {
+			const j: any = await res.json();
+			if (typeof j?.message === "string" && j.message) detail = `：${redact(j.message.slice(0, 200))}`;
+		} catch {
+			// 响应体不是 JSON 就只报状态码
+		}
+		throw Object.assign(new Error(`GitHub API ${res.status} ${path}${detail}`), { status: res.status });
+	}
 	return res.json();
 }
 

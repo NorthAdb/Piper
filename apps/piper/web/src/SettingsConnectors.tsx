@@ -2,15 +2,23 @@
 // GitHub 可配置令牌（PAT 粘贴保存，读回只有末四位掩码，保存后扫描立即使用）；
 // 网页查询可启用只读抓取并配置搜索端点（密钥读回只有掩码）；
 // 日历 / 邮件是占位卡，点开能看到「尚未接入」与既定口径，不冒充已接好。
-import { ChevronDownIcon, Loader2Icon, SaveIcon, Trash2Icon } from "lucide-react";
+import { ChevronDownIcon, Loader2Icon, SaveIcon, ShieldCheckIcon, Trash2Icon } from "lucide-react";
 import { useEffect, useState } from "react";
-import { getConnectors, saveGithubToken, saveWebSettings, UnauthorizedError } from "./api";
+import { checkGithubToken, getConnectors, saveGithubToken, saveWebSettings, UnauthorizedError } from "./api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import type { Connector } from "./model";
+import type { Connector, GithubSelfCheck } from "./model";
+
+const TOKEN_KIND_LABEL: Record<string, string> = {
+	"fine-grained": "fine-grained PAT（仓库级授权）",
+	classic: "classic PAT（scope 授权）",
+	oauth: "OAuth 令牌",
+	installation: "GitHub App 安装令牌",
+	unknown: "种类未识别",
+};
 
 const STATUS_LABEL: Record<Connector["status"], string> = {
 	connected: "已连接",
@@ -28,6 +36,20 @@ function GithubTokenForm({ connector, onChanged, onUnauthorized }: { connector: 
 	const [token, setToken] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [notice, setNotice] = useState("");
+	const [checking, setChecking] = useState(false);
+	const [check, setCheck] = useState<GithubSelfCheck | null>(null);
+
+	const runCheck = async () => {
+		setChecking(true);
+		try {
+			setCheck(await checkGithubToken());
+		} catch (err) {
+			if (err instanceof UnauthorizedError) onUnauthorized();
+			else setCheck({ configured: true, login: null, tokenKind: null, repos: [], error: `自检请求失败：${err instanceof Error ? err.message : String(err)}` });
+		} finally {
+			setChecking(false);
+		}
+	};
 
 	const save = async (value: string, okText: string) => {
 		setBusy(true);
@@ -70,6 +92,47 @@ function GithubTokenForm({ connector, onChanged, onUnauthorized }: { connector: 
 				) : null}
 			</div>
 			{notice ? <p className="text-sm text-muted-foreground">{notice}</p> : null}
+			{connector.status === "connected" ? (
+				<div className="flex flex-col gap-2">
+					<div className="flex items-center gap-2">
+						<Button type="button" size="sm" variant="outline" disabled={checking} onClick={() => void runCheck()}>
+							{checking ? <Loader2Icon className="animate-spin" /> : <ShieldCheckIcon />}
+							令牌自检
+						</Button>
+						<span className="text-xs text-muted-foreground">只读验证：令牌是谁的、每个绑定仓库够不够得着、能不能写评论。</span>
+					</div>
+					{check ? (
+						check.error ? (
+							<p className="rounded-lg border px-3 py-2 text-sm text-destructive">{check.error}</p>
+						) : (
+							<div className="flex flex-col gap-1.5 rounded-lg border px-3 py-2.5 text-sm">
+								<p>
+									身份：{check.login ?? "（未取到登录名）"}
+									{check.tokenKind ? <span className="text-muted-foreground"> · {TOKEN_KIND_LABEL[check.tokenKind] ?? check.tokenKind}</span> : null}
+								</p>
+								{check.repos.length === 0 ? <p className="text-muted-foreground">当前没有绑定任何仓库的 bot，无可对账的仓库。</p> : null}
+								{check.repos.map((r) => (
+									<p key={r.repo} className="flex flex-wrap items-baseline gap-x-2">
+										<span className="font-mono text-xs">{r.repo}</span>
+										{r.reachable ? (
+											<span className="text-muted-foreground">
+												可访问 · 写权限：{r.canPush === true ? "可写（评论可发送）" : r.canPush === false ? "只读（批准后的评论会 403，请补 Pull requests 读写）" : "未知"}
+											</span>
+										) : (
+											<span className="text-destructive">够不着（GitHub 回 {r.status ?? "网络错误"}）：令牌未授权这个仓库，或仓库不存在</span>
+										)}
+									</p>
+								))}
+								{check.tokenKind === "fine-grained" && check.repos.some((r) => !r.reachable || r.canPush === false) ? (
+									<p className="text-xs text-muted-foreground">
+										fine-grained PAT 的最小权限清单：Repository access 勾选出问题仓库；Contents 只读、Pull requests 读写、Actions 只读、Metadata 只读（自动）。改完在 GitHub 侧保存，再回这里覆盖令牌并重新自检。
+									</p>
+								) : null}
+							</div>
+						)
+					) : null}
+				</div>
+			) : null}
 		</div>
 	);
 }
