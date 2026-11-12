@@ -7,9 +7,9 @@
 //   artifacts/<id>.md         产物（Markdown），文件头注释里带结构化元数据
 //   routines.json             routine 定义 + 上次运行结果
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync, realpathSync } from "node:fs";
 import type { WriteFileOptions } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { join, dirname, resolve, basename, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redact } from "./redact.ts";
 
@@ -26,6 +26,9 @@ export interface Bot {
 	isMain: boolean;
 	canManageBots: boolean;
 	createdAt: string;
+	// P2-2：除自身工作区根外，额外允许文件工具访问的根（绝对路径，或相对
+	// DATA_DIR 解析）。缺省 []；旧 bots.json 没有该字段时按 [] 读（listBots 归一）。
+	workspaceAllowedRoots?: string[];
 }
 
 // 建 bot 入参：来自请求体（wire 输入），字段在 createBot 内逐个收窄，
@@ -39,6 +42,7 @@ export interface BotInput {
 	repos?: unknown;
 	routines?: unknown;
 	canManageBots?: unknown;
+	workspaceAllowedRoots?: unknown;
 }
 
 export interface BotPatch {
@@ -49,6 +53,7 @@ export interface BotPatch {
 	repos?: string[];
 	routines?: string[];
 	canManageBots?: boolean;
+	workspaceAllowedRoots?: string[];
 }
 
 export interface Routine {
@@ -251,8 +256,50 @@ export function acquireDataLock(): () => void {
 	};
 }
 
+// 路径真实解析：已存在的最长前缀过 realpath（消符号链接），尚不存在的尾巴
+// 按字面拼回。调用方须先用 resolve() 归一化（尾巴不含 ..）。工作区硬闸
+// （botWorkspace / WorkspaceGuard）共用，保证「检查时看到的路径」与
+// 「实际落盘的路径」在符号链接口径下一致。
+export function realpathExistingPrefix(absPath: string): string {
+	let current = absPath;
+	const tail: string[] = [];
+	while (!existsSync(current)) {
+		const parent = dirname(current);
+		if (parent === current) break;
+		tail.unshift(basename(current));
+		current = parent;
+	}
+	let real = current;
+	try {
+		real = realpathSync(current);
+	} catch {
+		/* 存在性刚确认过，realpath 失败按字面路径继续 */
+	}
+	return tail.length ? join(real, ...tail) : real;
+}
+
+export function isPathWithin(candidate: string, root: string): boolean {
+	return candidate === root || candidate.startsWith(root + sep);
+}
+
+const BOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function assertValidBotId(botId: string): void {
+	if (typeof botId !== "string" || !BOT_ID_PATTERN.test(botId)) {
+		throw new Error(`非法 botId: ${JSON.stringify(botId)}`);
+	}
+}
+
 export function botWorkspace(botId: string): string {
-	return join(DATA_DIR, "workspaces", botId);
+	assertValidBotId(botId);
+	const root = join(DATA_DIR, "workspaces");
+	const candidate = join(root, botId);
+	// 硬闸（P2-2）：工作区目录本身若被符号链接指到 workspaces/ 之外，
+	// realpath 后越界，直接拒绝——不能让一个链接把整间工作区搬走。
+	if (!isPathWithin(realpathExistingPrefix(candidate), realpathExistingPrefix(root))) {
+		throw new Error(`bot 工作区越界: ${botId}`);
+	}
+	return candidate;
 }
 
 export function ensureData(): void {
@@ -270,8 +317,14 @@ export function ensureData(): void {
 
 export function listBots(): Bot[] {
 	const { bots } = readJson<{ bots: Bot[] }>(BOTS_FILE, { bots: [] });
+	// 旧数据兼容（P2-2）：workspaceAllowedRoots 缺失或非数组一律归一为 []，
+	// 消费方（WorkspaceGuard 等）不必再各自判空。
+	const normalized = bots.map((b) => ({
+		...b,
+		workspaceAllowedRoots: Array.isArray(b.workspaceAllowedRoots) ? b.workspaceAllowedRoots.map(String) : [],
+	}));
 	// 主 bot 置顶，其余按创建时间
-	return [...bots].sort((a, b) => Number(b.isMain) - Number(a.isMain) || String(a.createdAt).localeCompare(String(b.createdAt)));
+	return normalized.sort((a, b) => Number(b.isMain) - Number(a.isMain) || String(a.createdAt).localeCompare(String(b.createdAt)));
 }
 
 export function getBot(id: string): Bot | null {
@@ -292,6 +345,7 @@ export function createBot(input: BotInput): Bot {
 		routines: Array.isArray(input.routines) ? input.routines.map(String) : [],
 		isMain: false,
 		canManageBots: Boolean(input.canManageBots),
+		workspaceAllowedRoots: Array.isArray(input.workspaceAllowedRoots) ? input.workspaceAllowedRoots.map(String) : [],
 		createdAt: new Date().toISOString(),
 	};
 	writeJson(BOTS_FILE, { bots: [...bots, bot] });
@@ -312,6 +366,7 @@ export function updateBot(id: string, patch: BotPatch): Bot | null {
 		...(patch.memoryScope !== undefined ? { memoryScope: String(patch.memoryScope) } : {}),
 		...(patch.repos !== undefined ? { repos: patch.repos.map(String) } : {}),
 		...(patch.routines !== undefined ? { routines: patch.routines.map(String) } : {}),
+		...(patch.workspaceAllowedRoots !== undefined ? { workspaceAllowedRoots: patch.workspaceAllowedRoots.map(String) } : {}),
 		// isMain / canManageBots 不允许通过普通编辑摘掉主 bot 的管理权
 		isMain: cur.isMain,
 		canManageBots: cur.isMain ? true : Boolean(patch.canManageBots ?? cur.canManageBots),

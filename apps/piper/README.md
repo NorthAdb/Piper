@@ -2348,3 +2348,57 @@ transcript 原参数（见落点的快照契约）。验收 5 的「落盘」在
   `resolveToolCall` 会等整段续跑结束，P2-4 的 HTTP 处理器不得直接
   `await` 它；批次中途 abort 时尚未处理的后续调用没有 tool result，
   下一轮请求会带着悬空 tool_use。
+
+## P2-2 权限策略与每 bot 文件工作区硬闸实测（第二件切片二，2026-11-12）
+
+权限与沙箱同批落地，全部改动在 `apps/piper` 内，不动基座：新增
+`lib/workspace-guard.ts`（`WorkspaceGuard`）、`lib/policy.ts`
+（`PolicyEngine`）、`lib/workspace-tools.ts`（四个文件工具），加固
+`lib/store.ts` 的 `botWorkspace`，`Bot` 增可选字段
+`workspaceAllowedRoots?: string[]`（缺省 `[]`，`listBots` 对旧数据归一，
+读写 bots.json 向后兼容）。按切片要求，本切片**不**把文件工具挂进
+`streamChat`——产品对话出现这四个工具要等 P2-5 注册表（或与 P2-5 合并时）；
+repo-keeper 默认不开放文件工具。
+
+- **硬闸口径**：`WorkspaceGuard.resolve(botId, rawPath)`——相对路径以
+  `botWorkspace(botId)` 为根，绝对路径只有落在该根或该 bot 的
+  `workspaceAllowedRoots` 内才放行；判定一律走 realpath（尚不存在的路径
+  解析其已存在的最长前缀，检查 store.ts 的 `realpathExistingPrefix`），
+  符号链接指向根外、`..` 穿越、未授权绝对路径一律 `{ ok: false, reason: "escape" }`。
+  允许根的相对条目按相对 `DATA_DIR` 解析（落点，管理者手写 bots.json 时
+  以数据目录为锚）。`botWorkspace` 同步加固：botId 只允许
+  `^[A-Za-z0-9][A-Za-z0-9._-]*$`（含 `/`、`..` 等一律抛错），且工作区
+  目录本身被符号链接指到 `workspaces/` 外时抛错。
+- **策略口径（锁定默认）**：`PolicyEngine.decide({ botId, toolName, args })`——
+  `workspace_list` / `workspace_read` 界内 allow、越界 deny；
+  `workspace_write` / `workspace_edit` 界内 ask、越界 deny；
+  `web_fetch` / `web_search` allow；`github.read` allow（规则先行，工具
+  尚未物化）；`github_comment` ask（仓库绑定校验在 P2-3 补进本引擎）；
+  未知工具一律 deny。decide 先问 Guard，工具 `execute()` 开头再问一次
+  Guard——策略被人为改成 allow，越界执行仍然失败（验收 3 已钉住）。
+- **工具口径**：参数形状按切片锁定（list 的 path 可缺省为 `"."`）；
+  越界返回 `isError` 且 `details.reason === "escape"`，与普通 IO 失败
+  （`"io"`）、参数形状错误（`"args"`）可区分；被拒的写不在盘上留任何
+  字节。`workspace_edit` 要求 oldText 恰好出现一次，0 次或多次都不改
+  文件。`workspace_read` 回喂上限 64 KiB，超出截断并注明（落点，与网页
+  抓取的截断口径一致）。
+
+实测（本地）：新增 `npm run test:workspace` **23/23 全绿**，逐条对应
+切片验收 1–6——界内写入落在 `workspaces/bot-a/hello.txt` 且 list 可见、
+read 读回一致；越界三形态（绝对路径、`../bot-b/…` 与 `../outside.txt`
+相对穿越、工作区内符号链接指向根外后经链接读写）全部以 escape 失败
+且目标文件内容不变、根外无新文件；PolicyEngine 被测试人为改成
+恒 allow 后 execute 仍 escape 失败；bot-a 读 bot-b 文件（相对与绝对
+两路）失败；额外目录未授权时失败、写入 bot-a 的
+`workspaceAllowedRoots` 后可读、其父目录仍不可读、授权根内写为 ask；
+`botWorkspace("../sessions")` 与带 `/` 的 botId 抛错、Guard 对非法
+botId 返回 escape 不抛。验收 7：`apps/piper` 全套 `npm test` 退出码 0
+（findings 30、scan 20、pr-review 16、schedule 14、gateway 43、
+workspace 23、recovery 7、listen 9、badtz 4、secrets 21、model-stub 11、
+model-providers 57、r10 22、webfetch 48、trace 24、eval 23、
+regression 72），无回退。根级 `npm run check` 退出码 0。可复制命令：
+在 `apps/piper` 下跑 `npm run test:workspace`（或全套 `npm test`）。
+
+- 明确不做（按切片）：未提供 bash/exec 等未隔离 shell；未做每 bot
+  云电脑或 Docker 隔离；未改 coding-agent 的 path-utils；文件工具未
+  挂进生产 `streamChat`。
