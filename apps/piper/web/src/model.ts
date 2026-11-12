@@ -140,6 +140,15 @@ export type Connector = {
 
 // 待批项（GET /api/approvals 的线格式，P1-5）：带 writeIntent 的 Finding 的审批视图，
 // id 与 findingId 同值（Finding 是唯一事实源，不另存一份 approvals）。
+// 令牌自检结果（切片三）：与后端 lib/github-check.ts 的 GithubSelfCheck 对齐
+export type GithubSelfCheck = {
+	configured: boolean;
+	login: string | null;
+	tokenKind: "fine-grained" | "classic" | "oauth" | "installation" | "unknown" | null;
+	repos: { repo: string; reachable: boolean; status: number | null; canPush: boolean | null }[];
+	error: string | null;
+};
+
 export type WriteIntent = {
 	kind: string;
 	prNumber: number;

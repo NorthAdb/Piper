@@ -8,6 +8,7 @@ import type {
 	BotDraft,
 	ChatEvent,
 	Connector,
+	GithubSelfCheck,
 	HistoryEntry,
 	ModelProvider,
 	ModelSettings,
@@ -165,6 +166,11 @@ export async function getConnectors(): Promise<Connector[]> {
 
 export async function saveGithubToken(token: string): Promise<Connector> {
 	return (await api<{ connector: Connector }>("/api/settings/connectors/github", { method: "PUT", body: JSON.stringify({ token }) })).connector;
+}
+
+// 令牌自检（切片三）：只读验证身份并对全部绑定仓库对账（可达/可写）
+export async function checkGithubToken(): Promise<GithubSelfCheck> {
+	return (await api<{ check: GithubSelfCheck }>("/api/settings/connectors/github/check", { method: "POST", body: "{}" })).check;
 }
 
 export async function saveWebSettings(patch: { fetchEnabled?: boolean; searchEndpoint?: string; searchApiKey?: string }): Promise<Connector> {
