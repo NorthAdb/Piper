@@ -42,6 +42,8 @@ import type { Finding } from "./findings.ts";
 import { appendAudit } from "./audit.ts";
 import { evaluateReviews } from "./pr-review.ts";
 import { ghPage, PAGE_CAPS } from "./scan.ts";
+import { getToolApproval, toolIntentSnapshotOf, updateToolApproval } from "./tool-approvals.ts";
+import type { ToolApproval } from "./tool-approvals.ts";
 
 // 批准记录里的意图快照形状（属主在 lib/approvals.ts 的 intentSnapshotOf，
 // 网关执行前与 Finding 当前 writeIntent 逐字比对，用的是同一份形状）。
@@ -60,6 +62,7 @@ export interface GatewayResult {
 	commentUrl?: string | null;
 	reused?: boolean;
 	finding?: Finding | null;
+	toolApproval?: ToolApproval | null;
 }
 
 // GitHub API 基址：缺省官方；可用 PIPER_GITHUB_API_BASE 覆盖（R4：回归/测试指向本地桩）。
@@ -119,14 +122,141 @@ function sameIntent(snapshot: IntentSnapshot | null | undefined, finding: Findin
 	return Number(snapshot.prNumber) === Number(current.prNumber);
 }
 
+// ---- 评论写入的共享尾段（Finding 与工具待批两条路径共用） ----
+// 领取（claim）由各路径在调用前完成并写好 executing 审计；本段负责：
+//   目标状态复检（PR / Issue 仍 open、Issue 不是 PR）→ 幂等查重（翻页取尽，
+//   没取尽且无标记则不发）→ POST（快照正文 + 幂等标记）→ executed 审计。
+// applyRulePreconditions 只对 Finding 路径为 true：那两条是扫描规则的前提
+// （PR 仍待审、Issue 仍无人回应），不是评论本身的合法性——对话里用户明确
+// 要求发的评论，PR 已被批准或 Issue 已有回复都不构成不发的理由（P2-3 落点）。
+// 失败一律先 rollback（释放领取/退回可重试态）再由调用方的 failed 落审计。
+interface CommentWriteRun {
+	base: { botId: string | null; findingId: string | null; approvalId: string | null; toolApprovalId: string | null; intent: unknown };
+	repo: string;
+	snapshot: IntentSnapshot;
+	token: string;
+	markerId: string;
+	applyRulePreconditions: boolean;
+	rollback: () => void;
+	markExecuted: () => void;
+	failed: (reason: string) => GatewayResult;
+}
+
+async function runCommentWrite(run: CommentWriteRun): Promise<GatewayResult> {
+	const { snapshot, repo, token } = run;
+	const targetNumber = (snapshot.kind === "issue_comment" ? snapshot.issueNumber : snapshot.prNumber) as number;
+
+	if (snapshot.kind === "pr_comment") {
+		let pr: any;
+		try {
+			pr = await ghJson(`/repos/${repo}/pulls/${targetNumber}`, { token });
+		} catch (err) {
+			run.rollback();
+			return run.failed(`pr_check_failed: ${(err as Error).message}`);
+		}
+		if (pr.state !== "open") {
+			run.rollback();
+			return run.failed("pr_not_open");
+		}
+		if (run.applyRulePreconditions) {
+			// 规则前提复检（R5）：与扫描共用 lib/pr-review.ts 的「已批准」判定。
+			if (pr.draft) {
+				run.rollback();
+				return run.failed("precondition_changed");
+			}
+			let reviews: any[];
+			try {
+				// 复检取 reviews 与扫描共用同一翻页函数（F2 顺手项）：一页 100 条装不下时
+				// 只看第一页会漏掉靠后的 APPROVED / CHANGES_REQUESTED，判定会错。
+				reviews = (await ghPage(`/repos/${repo}/pulls/${targetNumber}/reviews`, PAGE_CAPS.reviews)).items;
+			} catch (err) {
+				run.rollback();
+				return run.failed(`precondition_check_failed: ${(err as Error).message}`);
+			}
+			if (evaluateReviews(reviews, pr.head?.sha).approved) {
+				run.rollback();
+				return run.failed("precondition_changed");
+			}
+		}
+	} else {
+		// issue_comment 复检：Issue 仍 open、且确实是 Issue 不是 PR（编号串了线
+		// 时宁可不发）；Finding 路径的「仍无人回应」前提在下面的查重段一并验证。
+		let issue: any;
+		try {
+			issue = await ghJson(`/repos/${repo}/issues/${targetNumber}`, { token });
+		} catch (err) {
+			run.rollback();
+			return run.failed(`issue_check_failed: ${(err as Error).message}`);
+		}
+		if (issue.pull_request) {
+			run.rollback();
+			return run.failed("not_an_issue");
+		}
+		if (issue.state !== "open") {
+			run.rollback();
+			return run.failed("issue_not_open");
+		}
+	}
+
+	// 幂等查重：同一批准若已留过评论（例如上次 POST 成功后进程崩溃），直接复用，不再发第二条。
+	// 查重翻页取尽（F2）；到上限仍没取尽且没找到标记 → 无法证明没发过，不发。
+	const marker = `<!-- piper:approval=${run.markerId} -->`;
+	let existing: any = null;
+	let commentsComplete = true;
+	let checkedComments: any[] = [];
+	try {
+		const checked = await fetchCommentsForCheck(repo, targetNumber, token);
+		commentsComplete = checked.complete;
+		checkedComments = checked.comments;
+		existing = checked.comments.find((c) => typeof c?.body === "string" && c.body.includes(marker)) ?? null;
+	} catch (err) {
+		run.rollback();
+		return run.failed(`comments_check_failed: ${(err as Error).message}`);
+	}
+	if (!existing && !commentsComplete) {
+		run.rollback();
+		return run.failed("comments_check_incomplete");
+	}
+	if (!existing && run.applyRulePreconditions && snapshot.kind === "issue_comment" && checkedComments.length > 0) {
+		run.rollback();
+		return run.failed("precondition_changed");
+	}
+	if (existing) {
+		appendAudit({ ...run.base, result: "executed", commentUrl: existing.html_url ?? null });
+		run.markExecuted();
+		return { ok: true, result: "executed", commentUrl: existing.html_url ?? null, reused: true };
+	}
+
+	let comment: any;
+	try {
+		comment = await ghJson(`/repos/${repo}/issues/${targetNumber}/comments`, {
+			method: "POST",
+			token,
+			body: { body: `${snapshot.body}\n\n${marker}` },
+		});
+	} catch (err) {
+		run.rollback();
+		return run.failed(`comment_failed: ${(err as Error).message}`);
+	}
+
+	appendAudit({ ...run.base, result: "executed", commentUrl: comment.html_url ?? null });
+	run.markExecuted();
+	return { ok: true, result: "executed", commentUrl: comment.html_url ?? null };
+}
+
 export async function gatewayExecuteWrite({
 	findingId,
 	approvalId = null,
 	snapshot = null,
-}: { findingId?: string | null; approvalId?: string | null; snapshot?: IntentSnapshot | null } = {}): Promise<GatewayResult> {
+	toolApprovalId = null,
+}: { findingId?: string | null; approvalId?: string | null; snapshot?: IntentSnapshot | null; toolApprovalId?: string | null } = {}): Promise<GatewayResult> {
+	// P2-3：对话工具待批走同一入口（§1.1 锁定的入参扩展），分发到工具路径；
+	// Finding 路径的参数与语义不变。
+	if (toolApprovalId) return gatewayExecuteToolWrite({ toolApprovalId, snapshot });
+
 	const finding = findingId ? getFinding(findingId) : null;
 	const auditIntent = { ...(snapshot ?? finding?.writeIntent ?? {}), repo: snapshot?.repo ?? finding?.repo ?? null };
-	const base = { botId: finding?.botId ?? null, findingId: findingId ?? null, approvalId, intent: auditIntent };
+	const base = { botId: finding?.botId ?? null, findingId: findingId ?? null, approvalId, toolApprovalId: null as string | null, intent: auditIntent };
 	const denied = (reason: string): GatewayResult => {
 		appendAudit({ ...base, result: "denied", reason });
 		return { ok: false, result: "denied", reason };
@@ -169,103 +299,107 @@ export async function gatewayExecuteWrite({
 	updateFinding(finding.id, { status: "executing" });
 	appendAudit({ ...base, result: "executing" });
 
-	// 评论目标编号：PR 与 Issue 的评论接口同形（/issues/:n/comments），只有
-	// 执行前复检分叉。编号已由 sameIntent 与当前 writeIntent 比对过，必非空。
-	const targetNumber = (snapshot.kind === "issue_comment" ? snapshot.issueNumber : snapshot.prNumber) as number;
+	const out = await runCommentWrite({
+		base,
+		repo: finding.repo,
+		snapshot,
+		token,
+		markerId: approvalId,
+		applyRulePreconditions: true,
+		rollback,
+		markExecuted: () => {
+			updateFinding(finding.id, { status: "executed" });
+		},
+		failed,
+	});
+	return { ...out, finding: getFinding(finding.id) };
+}
 
-	if (snapshot.kind === "pr_comment") {
-		let pr: any;
-		try {
-			pr = await ghJson(`/repos/${finding.repo}/pulls/${targetNumber}`, { token });
-		} catch (err) {
-			rollback();
-			return failed(`pr_check_failed: ${(err as Error).message}`);
-		}
-		if (pr.state !== "open") {
-			rollback();
-			return failed("pr_not_open");
-		}
-		// 规则前提复检（R5）：与扫描共用 lib/pr-review.ts 的「已批准」判定。
-		if (pr.draft) {
-			rollback();
-			return failed("precondition_changed");
-		}
-		let reviews: any[];
-		try {
-			// 复检取 reviews 与扫描共用同一翻页函数（F2 顺手项）：一页 100 条装不下时
-			// 只看第一页会漏掉靠后的 APPROVED / CHANGES_REQUESTED，判定会错。
-			reviews = (await ghPage(`/repos/${finding.repo}/pulls/${targetNumber}/reviews`, PAGE_CAPS.reviews)).items;
-		} catch (err) {
-			rollback();
-			return failed(`precondition_check_failed: ${(err as Error).message}`);
-		}
-		if (evaluateReviews(reviews, pr.head?.sha).approved) {
-			rollback();
-			return failed("precondition_changed");
-		}
-	} else {
-		// issue_comment 复检：Issue 仍 open、且确实是 Issue 不是 PR（编号串了线
-		// 时宁可不发）；「仍无人回应」的前提由下面的评论查重一并验证——除本批准
-		// 的幂等标记外只要已有任何评论，就说明已有人分诊，模板评论不再发。
-		let issue: any;
-		try {
-			issue = await ghJson(`/repos/${finding.repo}/issues/${targetNumber}`, { token });
-		} catch (err) {
-			rollback();
-			return failed(`issue_check_failed: ${(err as Error).message}`);
-		}
-		if (issue.pull_request) {
-			rollback();
-			return failed("not_an_issue");
-		}
-		if (issue.state !== "open") {
-			rollback();
-			return failed("issue_not_open");
-		}
+// ---- 工具待批路径（P2-3）：领取物是 ToolApproval 记录而不是 Finding ----
+// 校验口径与 Finding 路径同构：快照必须与落盘记录逐字一致、仓库必须在
+// bot 绑定内、记录必须已批准。差别（落点，README 有记）：
+//   - 领取用进程内在途集合（记录状态机没有 executing 态，§1.1 锁定）；
+//   - 校验级 denied（快照不符 / 含秘密 / 不支持的意图 / 未绑定）把记录置
+//     failed 终态——这类重试也不会变；暂时性 failed（目标已关、网络、
+//     无令牌）保持 approved 并把原因写进 error，再次批准即可重试；
+//   - 不套用扫描规则前提复检（见 runCommentWrite 的落点说明）。
+const toolWritesInFlight = new Set<string>();
+
+async function gatewayExecuteToolWrite({
+	toolApprovalId,
+	snapshot = null,
+}: { toolApprovalId: string; snapshot?: IntentSnapshot | null }): Promise<GatewayResult> {
+	const record = getToolApproval(toolApprovalId);
+	const recordSnapshot = toolIntentSnapshotOf(record);
+	const auditIntent = { ...(snapshot ?? recordSnapshot ?? {}), repo: snapshot?.repo ?? recordSnapshot?.repo ?? null };
+	const base = { botId: record?.botId ?? null, findingId: null as string | null, approvalId: null as string | null, toolApprovalId, intent: auditIntent };
+	// 校验级拒绝：记录置 failed 终态（already_* 与 not_found 除外，它们不改变记录）。
+	const deniedTerminal = (reason: string): GatewayResult => {
+		appendAudit({ ...base, result: "denied", reason });
+		if (record && record.status === "approved") updateToolApproval(record.id, { status: "failed", error: reason });
+		return { ok: false, result: "denied", reason, toolApproval: getToolApproval(toolApprovalId) };
+	};
+	const denied = (reason: string): GatewayResult => {
+		appendAudit({ ...base, result: "denied", reason });
+		return { ok: false, result: "denied", reason, toolApproval: record ? getToolApproval(toolApprovalId) : null };
+	};
+	const failed = (reason: string): GatewayResult => {
+		appendAudit({ ...base, result: "failed", reason });
+		// 暂时性失败：状态保持 approved，原因记进 error 供收件箱展示与重试。
+		if (record) updateToolApproval(record.id, { status: "approved", error: reason });
+		return { ok: false, result: "failed", reason, toolApproval: getToolApproval(toolApprovalId) };
+	};
+
+	if (!record) return denied("tool_approval_not_found");
+	if (!snapshot) return deniedTerminal("missing_snapshot");
+	if (!recordSnapshot) return deniedTerminal("invalid_snapshot");
+	if (
+		snapshot.kind !== recordSnapshot.kind ||
+		snapshot.repo !== recordSnapshot.repo ||
+		snapshot.body !== recordSnapshot.body ||
+		Number(snapshot.prNumber) !== Number(recordSnapshot.prNumber) ||
+		Number(snapshot.issueNumber) !== Number(recordSnapshot.issueNumber)
+	) {
+		return deniedTerminal("intent_changed");
 	}
+	if (snapshot.kind !== "pr_comment" && snapshot.kind !== "issue_comment") return deniedTerminal("unsupported_intent");
 
-	// 幂等查重：同一批准若已留过评论（例如上次 POST 成功后进程崩溃），直接复用，不再发第二条。
-	// 查重翻页取尽（F2）；到上限仍没取尽且没找到标记 → 无法证明没发过，不发。
-	const marker = `<!-- piper:approval=${approvalId} -->`;
-	let existing: any = null;
-	let commentsComplete = true;
-	let checkedComments: any[] = [];
+	const bot = getBot(record.botId);
+	if (!bot) return deniedTerminal("bot_not_found");
+	if (!(bot.repos ?? []).includes(snapshot.repo)) return deniedTerminal("repo_not_bound");
+
+	if (record.status === "executed") return denied("already_executed");
+	if (toolWritesInFlight.has(toolApprovalId)) return denied("already_executing");
+	if (record.status !== "approved") return deniedTerminal("not_approved");
+
+	const token = githubToken();
+	if (typeof snapshot.body === "string" && containsSecret(snapshot.body)) return deniedTerminal("secret_in_body");
+	if (!token) return failed("no_token");
+
+	// 领取：同步段内登记在途并写 executing 审计（与 Finding 路径同口径：
+	// 先落审计再做网络调用，进程崩溃后能看到「发到一半」；崩溃后记录仍是
+	// approved，重试时靠幂等标记查重防双发）。
+	toolWritesInFlight.add(toolApprovalId);
+	appendAudit({ ...base, result: "executing" });
 	try {
-		const checked = await fetchCommentsForCheck(finding.repo, targetNumber, token);
-		commentsComplete = checked.complete;
-		checkedComments = checked.comments;
-		existing = checked.comments.find((c) => typeof c?.body === "string" && c.body.includes(marker)) ?? null;
-	} catch (err) {
-		rollback();
-		return failed(`comments_check_failed: ${(err as Error).message}`);
-	}
-	if (!existing && !commentsComplete) {
-		rollback();
-		return failed("comments_check_incomplete");
-	}
-	if (!existing && snapshot.kind === "issue_comment" && checkedComments.length > 0) {
-		rollback();
-		return failed("precondition_changed");
-	}
-	if (existing) {
-		appendAudit({ ...base, result: "executed", commentUrl: existing.html_url ?? null });
-		const updated = updateFinding(finding.id, { status: "executed" });
-		return { ok: true, result: "executed", commentUrl: existing.html_url ?? null, reused: true, finding: updated };
-	}
-
-	let comment: any;
-	try {
-		comment = await ghJson(`/repos/${finding.repo}/issues/${targetNumber}/comments`, {
-			method: "POST",
+		const out = await runCommentWrite({
+			base,
+			repo: snapshot.repo,
+			snapshot,
 			token,
-			body: { body: `${snapshot.body}\n\n${marker}` },
+			markerId: toolApprovalId,
+			applyRulePreconditions: false,
+			rollback: () => {
+				toolWritesInFlight.delete(toolApprovalId);
+			},
+			markExecuted: () => {
+				toolWritesInFlight.delete(toolApprovalId);
+				updateToolApproval(toolApprovalId, { status: "executed", error: null });
+			},
+			failed,
 		});
-	} catch (err) {
-		rollback();
-		return failed(`comment_failed: ${(err as Error).message}`);
+		return { ...out, toolApproval: getToolApproval(toolApprovalId) };
+	} finally {
+		toolWritesInFlight.delete(toolApprovalId);
 	}
-
-	appendAudit({ ...base, result: "executed", commentUrl: comment.html_url ?? null });
-	const updated = updateFinding(finding.id, { status: "executed" });
-	return { ok: true, result: "executed", commentUrl: comment.html_url ?? null, finding: updated };
 }

@@ -3,6 +3,7 @@
 // 字段钉死：ts 时间、botId、intent 摘要（kind / repo / prNumber / bodyLength /
 // bodyPreview——只存摘要与预览，绝不存任何秘密）、result、reason、findingId、
 // approvalId（本批与 findingId 同值，收件箱即按 Finding 审批）、commentUrl（执行成功时）。
+// P2-3 起另带 toolApprovalId（对话工具待批的审计追溯键，Finding 路径恒 null）。
 // 文件路径可用环境变量 PIPER_AUDIT_FILE 覆盖（仅供单元测试隔离，缺省走 data/）。
 import { appendFileSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -36,6 +37,8 @@ export interface AuditEntry {
 	reason: string | null;
 	findingId: string | null;
 	approvalId: string | null;
+	// 对话工具待批（P2-3）的审计按此 id 追溯；Finding 路径恒为 null。
+	toolApprovalId: string | null;
 	commentUrl: string | null;
 }
 
@@ -68,6 +71,7 @@ export function appendAudit({
 	reason = null,
 	findingId = null,
 	approvalId = null,
+	toolApprovalId = null,
 	commentUrl = null,
 }: {
 	botId?: string | null;
@@ -76,6 +80,7 @@ export function appendAudit({
 	reason?: string | null;
 	findingId?: string | null;
 	approvalId?: string | null;
+	toolApprovalId?: string | null;
 	commentUrl?: string | null;
 }): AuditEntry {
 	if (!(AUDIT_RESULTS as readonly string[]).includes(result)) throw new Error(`未知审计结果: ${result}`);
@@ -89,6 +94,7 @@ export function appendAudit({
 		reason: typeof reason === "string" ? redact(reason) : reason,
 		findingId,
 		approvalId,
+		toolApprovalId,
 		commentUrl,
 	};
 	ensureData();
@@ -113,9 +119,10 @@ function readAll(): AuditEntry[] {
 }
 
 // 按 findingId 追溯（收件箱错误展示与验收追审计都走这里），时间正序（先发生先排）。
-export function listAudit({ findingId }: { findingId?: string } = {}): AuditEntry[] {
+// toolApprovalId 同理（P2-3 对话工具待批的审计追溯）。
+export function listAudit({ findingId, toolApprovalId }: { findingId?: string; toolApprovalId?: string } = {}): AuditEntry[] {
 	return readAll()
-		.filter((r) => findingId === undefined || r.findingId === findingId)
+		.filter((r) => (findingId === undefined || r.findingId === findingId) && (toolApprovalId === undefined || r.toolApprovalId === toolApprovalId))
 		.sort((a, b) => String(a.ts).localeCompare(String(b.ts)));
 }
 

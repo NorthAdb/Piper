@@ -30,6 +30,9 @@
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
 // POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
 // POST /api/approvals/:id/edit {body} 改评论正文（切片二）：open 直接改；approved 改文同时作废原批准退回 open；已关闭/executing 回 409；空正文/超长/疑似含密钥回 400；改动写审计 edited
+// 工具待批（P2-3）：GET /api/approvals 同时返回 kind:"tool_call" 的工具待批项（每项带 kind 与 Finding 区分）；
+//   POST 对 ta-… id 同样有效——approve 置 approved 并触发循环放行（原 run 或重启后恢复，不 await 续跑到底），
+//   reject 置 rejected（原 run 还在等待时以 deny 放行收尾）；edit 对 ta-… 回 409（本件不支持改参）
 // POST /api/findings/ad-hoc {repo, prNumber} 即席开单（切片二，/api/findings 下唯一的写路由）：对指定 PR 即时取证开 pr_needs_review 事项（判定与扫描同一套）；已有同键未关闭/冷却中事项回 200 {existing:true}；已合并/关闭/draft/已批准回 409；PR 不存在回 404；仓库未绑定任何 bot 回 400
 // GET /api/audit 网关审计记录（可按 findingId 过滤）：denied / approved / executing / executed / failed / rejected
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
@@ -92,8 +95,11 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.ts";
-import { botSelfFacts, modelConfig, streamChat, testModelConfig, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { botSelfFacts, getLiveAgent, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
 import type { ChatEvent} from "./lib/kernel.ts";
+import { githubCommentToolsForBot } from "./lib/github-comment.ts";
+import { getToolApproval, listToolApprovalViews, toToolApprovalView, toolIntentSnapshotOf, updateToolApproval } from "./lib/tool-approvals.ts";
+import type { ToolApproval } from "./lib/tool-approvals.ts";
 import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.ts";
 import type { Finding} from "./lib/findings.ts";
 import type { ModelSettings} from "./lib/settings.ts";
@@ -107,7 +113,7 @@ import { createAdHocReviewFinding, runMorningScan} from "./lib/scan.ts";
 import { getFinding, listFindings} from "./lib/findings.ts";
 import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.ts";
 import { approveApproval, editApprovalBody, getApproval, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
-import { listAudit} from "./lib/audit.ts";
+import { appendAudit, listAudit} from "./lib/audit.ts";
 
 const PORT = Number(process.env.PORT || 4310);
 const HOST = process.env.PIPER_HOST || "127.0.0.1";
@@ -250,181 +256,396 @@ return (event, data) => res.write(`event: ${event}\ndata: ${JSON.stringify(data)
 }
 
 async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<void> {
-const { botId, message} = await readBody(req);
-const bot = getBot(String(botId || ""));
-if (!bot) return sendJson(res, 404, { error: "bot 不存在"});
-if (!message || typeof message!== "string") return sendJson(res, 400, { error: "message 必填"});
-const emit = sse(res);
-const sessionId = `s-${Date.now().toString(36)}`;
-emit("session", { botId: bot.id, sessionId});
-appendSession(bot.id, { role: "user", text: message, sessionId});
+	const { botId, message } = await readBody(req);
+	const bot = getBot(String(botId || ""));
+	if (!bot) return sendJson(res, 404, { error: "bot 不存在" });
+	if (!message || typeof message !== "string") return sendJson(res, 400, { error: "message 必填" });
+	const emit = sse(res);
+	// SSE 一旦结束（待批先行收尾或正常收尾），后续浮动续跑的事件不再往
+	// 已关闭的响应里写；落盘照常进行，用户重开会话即可看到最终态。
+	let responseEnded = false;
+	const emitLive = (event: string, data: unknown): void => {
+		if (!responseEnded) emit(event, data);
+	};
+	const sessionId = `s-${Date.now().toString(36)}`;
+	emit("session", { botId: bot.id, sessionId });
+	appendSession(bot.id, { role: "user", text: message, sessionId });
 
-// 主 bot 建 bot：对话里识别建 bot 意图 -> 生成草案卡，未确认不落库（规格二）
-if (bot.canManageBots && looksLikeCreateBotIntent(message)) {
-const draft = (await extractDraftWithModel(message))?? extractDraftByRules(message);
-appendSession(bot.id, { role: "system", kind: "draft", text: `生成 Bot 草案卡：${draft.name}`, draft});
-emit("system", { kind: "draft", text: `已按你的描述生成 Bot 草案卡（来源：${draft.source === "model"? "模型抽取": "规则兜底"}），确认后才会创建。`});
-emit("draft", { draft});
-emit("done", { botId: bot.id});
-res.end();
-return;
+	// 主 bot 建 bot：对话里识别建 bot 意图 -> 生成草案卡，未确认不落库（规格二）
+	if (bot.canManageBots && looksLikeCreateBotIntent(message)) {
+		const draft = (await extractDraftWithModel(message)) ?? extractDraftByRules(message);
+		appendSession(bot.id, { role: "system", kind: "draft", text: `生成 Bot 草案卡：${draft.name}`, draft });
+		emit("system", { kind: "draft", text: `已按你的描述生成 Bot 草案卡（来源：${draft.source === "model" ? "模型抽取" : "规则兜底"}），确认后才会创建。` });
+		emit("draft", { draft });
+		emit("done", { botId: bot.id });
+		res.end();
+		return;
+	}
+
+	// 工具调用落盘前的深脱敏：会话 JSONL 是秘密禁入面，appendSession 只脱 text 字段，
+	// tool 条目的 args/result 是结构化字段，落盘前逐个字符串过 redact()（复用统一出口）。
+	function redactDeep(value: unknown): unknown {
+		if (typeof value === "string") return redact(value);
+		if (Array.isArray(value)) return value.map(redactDeep);
+		if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
+		return value;
+	}
+
+	// 本轮的思考段与工具条目共用一个递增 seq：条目定型时按事件发生顺序领号，
+	// 回合结束按 seq 排序一并落盘，前端刷新回来据此还原与直播一致的交错顺序。
+	let leadSeq = 0;
+	const leadThinkingEntries: SessionEntry[] = [];
+
+	// 本轮工具调用按 toolCallId 收集：直播事件只透传不落盘，回合结束时把最终态逐条写进
+	// 会话流水、排在 assistant（或 error）条目之前，前端刷新/切 bot 回来据此还原工具卡。
+	// end 事件到达时领 seq（与思考段的定型顺序共用一本账），决定它在流水中的位置。
+	// 轨迹时间（PR-D）：同时记事件时刻——firstSeenAt 是服务端首次观察到该调用
+	// （call 阶段）的时刻，startedAt 是 start 阶段（工具开始执行）的时刻，
+	// endedAt 是 end 阶段的时刻；落盘时在 persistLead 里定型为
+	// startedAt/endedAt/durationMs（缺失回落口径见那里）。
+	interface ToolRec {
+		toolCallId: string;
+		name: string;
+		args: unknown;
+		status: string;
+		result: unknown;
+		seq: number | undefined;
+		firstSeenAt: number | undefined;
+		startedAt: number | undefined;
+		endedAt: number | undefined;
+	}
+	const toolCalls = new Map<string, ToolRec>();
+	// 待批（P2-3）：pending 事件一到就把本轮未结束的调用先落盘为 pending——
+	// 进程随后重启，恢复路径靠这批条目重建 transcript；回合收尾时已落盘的
+	// pending 条目不重复写（仍是 pending 的跳过，有了终态的另写一条终态）。
+	const persistedPendingIds = new Set<string>();
+	let turnHadPending = false;
+	const persistPendingEntries = (): void => {
+		for (const rec of toolCalls.values()) {
+			if (rec.endedAt !== undefined || persistedPendingIds.has(rec.toolCallId)) continue;
+			if (rec.seq === undefined) rec.seq = leadSeq++;
+			const nowTs = Date.now();
+			appendSession(bot.id, {
+				role: "tool",
+				toolCallId: rec.toolCallId,
+				name: rec.name,
+				args: redactDeep(rec.args),
+				status: "pending",
+				result: null,
+				seq: rec.seq,
+				startedAt: rec.startedAt ?? rec.firstSeenAt ?? nowTs,
+				endedAt: nowTs,
+				durationMs: 0,
+				sessionId,
+			});
+			persistedPendingIds.add(rec.toolCallId);
+		}
+	};
+	const collectTool = (e: ChatEvent & { type: "tool" }): void => {
+		const id = e.toolCallId || `${e.name}:${toolCalls.size}`;
+		const rec: ToolRec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined, firstSeenAt: undefined, startedAt: undefined, endedAt: undefined };
+		if (rec.firstSeenAt === undefined) rec.firstSeenAt = Date.now();
+		if (e.name) rec.name = e.name;
+		if (e.phase === "start" && rec.startedAt === undefined) rec.startedAt = Date.now();
+		if (e.phase === "pending") rec.status = "pending";
+		if (e.phase === "end") {
+			rec.status = (e.detail as { isError?: unknown } | null | undefined)?.isError ? "error" : "complete";
+			rec.result = e.detail ?? null;
+			rec.endedAt = Date.now();
+			if (rec.seq === undefined) rec.seq = leadSeq++;
+		} else if (e.detail != null) {
+			rec.args = e.detail;
+		}
+		toolCalls.set(id, rec);
+		if (e.phase === "pending") {
+			turnHadPending = true;
+			persistPendingEntries();
+		}
+	};
+
+	// 思考链落盘（按段定型）：直播时逐段透传 SSE thinking 事件（带生效挡位 level
+	// 与段号 seg），服务端按事件流切段——段在工具事件、正文 delta 或回合结束时
+	// 关闭；关闭时定型为一条 role:"thinking" 条目，带 seq（与 tool 条目共用）、
+	// durationMs（段首个 thinking 事件到段关闭）、startedAt（段首个 thinking
+	// 事件的时刻，轨迹时间用，PR-D）与 level（生效挡位）。空段（只有
+	// 空白）不落盘。单段文本落盘上限 THINKING_PERSIST_MAX_CHARS，超出截断并以
+	// truncated 标明；text 字段由 appendSession 统一过 redact（与 tool 条目同一
+	// 秘密禁入面）。思考不回喂模型（kernel 的 toPiMessages 只取 user/assistant
+	// 条目）。旧落盘形状（整轮一条、无 seq/durationMs/level）由前端读回兼容。
+	const THINKING_PERSIST_MAX_CHARS = 16_000;
+	let openSeg: { text: string; startedAt: number; level: string; index: number } | null = null;
+	let segIndex = 0;
+	const closeThinkingSeg = (): void => {
+		if (!openSeg) return;
+		const seg = openSeg;
+		openSeg = null;
+		if (!seg.text.trim()) return;
+		const truncated = seg.text.length > THINKING_PERSIST_MAX_CHARS;
+		leadThinkingEntries.push({
+			role: "thinking",
+			text: truncated ? seg.text.slice(0, THINKING_PERSIST_MAX_CHARS) : seg.text,
+			truncated,
+			seq: leadSeq++,
+			durationMs: Math.max(0, Date.now() - seg.startedAt),
+			startedAt: seg.startedAt,
+			level: seg.level,
+			sessionId,
+		});
+	};
+
+	// 回合收尾落盘：先关掉仍开着的思考段，再把思考段与工具条目按 seq 合并排序
+	// 逐条写进会话流水（排在 assistant 或 error 条目之前）。
+	const persistLead = (): void => {
+		closeThinkingSeg();
+		const toolEntries: SessionEntry[] = [];
+		for (const rec of toolCalls.values()) {
+			// 状态定型：pending 保持 pending（不得写成 error——待批不是失败）；
+			// 仍是 running 的：本轮有待批且该调用从未 start，是同批被闸拦下的
+			// 后续调用，同样记 pending；其余（已 start 未 end）维持中断记 error
+			// 的旧口径。已在 pending 事件时落盘且仍为 pending 的不重复写。
+			let status = rec.status;
+			if (status === "running") status = turnHadPending && rec.startedAt === undefined ? "pending" : "error";
+			if (status === "pending" && persistedPendingIds.has(rec.toolCallId)) continue;
+			if (rec.seq === undefined) rec.seq = leadSeq++;
+			// 轨迹时间定型（PR-D）：endedAt 取 end 事件时刻；回合结束仍无 end 的中断
+			// 调用以收尾落盘时刻为 endedAt（口径：至少持续到回合结束）。startedAt 取
+			// start 阶段时刻，缺失回落首次观察时刻（call 阶段），再缺失回落 endedAt
+			// （durationMs=0）。durationMs 恒为 endedAt - startedAt（不为负）。
+			const endedAt = rec.endedAt ?? Date.now();
+			const startedAt = rec.startedAt ?? rec.firstSeenAt ?? endedAt;
+			toolEntries.push({
+				role: "tool",
+				toolCallId: rec.toolCallId,
+				name: rec.name,
+				args: redactDeep(rec.args),
+				status,
+				result: redactDeep(rec.result),
+				seq: rec.seq,
+				startedAt,
+				endedAt,
+				durationMs: Math.max(0, endedAt - startedAt),
+				sessionId,
+			});
+		}
+		for (const entry of [...leadThinkingEntries, ...toolEntries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
+			appendSession(bot.id, entry);
+		}
+	};
+
+	const history = readSession(bot.id);
+	let finalText = "";
+	let streamError: unknown = null;
+	let resolvePendingSeen: () => void = () => {};
+	const pendingSeen = new Promise<void>((r) => {
+		resolvePendingSeen = r;
+	});
+	const run = streamChat({
+		systemPrompt: `${bot.systemPrompt}\n\n${botSelfFacts(bot, { runsMorningScan: morningRoutine()?.botId === bot.id })}\n\n\n${readAboutMe()}`,
+		history,
+		message,
+		botId: bot.id,
+		sessionId,
+		tools: [...webToolsForBot(bot), ...githubCommentToolsForBot(bot, sessionId)],
+		onEvent: (e) => {
+			if (e.type === "delta") {
+				// 正文出现即关闭当前思考段（思考→正文→思考是两段，不是一段）
+				closeThinkingSeg();
+				emitLive("delta", { text: e.text });
+			} else if (e.type === "thinking") {
+				if (!openSeg) openSeg = { text: "", startedAt: Date.now(), level: e.level ?? "off", index: segIndex++ };
+				const segStart = openSeg.text.length === 0;
+				openSeg.text += e.text;
+				emitLive("thinking", { text: e.text, level: openSeg.level, seg: openSeg.index, ...(segStart ? { segStart: true } : {}) });
+			} else if (e.type === "tool") {
+				// 工具调用打断思考段：先关段，工具条目在 end 时领到更大的 seq，顺序不乱
+				closeThinkingSeg();
+				collectTool(e);
+				emitLive("tool", { phase: e.phase, name: e.name, toolCallId: e.toolCallId, detail: e.detail });
+				if (e.phase === "pending") resolvePendingSeen();
+			}
+		},
+	});
+	trackBackgroundRun(run);
+	const settled = run.then(
+		(t) => {
+			finalText = t.text;
+			return "settled" as const;
+		},
+		(err) => {
+			streamError = err;
+			return "settled" as const;
+		},
+	);
+	// 回合收尾（正常结束与待批后浮动结束共用一份）：先落 lead，再写
+	// assistant 或 error 条目。待批路径里 SSE 已经结束，emitLive 自动静默，
+	// 落盘照常——批准在原 run 里放行后，本轮的最终态从这里补齐。
+	const finishTurn = (): void => {
+		persistLead();
+		if (streamError) {
+			// 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
+			// 这里是其余错误路径的兜底出口。
+			const e = streamError as { message?: unknown; code?: string } | null;
+			const safeMessage = redact(String(e?.message ?? streamError)).slice(0, 300);
+			appendSession(bot.id, { role: "system", kind: "error", text: safeMessage, code: e?.code ?? "ERROR", sessionId });
+			emitLive("error", { code: e?.code ?? "ERROR", message: safeMessage });
+		} else {
+			appendSession(bot.id, { role: "assistant", text: finalText, sessionId });
+		}
+	};
+	const outcome = await Promise.race([settled, pendingSeen.then(() => "pending" as const)]);
+	if (outcome === "pending") {
+		// 待批收尾（P2-3）：pending 相位已经透传、待批条目已经落盘，本条 SSE
+		// 到此发 done 结束，不把 HTTP 请求无限挂起等批准。run 本身不停：
+		// 它停泊在循环闸的等待上，批准（原 run 放行或重启后恢复）后由
+		// settled 的回调补齐本轮落盘。
+		void settled.then(() => finishTurn());
+		emit("done", { botId: bot.id });
+		responseEnded = true;
+		res.end();
+		return;
+	}
+	finishTurn();
+	emit("done", { botId: bot.id });
+	responseEnded = true;
+	res.end();
 }
 
-// 工具调用落盘前的深脱敏：会话 JSONL 是秘密禁入面，appendSession 只脱 text 字段，
-// tool 条目的 args/result 是结构化字段，落盘前逐个字符串过 redact()（复用统一出口）。
-function redactDeep(value: unknown): unknown {
-if (typeof value === "string") return redact(value);
-if (Array.isArray(value)) return value.map(redactDeep);
-if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, redactDeep(v)]));
-return value;
+// ---------- 工具待批的批准 / 驳回（P2-3）：与 Finding 共用 /api/approvals 路由 ----------
+// 批准只做两件事：把记录置 approved 并写审计，然后触发放行——原 Agent 还
+// 活着就 resolveToolCall 在原 run 里继续；不在（进程重启过）就走 kernel 的
+// 恢复路径从会话 JSONL 重建后 resolve。触发后不 await 整个续跑（续跑可能
+// 再停在同批下一个 ask 上），执行结果由网关写进记录状态（executed /
+// 保持 approved 可重试），接口立即返回记录视图。
+function conflictError(message: string): Error & { status: number } {
+	return Object.assign(new Error(message), { status: 409 });
 }
 
-// 本轮的思考段与工具条目共用一个递增 seq：条目定型时按事件发生顺序领号，
-// 回合结束按 seq 排序一并落盘，前端刷新回来据此还原与直播一致的交错顺序。
-let leadSeq = 0;
-const leadThinkingEntries: SessionEntry[] = [];
-
-// 本轮工具调用按 toolCallId 收集：直播事件只透传不落盘，回合结束时把最终态逐条写进
-// 会话流水、排在 assistant（或 error）条目之前，前端刷新/切 bot 回来据此还原工具卡。
-// end 事件到达时领 seq（与思考段的定型顺序共用一本账），决定它在流水中的位置。
-// 轨迹时间（PR-D）：同时记事件时刻——firstSeenAt 是服务端首次观察到该调用
-// （call 阶段）的时刻，startedAt 是 start 阶段（工具开始执行）的时刻，
-// endedAt 是 end 阶段的时刻；落盘时在 persistLead 里定型为
-// startedAt/endedAt/durationMs（缺失回落口径见那里）。
-interface ToolRec {
-toolCallId: string;
-name: string;
-args: unknown;
-status: string;
-result: unknown;
-seq: number | undefined;
-firstSeenAt: number | undefined;
-startedAt: number | undefined;
-endedAt: number | undefined;
-}
-const toolCalls = new Map<string, ToolRec>();
-const collectTool = (e: ChatEvent & { type: "tool" }): void => {
-const id = e.toolCallId || `${e.name}:${toolCalls.size}`;
-const rec: ToolRec = toolCalls.get(id) ?? { toolCallId: id, name: e.name, args: null, status: "running", result: null, seq: undefined, firstSeenAt: undefined, startedAt: undefined, endedAt: undefined };
-if (rec.firstSeenAt === undefined) rec.firstSeenAt = Date.now();
-if (e.name) rec.name = e.name;
-if (e.phase === "start" && rec.startedAt === undefined) rec.startedAt = Date.now();
-if (e.phase === "end") {
-rec.status = (e.detail as { isError?: unknown } | null | undefined)?.isError ? "error" : "complete";
-rec.result = e.detail ?? null;
-rec.endedAt = Date.now();
-if (rec.seq === undefined) rec.seq = leadSeq++;
-} else if (e.detail != null) {
-rec.args = e.detail;
-}
-toolCalls.set(id, rec);
-};
-
-// 思考链落盘（按段定型）：直播时逐段透传 SSE thinking 事件（带生效挡位 level
-// 与段号 seg），服务端按事件流切段——段在工具事件、正文 delta 或回合结束时
-// 关闭；关闭时定型为一条 role:"thinking" 条目，带 seq（与 tool 条目共用）、
-// durationMs（段首个 thinking 事件到段关闭）、startedAt（段首个 thinking
-// 事件的时刻，轨迹时间用，PR-D）与 level（生效挡位）。空段（只有
-// 空白）不落盘。单段文本落盘上限 THINKING_PERSIST_MAX_CHARS，超出截断并以
-// truncated 标明；text 字段由 appendSession 统一过 redact（与 tool 条目同一
-// 秘密禁入面）。思考不回喂模型（kernel 的 toPiMessages 只取 user/assistant
-// 条目）。旧落盘形状（整轮一条、无 seq/durationMs/level）由前端读回兼容。
-const THINKING_PERSIST_MAX_CHARS = 16_000;
-let openSeg: { text: string; startedAt: number; level: string; index: number } | null = null;
-let segIndex = 0;
-const closeThinkingSeg = (): void => {
-if (!openSeg) return;
-const seg = openSeg;
-openSeg = null;
-if (!seg.text.trim()) return;
-const truncated = seg.text.length > THINKING_PERSIST_MAX_CHARS;
-leadThinkingEntries.push({
-role: "thinking",
-text: truncated ? seg.text.slice(0, THINKING_PERSIST_MAX_CHARS) : seg.text,
-truncated,
-seq: leadSeq++,
-durationMs: Math.max(0, Date.now() - seg.startedAt),
-startedAt: seg.startedAt,
-level: seg.level,
-sessionId,
-});
-};
-
-// 回合收尾落盘：先关掉仍开着的思考段，再把思考段与工具条目按 seq 合并排序
-// 逐条写进会话流水（排在 assistant 或 error 条目之前）。
-const persistLead = (): void => {
-closeThinkingSeg();
-const toolEntries: SessionEntry[] = [];
-for (const rec of toolCalls.values()) {
-if (rec.seq === undefined) rec.seq = leadSeq++;
-// 轨迹时间定型（PR-D）：endedAt 取 end 事件时刻；回合结束仍无 end 的中断
-// 调用以收尾落盘时刻为 endedAt（口径：至少持续到回合结束）。startedAt 取
-// start 阶段时刻，缺失回落首次观察时刻（call 阶段），再缺失回落 endedAt
-// （durationMs=0）。durationMs 恒为 endedAt - startedAt（不为负）。
-const endedAt = rec.endedAt ?? Date.now();
-const startedAt = rec.startedAt ?? rec.firstSeenAt ?? endedAt;
-toolEntries.push({
-role: "tool",
-toolCallId: rec.toolCallId,
-name: rec.name,
-args: redactDeep(rec.args),
-// 回合已结束仍无 end 事件的调用视为中断，落盘为 error 而不是永远 running
-status: rec.status === "running" ? "error" : rec.status,
-result: redactDeep(rec.result),
-seq: rec.seq,
-startedAt,
-endedAt,
-durationMs: Math.max(0, endedAt - startedAt),
-sessionId,
-});
-}
-for (const entry of [...leadThinkingEntries, ...toolEntries].sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0))) {
-appendSession(bot.id, entry);
-}
-};
-
-const history = readSession(bot.id);
-try {
-const { text} = await streamChat({
-systemPrompt: `${bot.systemPrompt}\n\n${botSelfFacts(bot, { runsMorningScan: morningRoutine()?.botId === bot.id })}\n\n\n${readAboutMe()}`,
-history,
-message,
-tools: webToolsForBot(bot),
-onEvent: (e) => {
-if (e.type === "delta") {
-// 正文出现即关闭当前思考段（思考→正文→思考是两段，不是一段）
-closeThinkingSeg();
-emit("delta", { text: e.text});
-}
-else if (e.type === "thinking") {
-if (!openSeg) openSeg = { text: "", startedAt: Date.now(), level: e.level ?? "off", index: segIndex++ };
-const segStart = openSeg.text.length === 0;
-openSeg.text += e.text;
-emit("thinking", { text: e.text, level: openSeg.level, seg: openSeg.index, ...(segStart ? { segStart: true } : {}) });
-}
-else if (e.type === "tool") {
-// 工具调用打断思考段：先关段，工具条目在 end 时领到更大的 seq，顺序不乱
-closeThinkingSeg();
-collectTool(e);
-emit("tool", { phase: e.phase, name: e.name, toolCallId: e.toolCallId, detail: e.detail});
-}
-},
-});
-persistLead();
-appendSession(bot.id, { role: "assistant", text, sessionId});
-} catch (err) {
-persistLead();
-// 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
-// 这里是其余错误路径的兜底出口。
-const e = err as { message?: unknown; code?: string } | null | undefined;
-const safeMessage = redact(String(e?.message?? err)).slice(0, 300);
-appendSession(bot.id, { role: "system", kind: "error", text: safeMessage, code: e?.code?? "ERROR"});
-emit("error", { code: e?.code?? "ERROR", message: safeMessage});
-}
-emit("done", { botId: bot.id});
-res.end();
+// 恢复续跑的落盘器：工具条目在 end 事件即时落盘（进程再重启也不丢），
+// assistant 文本在续跑结束时补上；seq 接在该会话既有最大值之后。
+function continuationPersister(botId: string, sessionId: string) {
+	let nextSeq = readSession(botId).reduce((max, e) => Math.max(max, e.seq ?? 0), 0) + 1;
+	const argsByCall = new Map<string, unknown>();
+	return {
+		onEvent(e: ChatEvent): void {
+			if (e.type !== "tool") return;
+			if (e.phase === "call" || e.phase === "pending") {
+				if (e.detail != null) argsByCall.set(e.toolCallId, e.detail);
+				if (e.phase === "pending") {
+					appendSession(botId, {
+						role: "tool",
+						toolCallId: e.toolCallId,
+						name: e.name,
+						args: argsByCall.get(e.toolCallId) ?? null,
+						status: "pending",
+						result: null,
+						seq: nextSeq++,
+						sessionId,
+					});
+				}
+				return;
+			}
+			if (e.phase === "end") {
+				const isError = (e.detail as { isError?: unknown } | null | undefined)?.isError;
+				appendSession(botId, {
+					role: "tool",
+					toolCallId: e.toolCallId,
+					name: e.name,
+					args: argsByCall.get(e.toolCallId) ?? null,
+					status: isError ? "error" : "complete",
+					result: e.detail ?? null,
+					seq: nextSeq++,
+					sessionId,
+				});
+			}
+		},
+		finish(text: string): void {
+			appendSession(botId, { role: "assistant", text, sessionId });
+		},
+		fail(err: unknown): void {
+			const e = err as { message?: unknown; code?: string } | null;
+			appendSession(botId, {
+				role: "system",
+				kind: "error",
+				text: redact(String(e?.message ?? err)).slice(0, 300),
+				code: e?.code ?? "ERROR",
+				sessionId,
+			});
+		},
+	};
 }
 
+function approveToolApprovalById(id: string): ToolApproval | null {
+	const record = getToolApproval(id);
+	if (!record) return null;
+	if (record.status === "executed" || record.status === "rejected" || record.status === "cancelled" || record.status === "failed") {
+		throw conflictError(`该工具待批已关闭（当前状态 ${record.status}），不能再批准`);
+	}
+	let current = record;
+	if (record.status === "pending") {
+		current = updateToolApproval(id, { status: "approved", error: null });
+		appendAudit({
+			botId: record.botId,
+			intent: toolIntentSnapshotOf(record),
+			result: "approved",
+			toolApprovalId: id,
+		});
+	}
+	const live = getLiveAgent(record.sessionId);
+	if (live) {
+		trackBackgroundRun(live.resolveToolCall(record.toolCallId, { decision: "allow" }));
+	} else {
+		const persister = continuationPersister(record.botId, record.sessionId);
+		trackBackgroundRun(
+			resumeToolApproval({
+				botId: record.botId,
+				sessionId: record.sessionId,
+				toolCallId: record.toolCallId,
+				decision: "allow",
+				onEvent: persister.onEvent,
+			}).then(
+				({ text }) => persister.finish(text),
+				(err) => persister.fail(err),
+			),
+		);
+	}
+	return current;
+}
+
+function rejectToolApprovalById(id: string): ToolApproval | null {
+	const record = getToolApproval(id);
+	if (!record) return null;
+	if (record.status !== "pending" && record.status !== "approved") {
+		throw conflictError(`该工具待批已关闭（当前状态 ${record.status}），不能再驳回`);
+	}
+	const next = updateToolApproval(id, { status: "rejected", error: null });
+	appendAudit({
+		botId: record.botId,
+		intent: toolIntentSnapshotOf(record),
+		result: "rejected",
+		reason: "rejected_by_user",
+		toolApprovalId: id,
+	});
+	if (record.status === "pending") {
+		const live = getLiveAgent(record.sessionId);
+		if (live) {
+			// 原 run 还停在等待上：以 deny 放行让它干净收尾（工具结果为拒绝，
+			// 本轮落盘由 handleChat 的浮动收尾补齐）。
+			trackBackgroundRun(live.resolveToolCall(record.toolCallId, { decision: "deny" }));
+		} else {
+			// 没有活 run：给会话补一条终态 tool 条目，免得历史里永远挂 pending。
+			appendSession(record.botId, {
+				role: "tool",
+				toolCallId: record.toolCallId,
+				name: record.toolName,
+				args: record.argsSnapshot ?? null,
+				status: "error",
+				result: { isError: true, error: "用户已驳回，未执行" },
+				sessionId: record.sessionId,
+			});
+		}
+	}
+	return next;
+}
 // ---------- 晨间扫描执行（手动触发与定时调度共用同一条路径，L0-5 通知语义只写一份） ----------
 // 重入防护：同一时刻只允许一轮扫描；已有运行在途时返回 { skipped: true }，手动路由据此回 409、
 // 调度器据此跳过本 tick。整轮失败（全部仓库取证失败）不报成功：状态记 failed 并发失败通知；
@@ -704,9 +925,15 @@ if (artMatch && req.method === "GET") {
 const art = readArtifact(artMatch[1]);
 return art? sendJson(res, 200, { artifact: art}): sendJson(res, 404, { error: "产物不存在"});
 }
-if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: listApprovals(), closed: listClosedApprovals()});
+if (path === "/api/approvals" && req.method === "GET") return sendJson(res, 200, { approvals: [...listApprovals().map((v) => ({ ...v, kind: "finding" })), ...listToolApprovalViews()], closed: [...listClosedApprovals().map((v) => ({ ...v, kind: "finding" })), ...listToolApprovalViews({ closed: true })]});
 const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject|edit)$/);
 if (approvalMatch && req.method === "POST") {
+// 工具待批（ta-…）与 Finding 共用批准/驳回路由，按 id 前缀分发（P2-3）。
+if (approvalMatch[1].startsWith("ta-")) {
+if (approvalMatch[2] === "edit") throw Object.assign(new Error("工具待批暂不支持修改参数"), { status: 409 });
+const handled = approvalMatch[2] === "approve" ? approveToolApprovalById(approvalMatch[1]) : rejectToolApprovalById(approvalMatch[1]);
+return handled ? sendJson(res, 200, { approval: toToolApprovalView(handled) }) : sendJson(res, 404, { error: "待批项不存在" });
+}
 if (approvalMatch[2] === "approve") {
 const body = await readBody(req);
 const out = await approveApproval(approvalMatch[1], { intentHash: typeof body.intentHash === "string"? body.intentHash: undefined});
