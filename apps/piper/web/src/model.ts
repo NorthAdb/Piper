@@ -226,6 +226,22 @@ export type ToolApprovalItem = {
 // 收件箱条目联合：kind 区分 Finding 待批与对话工具待批
 export type InboxItem = Approval | ToolApprovalItem;
 
+// 工具注册表项（GET /api/bots/:id/tools，P2-5）：形状与服务端
+// lib/tool-registry.ts 的 ToolRegistryItem 锁定一致。parameters 是
+// JSON Schema（与交给模型的同一份）；implemented:false / 非 offered
+// 的项没有真正提供给模型，页签如实展示。
+export type ToolRegistryItem = {
+	name: string;
+	label: string;
+	description: string;
+	parameters: unknown;
+	source: { kind: "builtin" | "connector" | "extension"; id: string };
+	registeredBy: string;
+	modelExposure: "offered" | "deferred" | "hidden";
+	policy: "allow" | "ask" | "deny";
+	implemented: boolean;
+};
+
 // 批准执行的网关结果（POST /api/approvals/:id/approve 的 execution 字段，P1-6）
 export type ApprovalExecution = {
 	ok: boolean;

@@ -11,6 +11,7 @@
 // PUT /api/bots/:id 编辑 bot
 // DELETE /api/bots/:id 删除 bot（主 bot 不可删）
 // POST /api/bots/draft-confirm {draft} 草案卡确认落库（未确认不落库）
+// GET /api/bots/:id/tools 该 bot 的工具注册表全文（P2-5，lib/tool-registry.ts；bot 不存在回 404）
 // GET /api/bots/:id/messages 该 bot 的会话流水（JSONL 读出）
 // GET /api/bots/:id/trace 轨迹数据（PR-D，lib/trace.ts）：会话流水按轮归一化为
 //   {turns:[{index,startedAt,endedAt,durationMs,events}]}，时间统一 epoch 毫秒、
@@ -106,10 +107,10 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.ts";
-import { abortLiveRun, botSelfFacts, getLiveAgent, hasLiveRun, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { abortLiveRun, botSelfFacts, getLiveAgent, hasLiveRun, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.ts";
 import { isToolWriteInFlight } from "./lib/gateway.ts";
 import type { ChatEvent} from "./lib/kernel.ts";
-import { githubCommentToolsForBot } from "./lib/github-comment.ts";
+import { toolRegistryForBot } from "./lib/tool-registry.ts";
 import { findToolApprovalByToolCall, getToolApproval, listToolApprovals, listToolApprovalViews, toToolApprovalView, toolIntentSnapshotOf, updateToolApproval, updateToolApprovalBody } from "./lib/tool-approvals.ts";
 import type { ToolApproval } from "./lib/tool-approvals.ts";
 import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.ts";
@@ -457,7 +458,6 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
 		message,
 		botId: bot.id,
 		sessionId,
-		tools: [...webToolsForBot(bot), ...githubCommentToolsForBot(bot, sessionId)],
 		onEvent: (e) => {
 			if (e.type === "delta") {
 				// 正文出现即关闭当前思考段（思考→正文→思考是两段，不是一段）
@@ -650,7 +650,17 @@ function approveToolApprovalById(id: string): ToolApproval | null {
 	}
 	const live = getLiveAgent(record.sessionId);
 	if (live) {
-		trackBackgroundRun(live.resolveToolCall(record.toolCallId, { decision: "allow" }));
+		// 快照回传（P2-5，#33 MAJOR-2 宿主契约）：放行时把落盘的
+		// argsSnapshot 作为最终参数交回基座（基座会按 schema 复验后
+		// 执行）——pending 时改过的正文以快照为准，不用原 run 里挂起的
+		// 原始参数。活 run 的挂起参数与记录同源（记录就是由它落盘的），
+		// 不存在第二份可冲突的参数；冲突判定在恢复路径（流水重建）上。
+		trackBackgroundRun(
+			live.resolveToolCall(record.toolCallId, {
+				decision: "allow",
+				...(record.argsSnapshot != null ? { arguments: record.argsSnapshot } : {}),
+			}),
+		);
 	} else {
 		const persister = continuationPersister(record.botId, record.sessionId);
 		trackBackgroundRun(
@@ -938,6 +948,15 @@ const traceMatch = path.match(/^\/api\/bots\/([\w-]+)\/trace$/);
 if (traceMatch && req.method === "GET") {
 if (!getBot(traceMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});
 return sendJson(res, 200, buildTrace(readSession(traceMatch[1])));
+}
+// 工具注册表（P2-5）：该 bot 的工具清单全文（含参数 schema 与未物化
+// 的声明项），供右栏「工具」页签核对；内容来自 lib/tool-registry.ts，
+// 与实际物化给模型的集合同一来源，不含任何秘密。
+const botToolsMatch = path.match(/^\/api\/bots\/([\w-]+)\/tools$/);
+if (botToolsMatch && req.method === "GET") {
+const bot = getBot(botToolsMatch[1]);
+if (!bot) return sendJson(res, 404, { error: "bot 不存在"});
+return sendJson(res, 200, { botId: bot.id, tools: toolRegistryForBot(bot)});
 }
 if (path === "/api/about-me" && req.method === "GET") return sendJson(res, 200, { markdown: readAboutMe()});
 if (path === "/api/about-me" && req.method === "PUT") {

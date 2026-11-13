@@ -2602,3 +2602,81 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   钉住 run-state 的 401 与 false→true→false。
 - 返工后亲跑：`test:intervention` 增至 **15/15**，其余套件计数不变，
   全套与根级 check 见 PR 回复评论。
+
+## P2-5 工具注册表实测（第二件切片五，2026-11-13）
+
+- **注册表（新增 `lib/tool-registry.ts`）**：每 bot 一份清单，项形状按
+  切片锁定（name / label / description / parameters / source /
+  registeredBy / modelExposure / policy / implemented）。登记与物化共用
+  同一批构建器——注册表里的 parameters 与交给 Agent 的是同一份，
+  不存在两份 schema 漂移；网页工具实现自 kernel 迁入注册表，
+  `webToolsForBot` 旁路删除。
+- **物化唯一路径**：`streamChat` 不再接受调用方传工具数组，按 botId
+  从注册表物化；`resumeToolApproval` 同一函数（kernel 里
+  `agentToolsForBot` 恰两个调用点，源码断言钉住）。只有
+  `implemented && modelExposure === "offered"` 的项进
+  `Agent.state.tools`；`Bot.tools` 字符串降为声明来源（注册表据它
+  推导声明项），不再是物化真源。
+- **默认清单（与切片表逐项对齐，测试 A1–A3/B2 钉住）**：主 bot——
+  bots.draft / bots.manage / about-me.write 为 hidden + deny +
+  implemented:false（draft 参数用 BotDraft 字段展示，草案拦截不改
+  造成循环工具）；workspace_list/read offered + allow、
+  workspace_write/edit offered + ask（文件工具自本切片正式挂上
+  循环）；web_fetch/web_search implemented:true，未启用/未配置/
+  不在可用范围时 deferred。仓库管家——github.read hidden + allow +
+  implemented:false（尚未提供给模型，策略先行）；github_comment
+  offered + ask；四个 workspace_* hidden + deny + implemented:false
+  （默认不开放）。两边清单不串项。
+- **落点 1（请审计裁断）：工作区工具开放口径按 `Bot.isMain` 推广。**
+  切片表只列了两个种子 bot；本件的推广规则是文件工具只对主 bot
+  开放，其他 bot（含用户自建）一律 hidden/deny/未物化。
+- **接口与页签**：`GET /api/bots/:id/tools`（未登录 401、bot 不存在
+  404）返回注册表全文，不含秘密；右栏页签由三改四，新增「工具」
+  页签（`web/src/ToolsPanel.tsx`）：每项可见中文 label、name、
+  policy（允许/须批准/不可用）、是否已提供给模型、来源，展开可见
+  完整参数（字段名、类型、必填、description）。
+- **argsSnapshot 回传（#35 审计建议 1，本切片硬验收）**：批准路径
+  （批准路由、原 run 活着时）与恢复路径（`resumeToolApproval`）放行
+  时都把落盘 argsSnapshot 经 `resolveToolCall(..., { arguments })`
+  传回，基座按 schema 复验后执行——pending 时改过的正文以快照
+  为准。恢复前由 ToolApproval 层判冲突（`snapshotConflictReason`）：
+  会话流水的原始参数与快照在 body 之外任一字段不一致，以
+  `SNAPSHOT_CONFLICT` 拒绝恢复、不执行；body 是 pending 唯一可改
+  字段，只差 body 不算冲突（快照更新、以快照为准）。
+  **落点 2（请审计裁断）：冲突判定只落在恢复路径**——活 run 的挂起
+  参数与记录同源（记录即由它在 ask 时落盘），不存在第二份可冲突的
+  参数；可冲突的只有流水重建这条路。
+- **落点 3（请审计裁断）：本地工具待批记录定型。** 工作区写/编辑
+  执行结束后，kernel 在 tool_execution_end 给记录定型：成功 →
+  executed；确定性失败 → failed（工作区工具结果 details.reason 的
+  escape=硬闸越界、args=参数形状不对，同一快照永远不会成功，与
+  网关校验级拒绝同口径）；暂时性失败（reason io 等）→ 保持
+  approved + error（与网关暂时性失败同口径，留在收件箱活动栏可
+  人工驳回关闭）。github_comment 明确跳过——其记录生命周期归
+  网关（口径不变）。没有这一步，文件工具的待批会永远停在
+  approved 挂在收件箱活动栏。**订正（PR #37 审计 MINOR，
+  2026-11-13）**：初版定型不分失败类别、出错一律 executed，账本
+  会把零落盘的越界写记成「已执行」；审计指出后改为上述三分类，
+  B6/B7 两条全链用例钉住（批准后种入越界符号链接 → failed 且
+  界外零落盘；写入已存在目录的 IO 错 → 保持 approved）。
+- **亲跑验收**（`npm run test:tool-registry`，新脚本，已并入
+  `npm test` 链）：**14/14**——A 段进程内 7 条（种子两 bot 清单逐项
+  对表；物化集合恰为 offered 集且 parameters 与登记深等，未实现/
+  非 offered 永不物化；网页启用+搜索配置后主 bot 物化多出
+  web_fetch/web_search、管家不在范围内不物化、关闭后消失；快照
+  冲突判定口径；源码断言无第二条组装路径）；B 段真实 server +
+  模型替身 7 条（接口 401/404/全文形状；模型请求里实际带的 tools
+  集合逐项核对——主 bot 恰四个工作区工具、管家恰 [github_comment]；
+  workspace_write 批准后原 run 执行、记录定型 executed、文件按
+  快照内容落盘；杀进程后篡改会话流水参数再批准，恢复被快照冲突
+  拒绝、文件不落盘、记录保持 approved；定型分类两件——批准后种入
+  越界符号链接使执行被硬闸拦下、记录定型 failed 且界外零落盘，
+  写入已存在目录的 IO 失败、记录保持 approved + error）。其余
+  套件计数与 P2-4
+  基线逐项一致（gateway 43、tool-gateway 19、intervention 15、
+  workspace 43、webfetch 48、regression 72 等），全套 `npm test`
+  退出 0、根级 `npm run check` 退出 0（最终数字以 PR head 为准）。
+- **明确不做**（按切片）：草案拦截不改造成循环工具；github.read
+  不补只读实现（仅登记 + 策略先行）；不做工具搜索/延迟加载产品；
+  不接新 MCP 市场。验收截图（两 bot 工具页签）按惯例以用户本机
+  实例为准，VM 无真实数据不拿替身冒充——诚实延期，与 P2-4 同口径。

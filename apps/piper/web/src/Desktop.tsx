@@ -1,4 +1,4 @@
-// 右栏业务组件：当前 bot 的「桌面」三页签——例程 / 产物 / 记忆，数据全部走现有 API。
+// 右栏业务组件：当前 bot 的「桌面」四页签——例程 / 产物 / 记忆 / 工具（P2-5），数据全部走现有 API。
 // 例程与产物按当前选中 bot 隔离：例程在前端按 botId 过滤；产物走服务端过滤
 //（GET /api/artifacts?botId=，R10），切 bot 时重新拉取。选中主 bot 时不得出现
 // 仓库管家的例程或日报。页签用 shadcn Tabs（在本组件内覆写为基线分段控件样式）；
@@ -20,6 +20,7 @@ import {
 import type { ComponentType, ReactNode } from "react";
 import { useCallback, useEffect, useState } from "react";
 import { getArtifact, getMemory, listArtifacts, listRoutines, runMorningScan, UnauthorizedError } from "./api";
+import { ToolsPanel } from "./ToolsPanel";
 import { Artifact, ArtifactActions, ArtifactClose, ArtifactContent, ArtifactDescription, ArtifactHeader, ArtifactTitle } from "@/components/ai-elements/artifact";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -27,7 +28,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { cn } from "@/lib/utils";
 import type { Artifact as ArtifactData, ArtifactMeta, Bot, Routine } from "./model";
 
-type Tab = "routines" | "artifacts" | "memory";
+type Tab = "routines" | "artifacts" | "memory" | "tools";
 
 export type DesktopProps = {
 	bot: Bot | null;
@@ -161,7 +162,7 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 						<span className="font-medium text-muted-foreground">未选择 bot</span>
 					)}
 				</div>
-				<TabsList className="grid h-9 w-full grid-cols-3 rounded-lg border bg-background/40 p-1 shadow-none">
+				<TabsList className="grid h-9 w-full grid-cols-4 rounded-lg border bg-background/40 p-1 shadow-none">
 					<TabsTrigger value="routines" className={tabTriggerClass}>
 						例程
 						<TabCount n={visibleRoutines.length} />
@@ -172,6 +173,9 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 					</TabsTrigger>
 					<TabsTrigger value="memory" className={tabTriggerClass}>
 						记忆
+					</TabsTrigger>
+					<TabsTrigger value="tools" className={tabTriggerClass}>
+						工具
 					</TabsTrigger>
 				</TabsList>
 			</div>
@@ -272,6 +276,10 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 								</ArtifactContent>
 							</Artifact>
 						) : null}
+					</TabsContent>
+
+					<TabsContent value="tools" className="mt-0">
+						<ToolsPanel botId={bot?.id ?? null} onUnauthorized={onUnauthorized} />
 					</TabsContent>
 
 					<TabsContent value="memory" className="mt-0 flex flex-col gap-5">

@@ -18,6 +18,7 @@ import type {
 	ProfileSettings,
 	Routine,
 	ToolApprovalItem,
+	ToolRegistryItem,
 	TraceData,
 } from "./model";
 
@@ -72,6 +73,11 @@ export async function confirmDraft(draft: BotDraft): Promise<Bot> {
 
 export async function listMessages(botId: string): Promise<HistoryEntry[]> {
 	return (await api<{ messages: HistoryEntry[] }>(`/api/bots/${botId}/messages`)).messages;
+}
+
+// 工具注册表（P2-5）：该 bot 的工具清单全文，供桌面「工具」页签核对
+export async function listBotTools(botId: string): Promise<ToolRegistryItem[]> {
+	return (await api<{ tools: ToolRegistryItem[] }>(`/api/bots/${botId}/tools`)).tools;
 }
 
 // 轨迹（PR-E）：当前 bot 会话流水的按轮归一化视图，形状见 model.ts 的 TraceData。
