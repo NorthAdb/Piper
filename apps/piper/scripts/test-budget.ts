@@ -11,7 +11,9 @@
 //      收到 1 次请求），被拦结果在会话里可见；
 //   S4 maxSteps=1 + github_comment 待批：待批保持 pending、批准后
 //      恰好发 1 条评论、记录 executed，续跑段跳闸审计落盘；
-//   S5 缺省预算：普通对话不跳闸。
+//   S5 缺省预算：普通对话不跳闸；
+//   S6 重启恢复边界（#40 审计 MINOR-1）：杀进程后同目录重启再批准，
+//      评论恰 1 条、恢复段恰多 1 次模型请求后 steps 跳闸（行为钉）。
 // 数据目录指向临时目录，替身全在本地，不访问真实网络。
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -199,8 +201,8 @@ let serverLog = "";
 let cookie = "";
 let DATA_B = "";
 
-function startServer(extraEnv: Record<string, string>, preseed?: (dataDir: string) => void): ChildProcess {
-	const tmp = mkdtempSync(join(tmpdir(), "piper-budget-b-"));
+function startServer(extraEnv: Record<string, string>, preseed?: (dataDir: string) => void, reuseDir?: string): ChildProcess {
+	const tmp = reuseDir ?? mkdtempSync(join(tmpdir(), "piper-budget-b-"));
 	DATA_B = join(tmp, "data");
 	mkdirSync(DATA_B, { recursive: true });
 	if (preseed) preseed(DATA_B);
@@ -278,9 +280,9 @@ function sessionText(botId: string): string {
 	const file = join(DATA_B, "sessions", `${botId}.jsonl`);
 	return existsSync(file) ? readFileSync(file, "utf8") : "";
 }
-async function boot(extraEnv: Record<string, string>, preseed?: (dataDir: string) => void): Promise<boolean> {
+async function boot(extraEnv: Record<string, string>, preseed?: (dataDir: string) => void, reuseDir?: string): Promise<boolean> {
 	serverLog = "";
-	proc = startServer(extraEnv, preseed);
+	proc = startServer(extraEnv, preseed, reuseDir);
 	const ready = await waitReady();
 	return ready && (await login());
 }
@@ -394,6 +396,47 @@ async function shutdown(): Promise<void> {
 		`posts=${ghPosts.length} rec=${JSON.stringify(rec)} trip=${JSON.stringify(trip)} log=${serverLog.slice(-200)}`,
 	);
 	await shutdown();
+}
+
+// ---- S6 重启恢复路径的预算边界（#40 审计 MINOR-1，行为钉） ----
+// 基座恢复入口（runAgentLoopResolveToolCall）在工具批之后不咨询
+// finishTurn、直接进 runLoop：重启后批准，评论照常发出，但恢复段
+// 会多发一轮模型请求、その轮的 finishTurn 才计数跳闸。本条把这条
+// 已知边界钉在册：评论恰 1 条、恢复段模型请求恰 1 次、跳闸落审计。
+{
+	mode = "comment";
+	usageTotal = 10;
+	ghPosts.length = 0;
+	const tmpS6 = mkdtempSync(join(tmpdir(), "piper-budget-s6-"));
+	const ok1 = await boot({ PIPER_BUDGET_MAX_STEPS: "1" }, undefined, tmpS6);
+	let pendingId: string | null = null;
+	if (ok1) {
+		void chatEvents("repo-keeper", "请给 LinkForge 的 PR #1 发一条评论：预算测试").catch(() => []);
+		for (let i = 0; i < 60 && !pendingId; i++) {
+			const list = await req("/api/approvals");
+			const found = (list.json?.approvals ?? []).find((a: any) => a.kind === "tool_call" && a.status === "pending");
+			if (found) pendingId = found.id;
+			else await sleep(250);
+		}
+	}
+	await shutdown(); // SIGKILL：待批记录与会话流水留在数据目录
+	modelRequests = 0; // 只数恢复段的模型请求
+	const ok2 = await boot({ PIPER_BUDGET_MAX_STEPS: "1" }, undefined, tmpS6);
+	if (ok2 && pendingId) {
+		await req(`/api/approvals/${pendingId}/approve`, { method: "POST", body: JSON.stringify({}) });
+		for (let i = 0; i < 80 && ghPosts.length === 0; i++) await sleep(250);
+		for (let i = 0; i < 80 && !auditEntries().some((a) => a.result === "budget_exceeded"); i++) await sleep(250);
+	}
+	const approvals = await req("/api/approvals");
+	const rec = [...(approvals.json?.approvals ?? []), ...(approvals.json?.closed ?? [])].find((a: any) => a.id === pendingId);
+	const trip = auditEntries().find((a) => a.result === "budget_exceeded");
+	check(
+		"S6 重启恢复边界（MINOR-1 钉）：重启后批准 → 评论恰 1 条、记录 executed、恢复段恰多 1 次模型请求后 steps 跳闸落审计",
+		ok1 && ok2 && Boolean(pendingId) && ghPosts.length === 1 && rec?.status === "executed" && modelRequests === 1 && trip?.reason === "steps",
+		`ok1=${ok1} ok2=${ok2} pending=${pendingId} posts=${ghPosts.length} rec=${JSON.stringify(rec)} reqs=${modelRequests} trip=${JSON.stringify(trip)} log=${serverLog.slice(-200)}`,
+	);
+	await shutdown();
+	rmSync(tmpS6, { recursive: true, force: true });
 }
 
 // ---- S5 缺省预算：普通对话不跳闸 ----
