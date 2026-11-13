@@ -18,6 +18,8 @@ export interface NotificationEntry {
 	routineId: string | null;
 	artifactId: string | null;
 	findingId: string | null;
+	// 对话工具待批（P2-4）的通知按此 id 深链到收件箱条目；Finding 路径恒 null。
+	toolApprovalId: string | null;
 	read: boolean;
 	createdAt: string;
 }
@@ -49,6 +51,7 @@ export function addNotification({
 	routineId = null,
 	artifactId = null,
 	findingId = null,
+	toolApprovalId = null,
 }: {
 	type: string;
 	title: unknown;
@@ -56,6 +59,7 @@ export function addNotification({
 	routineId?: string | null;
 	artifactId?: string | null;
 	findingId?: string | null;
+	toolApprovalId?: string | null;
 }): NotificationEntry {
 	if (!(NOTIFICATION_TYPES as readonly string[]).includes(type)) throw new Error(`未知通知类型: ${type}`);
 	const entry: NotificationEntry = {
@@ -67,6 +71,7 @@ export function addNotification({
 		routineId,
 		artifactId,
 		findingId,
+		toolApprovalId,
 		read: false,
 		createdAt: new Date().toISOString(),
 	};

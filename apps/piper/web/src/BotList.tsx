@@ -4,7 +4,7 @@
 import { BellIcon, BotIcon, InboxIcon, PencilIcon, PinIcon, PlusIcon, SettingsIcon } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getNotifications, listApprovals } from "./api";
-import type { Approval } from "./model";
+import type { InboxItem } from "./model";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -25,7 +25,7 @@ export type BotListProps = {
 };
 
 export function BotList({ bots, currentBotId, busyBotIds, onSelect, onNew, onEdit, onOpenInbox, onOpenSettings, onOpenNotifications }: BotListProps) {
-	const [approvals, setApprovals] = useState<Approval[]>([]);
+	const [approvals, setApprovals] = useState<InboxItem[]>([]);
 	const [notifUnread, setNotifUnread] = useState(0);
 
 	useEffect(() => {

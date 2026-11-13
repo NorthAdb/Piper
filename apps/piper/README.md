@@ -2514,3 +2514,91 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
 - **明确不做**（按切片）：收件箱与工具卡的工具待批视觉（P2-4）、中止
   接口（P2-4）、文件工具挂进 streamChat（P2-5；本 PR 未挂）、新写意图
   种类、把网关收成通用 WriteExecutor。
+
+## P2-4 人的介入面实测（第二件切片四，2026-11-13）
+
+- **收件箱联合视图**：`GET /api/approvals` 的工具待批项（`kind: "tool_call"`）
+  与 Finding 项并列展示（P2-3 已备数据，本件补前端）——活动与已关闭两栏
+  均按 kind 分支渲染；工具卡含目标（repo + PR/Issue 号）、参数全文、
+  提出 bot 与时间、状态徽章（cancelled 显示「已取消」、failed 显示
+  「执行失败」）；批准按钮文案区分「批准并执行」与执行失败后的「再次
+  执行」；驳回两步确认（工具路径无去重冷却，bot 可重新提出，与
+  Finding 的 14 天冷却文案分开）。左栏收件箱角标计数同步计入两类。
+  （审计返工补记：驳回确认文案按状态区分——pending 态仍明示不会执行；
+  approved 态明示正在执行时驳回会被拒绝、在等重试时驳回后不再重试，
+  成功提示亦随状态区分；见文末「P2-4 审计返工补记」。）
+- **对话内工具卡待批准态**：实时流与历史还原同一口径——工具条目按
+  toolCallId 取最后一条，`status: "pending"` 还原为「待批准」卡（不显示
+  结果区，提示去收件箱批准/驳回），不再据 endedAt 把 pending 显示成
+  已完成（#35 审计建议 4 的前端半边）；运行状态行显示「等待批准：
+  <工具名>」；运行中可点「中止本轮」。待批产生时写 `approval.pending`
+  通知（新增 `toolApprovalId` 字段，通知中心「查看事项」深链两类
+  通用）；批准后回主视图由 ChatPane 重挂载重拉历史，工具卡随之更新。
+- **批准前改正文（工具待批）**：`POST /api/approvals/:id/edit` 对
+  `ta-…` 由 409 改为真编辑，但只许改正文、且只许 pending 态——请求
+  携带 repo/kind/number 且与快照不一致回 400、快照不变；正文校验与
+  Finding 改文同口径（非空、上限 10000 字、疑似含秘密拒绝）；成功写
+  审计 `edited`（intent 预览即新正文），批准后网关按新正文发。
+  已批准记录正文即冻结快照：要改先驳回重提，不新开状态迁移。
+- **中止接口**：`POST /api/chats/:botId/abort`（未登录 401、bot 不存在
+  404、无活动 run 回 `{aborted:false}`）。语义分三段：停在等待批准的
+  调用以 deny 结算，本会话 pending 工具待批记录随之置 `cancelled` +
+  审计 `cancelled`/`run_aborted`，零写入；同批未开始的调用不再执行；
+  **已在执行中的写不撤回**——基座 execute 不被 abort 信号抢占，已发出
+  的请求按真实结果落审计（与 Finding executing 中断恢复同口径），
+  中止不谎报「未写」。kernel 新增按 bot 索引的活动 run 登记
+  （`abortLiveRun`），streamChat 与恢复续跑都登记/摘除。
+- **#35 审计留项落地**：建议 2——`GET /api/audit` 透传 `toolApprovalId`
+  过滤（`listAudit` 本已支持）；建议 3——`tool-approvals.json` 改走
+  原子写（tmp+rename），解析失败/非数组时把原文件改名
+  `.corrupt-<时间戳>` 隔离留痕后从空表继续，绝不把损坏当空表静默
+  覆盖；建议 4 的后端半边——恢复重建待批集合按 toolCallId 取最后
+  一条且 status 为 pending，再滤掉 ToolApproval 记录已终态
+  （executed/rejected/cancelled/failed）的调用：防「第一条已在原 run
+  执行完、终态条目未及落盘就被杀进程」时重建把第一条误当待批重发
+  （建议 1 的 argsSnapshot 回传归 P2-5 文件工具挂载，本件未动）。
+- **亲跑验收**（`npm run test:intervention`，新脚本，已并入 `npm test`
+  链）：A 段进程内 3 条——原子落盘无 .tmp 残留、损坏隔离（原文件改名
+  保留内容、新写入从新表开始）、改正文 pending 只改 body / executed
+  回 409 / 空正文与疑似含秘密回 400；B 段真实 server + 双替身 12 条——
+  未登录中止 401、待批通知带 toolApprovalId、改正文锁定字段 400 且
+  快照不变 + 审计 edited 预览为新正文、批准按新正文恰好发一次且
+  `/api/audit?toolApprovalId=` 可追而 `?findingId=` 查不到、待批中
+  中止（cancelled + 审计 + 零写入 + 会话 error 终态 + 再批准 409）、
+  无 run 中止回 aborted:false、执行中中止（在途写完成落账、同批无
+  额外写）、同批双待批批一后 SIGKILL 重启批二（两条正文各发一次、
+  第一条再批准 409）、在途驳回回 409（记录保持 approved、在途写完成落
+  executed 恰好一次、无 rejected 审计，B10）、run-state（无 run false /
+  待批停泊 true / 落定 false / 未登录 401，B11）、暂时性失败后驳回对照
+  （approved+error 未在途时驳回成功、零写入，B12）。全套 `npm test` 与根级 `npm run check` 结果见
+  PR 描述。
+- **验收截图**：待批工具卡、收件箱两类并列、工具待批详情三张界面图
+  需在真实界面核对——本机（VM）实例无用户数据，截图以用户本机实例
+  为准，PR 中如实标注，不拿替身数据冒充产品界面。
+- **明确不做**（按切片）：计划模式、平行观察系统、Slack/邮件通知、
+  整套视觉重做；argsSnapshot 经 resolveToolCall 回传与冲突拒绝
+  （P2-5，文件工具挂循环前落地）。
+
+### P2-4 审计返工补记（PA—design 有条件通过，2026-11-13）
+
+- **MAJOR：在途驳回会让账本与副作用分叉，已修。** 原实现对「已批准」
+  记录也允许驳回：写在途时驳回接口回 200、记录转 rejected、界面称
+  「不会执行」，但在途 POST 拦不住、评论照发，且状态机不许 rejected
+  再转 executed。修法两道防线：网关导出 `isToolWriteInFlight`，驳回
+  接口对已批准且在途的记录回 409（与中止同口径：在途写按真实结果
+  落账）；网关领取后、任何网络调用之前在同一同步段内复查记录状态，
+  状态已变即放回领取并按 not_approved 拒绝，绝不带着已变的账本发写。
+  未在途的已批准记录（等重试）仍可驳回。收件箱文案随之分态：确认框
+  与成功提示对已批准记录不再说「不会执行任何写操作」。新验收 B10
+  钉住：在途驳回 409、记录保持 approved、写完成落 executed 恰好
+  一次、无 rejected 审计；在途的确定性信号是网关领取时同步写的
+  executing 审计；B12 对照：暂时性失败后 approved+error、未在途时
+  驳回仍成功、零写入。
+- **MINOR：待批后对话里中止入口随 SSE 收尾消失，已修。** 新增
+  `GET /api/chats/:botId/run-state`（kernel `hasLiveRun`，含停在待批
+  与已批准在途）；对话里有待批准工具卡且本端不在 running 时，窗格
+  每 3 秒轮询该接口，run 活跃则保留「等待批准」状态行与「中止本轮」
+  按钮，run 落定后自动重拉一次历史让工具卡切到终态。新验收 B11
+  钉住 run-state 的 401 与 false→true→false。
+- 返工后亲跑：`test:intervention` 增至 **15/15**，其余套件计数不变，
+  全套与根级 check 见 PR 回复评论。

@@ -36,6 +36,9 @@ export const PlainText: TextMessagePartComponent = ({ text }) => <span className
 // 一次调用一张卡（ChatPane 按 toolCallId 合并 call/start/end 三段事件）：
 // phase 非 end 映射 input-available（Running），end 映射 output-available
 //（Completed），end 且 result.isError 为真映射 output-error（Error）。
+// 待批（P2-4）：phase "pending" 映射 AI Elements 的 approval-requested
+//（状态文案「待批准」），只展示参数、不得显示成运行中或已成功——批准 /
+// 驳回在待批收件箱里做，批准后会话重拉，卡片随流水终态变完成或已拒绝。
 // 卡内同时留参数与结果摘要，end 后不必重开卡看执行结果。
 
 export type ToolArgs = { phase: string; args: JsonValue; result: JsonValue };
@@ -45,6 +48,7 @@ function resultRecord(result: JsonValue): { [key: string]: JsonValue } | null {
 }
 
 function toolState(phase: string, result: JsonValue): ToolPart["state"] {
+	if (phase === "pending") return "approval-requested";
 	if (phase !== "end") return "input-available";
 	return resultRecord(result)?.isError === true ? "output-error" : "output-available";
 }
@@ -73,6 +77,9 @@ export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, arg
 			<ToolHeader type={`tool-${toolName}` as `tool-${string}`} state={state} title={toolName} />
 			<ToolContent>
 				{input !== null ? <ToolInput input={input} /> : null}
+				{phase === "pending" ? (
+					<p className="text-sm text-muted-foreground">待批准：这项写操作还没有执行。请到待批收件箱批准或驳回。</p>
+				) : null}
 				{phase === "end" ? (
 					<>
 						{summary && state !== "output-error" ? <p className="text-sm text-muted-foreground">{summary}</p> : null}

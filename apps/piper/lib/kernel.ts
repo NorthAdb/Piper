@@ -33,7 +33,7 @@ import { redact } from "./redact.ts";
 import { APP_DIR, getBot, readSession } from "./store.ts";
 import type { Bot, SessionEntry } from "./store.ts";
 import { PolicyEngine } from "./policy.ts";
-import { createToolApproval } from "./tool-approvals.ts";
+import { createToolApproval, findToolApprovalByToolCall } from "./tool-approvals.ts";
 import { githubCommentToolsForBot } from "./github-comment.ts";
 import type { Api, ApiKeyAuth, AssistantMessage, CreateProviderOptions, Message, Model, ModelThinkingLevel, MutableModels, Provider, ProviderStreams, ToolCall, Usage } from "@earendil-works/pi-ai";
 import type { Agent, AgentTool, AgentToolResult, ThinkingLevel as AgentThinkingLevel } from "@earendil-works/pi-agent-core";
@@ -320,6 +320,9 @@ export function webToolsForBot(bot: Bot | null | undefined): AgentTool<any>[] {
 // 没有这层引用，整条 promise 链可能被 GC 掉，批准就再也唤不醒它。
 const liveAgents = new Map<string, Agent>();
 const backgroundRuns = new Set<Promise<unknown>>();
+// 按 bot 索引的活 run（P2-4 中止接口用）：同一 bot 同时至多一轮在跑，
+// streamChat / resumeToolApproval 在建 Agent 时登记、run 结束时按身份摘除。
+const liveRunsByBot = new Map<string, { sessionId: string; agent: Agent }>();
 
 export function trackBackgroundRun(promise: Promise<unknown>): void {
 	backgroundRuns.add(promise);
@@ -331,6 +334,30 @@ export function trackBackgroundRun(promise: Promise<unknown>): void {
 
 export function getLiveAgent(sessionId: string): Agent | null {
 	return liveAgents.get(sessionId) ?? null;
+}
+
+function registerLiveRun(botId: string, sessionId: string, agent: Agent): void {
+	liveRunsByBot.set(botId, { sessionId, agent });
+}
+
+function clearLiveRun(botId: string, agent: Agent): void {
+	if (liveRunsByBot.get(botId)?.agent === agent) liveRunsByBot.delete(botId);
+}
+
+// 中止某 bot 当前的 run（P2-4）：基座 abort 会把停在待批等待上的调用以
+// deny 结算（循环按「已取消」收尾成错误结果），正在执行的调用跑完当前这
+// 一步后其余同批调用不再开始。没有活 run 时回 { aborted: false }，不抛错。
+export function abortLiveRun(botId: string): { aborted: boolean; sessionId?: string } {
+	const entry = liveRunsByBot.get(botId);
+	if (!entry) return { aborted: false };
+	entry.agent.abort();
+	return { aborted: true, sessionId: entry.sessionId };
+}
+
+// 该 bot 此刻是否有活动 run（含停在待批等待、已批准在途执行）：对话
+// 窗格的 run-state 轮询据此保留中止入口（#36 审计 MINOR）。
+export function hasLiveRun(botId: string): boolean {
+	return liveRunsByBot.has(botId);
 }
 
 // 闸的三个钩子（botId 在场时才装）：beforeToolCall 问 PolicyEngine——
@@ -452,6 +479,7 @@ export async function streamChat({
 	const state = { finalText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state);
 	if (sessionId) liveAgents.set(sessionId, agent);
+	if (botId && sessionId) registerLiveRun(botId, sessionId, agent);
 	try {
 		await agent.prompt(message);
 	} catch (err) {
@@ -459,6 +487,7 @@ export async function streamChat({
 	} finally {
 		unsubscribe();
 		if (sessionId && liveAgents.get(sessionId) === agent) liveAgents.delete(sessionId);
+		if (botId) clearLiveRun(botId, agent);
 	}
 	if (agent.state?.errorMessage) {
 		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
@@ -468,8 +497,9 @@ export async function streamChat({
 
 // 待批恢复（进程重启后批准）：从会话 JSONL 重建 transcript——本轮之前的
 // 对话按文本历史（toPiMessages 同口径），本轮 = user 条目 + 一条只含待批
-// 工具调用的 assistant 消息（status 为 pending 的 tool 条目即该批的全部
-// 调用，按 seq 排序）；新建 Agent 后走 resolveToolCall（不得用 continue()，
+// 工具调用的 assistant 消息（待批集合的取法见函数内注释：按 toolCallId
+// 取最后一条且仍为 pending、且 ToolApproval 记录未终结，按 seq 排序）；
+// 新建 Agent 后走 resolveToolCall（不得用 continue()，
 // 基座在 last 为 assistant 时会抛错）。续跑的事件经 onEvent 交回调用方
 // 落盘；若续跑中又有同批调用进 ask，本函数返回的 promise 会停泊在那次
 // 等待上（调用方应以 trackBackgroundRun 托住、不要直接 await 到底）。
@@ -497,8 +527,25 @@ export async function resumeToolApproval({
 	const entries = readSession(botId);
 	const turn = entries.filter((e) => e.sessionId === sessionId);
 	const userEntry = turn.find((e) => e.role === "user");
-	const pendingTools = turn
-		.filter((e) => e.role === "tool" && e.status === "pending")
+	// 待批集合的取法（P2-4，#35 审计留项）：同一 toolCallId 在流水里有
+	// pending 与终态两条（先落盘 pending、终态后补一条），按 toolCallId 取
+	// 最后一条为准——最后一条仍是 pending 才算待批。还要再看 ToolApproval
+	// 记录本身：记录已是终态（executed / rejected / cancelled / failed）
+	// 的调用绝不重建进 transcript——典型场景是同批第一个调用已在原 run
+	// 里执行完、进程停在第二个待批上时被杀：第一个调用的终态条目还没来
+	// 得及落盘（回合浮动收尾未跑），只看流水会把它当待批重新批准、重复
+	// 发评论。记录为 pending / approved 的才可恢复；无记录（异常）时按
+	// 流水口径保留。
+	const lastToolByCall = new Map<string, SessionEntry>();
+	for (const e of turn) {
+		if (e.role === "tool" && e.toolCallId) lastToolByCall.set(String(e.toolCallId), e);
+	}
+	const pendingTools = [...lastToolByCall.values()]
+		.filter((e) => e.status === "pending")
+		.filter((e) => {
+			const rec = findToolApprovalByToolCall(sessionId, String(e.toolCallId));
+			return !rec || rec.status === "pending" || rec.status === "approved";
+		})
 		.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
 	if (!userEntry || !pendingTools.some((t) => t.toolCallId === toolCallId)) {
 		throw Object.assign(new Error("会话记录里找不到该待批调用，无法恢复执行"), { code: "RESUME_NOT_FOUND" });
@@ -548,6 +595,7 @@ export async function resumeToolApproval({
 	const state = { finalText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state);
 	liveAgents.set(sessionId, agent);
+	registerLiveRun(botId, sessionId, agent);
 	try {
 		await agent.resolveToolCall(toolCallId, { decision });
 	} catch (err) {
@@ -555,6 +603,7 @@ export async function resumeToolApproval({
 	} finally {
 		unsubscribe();
 		if (liveAgents.get(sessionId) === agent) liveAgents.delete(sessionId);
+		clearLiveRun(botId, agent);
 	}
 	if (agent.state?.errorMessage) {
 		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });

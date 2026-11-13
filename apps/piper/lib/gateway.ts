@@ -325,6 +325,13 @@ export async function gatewayExecuteWrite({
 //   - 不套用扫描规则前提复检（见 runCommentWrite 的落点说明）。
 const toolWritesInFlight = new Set<string>();
 
+// 工具写是否已领取在途（#36 审计 MAJOR）：驳回接口据此拒绝「已批准且
+// 正在执行」的驳回——在途的写拦不住，改成 rejected 只会让账本与外部
+// 副作用分叉（评论已发、记录却写驳回且状态机不许再转 executed）。
+export function isToolWriteInFlight(toolApprovalId: string): boolean {
+	return toolWritesInFlight.has(toolApprovalId);
+}
+
 async function gatewayExecuteToolWrite({
 	toolApprovalId,
 	snapshot = null,
@@ -378,8 +385,17 @@ async function gatewayExecuteToolWrite({
 
 	// 领取：同步段内登记在途并写 executing 审计（与 Finding 路径同口径：
 	// 先落审计再做网络调用，进程崩溃后能看到「发到一半」；崩溃后记录仍是
-	// approved，重试时靠幂等标记查重防双发）。
+	// approved，重试时靠幂等标记查重防双发）。领取后、任何网络调用之前
+	// 再复查一次记录状态（与领取同在一个同步段，驳回接口插不进来）：入口
+	// 检查之后状态若被改（例如刚被驳回），立刻放回领取并按未批准拒绝，
+	// 绝不带着已变的账本发出写（#36 审计 MAJOR 的防线之二）。
 	toolWritesInFlight.add(toolApprovalId);
+	const fresh = getToolApproval(toolApprovalId);
+	if (!fresh || fresh.status !== "approved") {
+		toolWritesInFlight.delete(toolApprovalId);
+		appendAudit({ ...base, result: "denied", reason: "not_approved" });
+		return { ok: false, result: "denied", reason: "not_approved", toolApproval: fresh };
+	}
 	appendAudit({ ...base, result: "executing" });
 	try {
 		const out = await runCommentWrite({

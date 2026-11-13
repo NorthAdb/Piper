@@ -9,9 +9,14 @@
 // approved 并把原因写进 error，用户可再次批准重试（与 Finding 的
 // approved 可重试口径一致）；failed 只给网关校验级拒绝（快照不符、
 // 正文含秘密、不支持的意图这类重试也不会变的情况）。
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+// 落盘纪律（P2-4，#35 审计留项）：整表写入走 store 的原子落盘（临时文件 +
+// rename），写一半崩溃不留截断文件；读到损坏内容（JSON 解析失败或不是
+// 数组）时把原文件改名隔离（.corrupt-<时间戳>）并记日志，绝不把损坏当成
+// 空表后在下一次写入时静默覆盖掉原记录。
+import { existsSync, readFileSync, renameSync } from "node:fs";
 import { join } from "node:path";
-import { DATA_DIR, ensureData } from "./store.ts";
+import { DATA_DIR, ensureData, writeFileAtomicSync } from "./store.ts";
+import { containsSecret } from "./redact.ts";
 import type { IntentSnapshot } from "./gateway.ts";
 
 export type ToolApprovalStatus = "pending" | "approved" | "rejected" | "executed" | "cancelled" | "failed";
@@ -23,7 +28,7 @@ export interface ToolApproval {
 	sessionId: string;
 	toolCallId: string;
 	toolName: string;
-	argsSnapshot: unknown; // 批准比对用，落盘后视为不可变（本件不支持批准时改参，P2-4 再议）
+	argsSnapshot: unknown; // 批准比对用；仅 body 可在 pending 时经 updateToolApprovalBody 改（P2-4），其余字段锁定
 	status: ToolApprovalStatus;
 	createdAt: string;
 	updatedAt: string;
@@ -46,17 +51,27 @@ function toolApprovalsFile(): string {
 function readAll(): ToolApproval[] {
 	const file = toolApprovalsFile();
 	if (!existsSync(file)) return [];
+	let parsed: unknown;
 	try {
-		const parsed = JSON.parse(readFileSync(file, "utf8"));
-		return Array.isArray(parsed) ? parsed : [];
+		parsed = JSON.parse(readFileSync(file, "utf8"));
 	} catch {
-		return [];
+		parsed = undefined;
 	}
+	if (Array.isArray(parsed)) return parsed as ToolApproval[];
+	// 损坏隔离：原文件改名保留证据，后续写入从空表开始——而不是把解析失败
+	// 当成空数组、再在下一次 writeAll 时无声覆盖原文件（#35 审计留项）。
+	try {
+		renameSync(file, `${file}.corrupt-${Date.now()}`);
+		console.error(`[piper] tool-approvals.json 内容损坏，已隔离原文件并从空表继续：${file}`);
+	} catch {
+		console.error(`[piper] tool-approvals.json 内容损坏且隔离失败，按空表继续：${file}`);
+	}
+	return [];
 }
 
 function writeAll(records: ToolApproval[]): void {
 	ensureData();
-	writeFileSync(toolApprovalsFile(), JSON.stringify(records, null, 2) + "\n", "utf8");
+	writeFileAtomicSync(toolApprovalsFile(), JSON.stringify(records, null, 2) + "\n", "utf8");
 }
 
 export function createToolApproval(input: {
@@ -122,6 +137,44 @@ export function updateToolApproval(id: string, patch: { status: ToolApprovalStat
 		...current,
 		status: patch.status,
 		error: patch.error !== undefined ? patch.error : current.error ?? null,
+		updatedAt: new Date().toISOString(),
+	};
+	all[idx] = next;
+	writeAll(all);
+	return next;
+}
+
+// 改正文（P2-4）：只许改 argsSnapshot.body，其余字段（repo / kind /
+// number）是锁定字段——路由层先对请求里带的锁定字段做不一致校验（400），
+// 这里只负责正文本身与状态。仅 pending 可改：已批准的记录正文即冻结快照，
+// 要改先驳回让 bot 重新提出（ToolApproval 状态机没有 approved → pending
+// 这条边，不为改正文新开状态迁移）。正文校验与 Finding 改文同口径
+// （非空、长度上限、疑似含秘密拒绝），上限与 approvals.ts 的
+// COMMENT_BODY_MAX_CHARS 对齐。
+export const TOOL_COMMENT_BODY_MAX_CHARS = 10000;
+
+export function updateToolApprovalBody(id: string, rawBody: unknown): ToolApproval {
+	const all = readAll();
+	const idx = all.findIndex((r) => r.id === id);
+	if (idx < 0) throw Object.assign(new Error(`工具待批不存在: ${id}`), { status: 404 });
+	const current = all[idx];
+	if (current.status !== "pending") {
+		throw Object.assign(new Error(`该工具待批已不在待批准状态（当前状态 ${current.status}），不能改正文`), { status: 409 });
+	}
+	if (typeof rawBody !== "string" || !rawBody.trim()) throw Object.assign(new Error("评论正文不能为空"), { status: 400 });
+	if (rawBody.length > TOOL_COMMENT_BODY_MAX_CHARS) {
+		throw Object.assign(new Error(`评论正文过长（上限 ${TOOL_COMMENT_BODY_MAX_CHARS} 字）`), { status: 400 });
+	}
+	if (containsSecret(rawBody)) {
+		throw Object.assign(new Error("评论正文疑似包含令牌或密钥，已拒绝保存（凭据请勿写进评论）"), { status: 400 });
+	}
+	const snap = current.argsSnapshot;
+	if (!snap || typeof snap !== "object" || Array.isArray(snap) || typeof (snap as { body?: unknown }).body !== "string") {
+		throw Object.assign(new Error("该工具待批的参数快照不支持正文编辑"), { status: 409 });
+	}
+	const next: ToolApproval = {
+		...current,
+		argsSnapshot: { ...(snap as Record<string, unknown>), body: rawBody },
 		updatedAt: new Date().toISOString(),
 	};
 	all[idx] = next;

@@ -116,6 +116,8 @@ export type NotificationEntry = {
 	routineId: string | null;
 	artifactId: string | null;
 	findingId?: string | null;
+	// 对话工具待批的通知带此 id（P2-4），「查看事项」按它定位收件箱条目
+	toolApprovalId?: string | null;
 	read: boolean;
 	createdAt: string;
 };
@@ -167,6 +169,7 @@ export type FindingDetail = {
 };
 
 export type Approval = {
+	kind: "finding";
 	id: string;
 	findingId: string;
 	botId: string;
@@ -202,6 +205,26 @@ export type Approval = {
 	closeReason: string | null;
 	closedAt: string | null;
 };
+
+// 对话工具待批（GET /api/approvals 里 kind:"tool_call" 的项，P2-3 起、
+// P2-4 接入收件箱）：bot 在对话里经循环闸提出的写操作，argsSnapshot 是
+// 批准比对的完整参数快照（github_comment 为 {repo, kind, number, body}）。
+export type ToolApprovalItem = {
+	kind: "tool_call";
+	id: string;
+	botId: string;
+	sessionId: string;
+	toolCallId: string;
+	toolName: string;
+	argsSnapshot: { repo?: string; kind?: string; number?: number; body?: string } | null;
+	status: string;
+	createdAt: string;
+	updatedAt: string;
+	error?: string | null;
+};
+
+// 收件箱条目联合：kind 区分 Finding 待批与对话工具待批
+export type InboxItem = Approval | ToolApprovalItem;
 
 // 批准执行的网关结果（POST /api/approvals/:id/approve 的 execution 字段，P1-6）
 export type ApprovalExecution = {
@@ -290,9 +313,10 @@ export type ChatEvent =
 	| { event: "done"; data: { botId: string } };
 
 // 前端消息模型：external-store runtime 自持，convertMessage 转成 assistant-ui 的 ThreadMessageLike
-// tool part 是「一次调用一张卡」的合并模型：phase 随 call/start/end 推进，
+// tool part 是「一次调用一张卡」的合并模型：phase 随 call/pending/start/end 推进，
 // args 是调用参数（call/start 的 detail），result 是 end 的结果摘要 detail
-//（{isError, url?, status?, truncated?, count?, error?}），历史还原时 phase 恒为 end。
+//（{isError, url?, status?, truncated?, count?, error?}）；历史还原时终态条目
+// phase 为 end、仍待批的条目 phase 为 pending（还原成待批工具卡）。
 // reasoning part 是一段思考：流式增量按 seg 拼进同一个 part，被工具/正文
 // 打断后另起一段；level 是生效挡位，durationMs 是段时长（直播时在段关闭时
 // 由 startedAt 补记，历史还原则来自落盘条目），渲染为弱化色竖条的折叠区。
@@ -330,7 +354,15 @@ export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
 		out.push({ id: nextId("hist"), role: "assistant", parts: pendingLead, running: false });
 		pendingLead = [];
 	};
-	for (const e of entries) {
+	// 工具条目按 toolCallId 取最后一条定型（P2-4）：同一调用在流水里先有
+	// pending 条目、回合收尾后可能再有一条终态条目，只认最后一条；最后
+	// 一条仍是 pending 的还原成待批工具卡（phase "pending"），不得因为它
+	// 带了 endedAt 就显示成已结束。
+	const lastToolIndex = new Map<string, number>();
+	entries.forEach((e, i) => {
+		if (e.role === "tool" && e.toolCallId) lastToolIndex.set(e.toolCallId, i);
+	});
+	for (const [i, e] of entries.entries()) {
 		if (e.role === "thinking") {
 			pendingLead.push({
 				type: "reasoning",
@@ -340,14 +372,26 @@ export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
 				level: e.level,
 			});
 		} else if (e.role === "tool") {
-			pendingLead.push({
-				type: "tool",
-				id: e.toolCallId ?? nextId("tool"),
-				name: e.name ?? "tool",
-				phase: "end",
-				args: e.args ?? null,
-				result: e.result ?? (e.status === "error" ? { isError: true } : null),
-			});
+			if (e.toolCallId && lastToolIndex.get(e.toolCallId) !== i) continue;
+			if (e.status === "pending") {
+				pendingLead.push({
+					type: "tool",
+					id: e.toolCallId ?? nextId("tool"),
+					name: e.name ?? "tool",
+					phase: "pending",
+					args: e.args ?? null,
+					result: null,
+				});
+			} else {
+				pendingLead.push({
+					type: "tool",
+					id: e.toolCallId ?? nextId("tool"),
+					name: e.name ?? "tool",
+					phase: "end",
+					args: e.args ?? null,
+					result: e.result ?? (e.status === "error" ? { isError: true } : null),
+				});
+			}
 		} else if (e.role === "user") {
 			flushLead();
 			out.push({ id: nextId("hist"), role: "user", parts: [{ type: "text", text: e.text ?? "" }], running: false });

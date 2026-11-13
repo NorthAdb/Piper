@@ -28,13 +28,24 @@
 // POST /api/approvals/:id/approve {intentHash} 批准并经薄网关执行批准快照（P1-6 + R1）：回 { approval, execution }；
 //   intentHash 与当前内容不一致回 409「内容已变，请重新查看」；正在 executing 回 409；
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
-// POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
+// POST /api/approvals/:id/reject 驳回 Finding（状态 rejected，不产生任何对外写操作；
+//   执行中（executing）驳回回 409，见 lib/approvals.ts）
 // POST /api/approvals/:id/edit {body} 改评论正文（切片二）：open 直接改；approved 改文同时作废原批准退回 open；已关闭/executing 回 409；空正文/超长/疑似含密钥回 400；改动写审计 edited
 // 工具待批（P2-3）：GET /api/approvals 同时返回 kind:"tool_call" 的工具待批项（每项带 kind 与 Finding 区分）；
 //   POST 对 ta-… id 同样有效——approve 置 approved 并触发循环放行（原 run 或重启后恢复，不 await 续跑到底），
-//   reject 置 rejected（原 run 还在等待时以 deny 放行收尾）；edit 对 ta-… 回 409（本件不支持改参）
+//   reject 置 rejected（原 run 还在等待时以 deny 放行收尾）；已批准且网关正在
+//   执行时回 409（写已发出、驳回无效，记录保持 approved 按真实结果落账），
+//   已批准但未在途时驳回仍置 rejected（暂时性失败后 approved+error 可重试的
+//   记录，驳回即放弃重试）
+// 工具待批改正文（P2-4）：POST /api/approvals/:id/edit 对 ta-… 只许改评论正文（{body}，仅 pending 可改，
+//   非 pending 回 409；请求若带 repo/kind/number 且与快照不一致回 400 且快照不变）；改文写审计 edited
+// POST /api/chats/:botId/abort 中止该 bot 当前 run（P2-4，需登录）：停在待批上的记录转 cancelled
+//   并写审计 cancelled/run_aborted；无活动 run 回 { aborted: false }；bot 不存在回 404
+// GET /api/chats/:botId/run-state 该 bot 是否有活动 run（#36 审计 MINOR）：{ active }，
+//   含停在待批与已批准在途；对话窗格据此在 SSE 收尾后保留中止入口；bot 不存在回 404
+// 工具待批驳回补充（#36 审计 MAJOR）：已批准且写在途时 reject 回 409（在途写按真实结果落账）
 // POST /api/findings/ad-hoc {repo, prNumber} 即席开单（切片二，/api/findings 下唯一的写路由）：对指定 PR 即时取证开 pr_needs_review 事项（判定与扫描同一套）；已有同键未关闭/冷却中事项回 200 {existing:true}；已合并/关闭/draft/已批准回 409；PR 不存在回 404；仓库未绑定任何 bot 回 400
-// GET /api/audit 网关审计记录（可按 findingId 过滤）：denied / approved / executing / executed / failed / rejected
+// GET /api/audit 网关审计记录（可按 findingId 或 toolApprovalId 过滤）：denied / approved / executing / executed / failed / rejected / edited / cancelled
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
 // GET /api/findings/:id 单条 Finding（不存在 404）
 // GET /api/memory/:botId 该 bot 记忆（memory.md，只读）
@@ -95,10 +106,11 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.ts";
-import { botSelfFacts, getLiveAgent, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { abortLiveRun, botSelfFacts, getLiveAgent, hasLiveRun, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { isToolWriteInFlight } from "./lib/gateway.ts";
 import type { ChatEvent} from "./lib/kernel.ts";
 import { githubCommentToolsForBot } from "./lib/github-comment.ts";
-import { getToolApproval, listToolApprovalViews, toToolApprovalView, toolIntentSnapshotOf, updateToolApproval } from "./lib/tool-approvals.ts";
+import { findToolApprovalByToolCall, getToolApproval, listToolApprovals, listToolApprovalViews, toToolApprovalView, toolIntentSnapshotOf, updateToolApproval, updateToolApprovalBody } from "./lib/tool-approvals.ts";
 import type { ToolApproval } from "./lib/tool-approvals.ts";
 import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.ts";
 import type { Finding} from "./lib/findings.ts";
@@ -461,7 +473,10 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
 				closeThinkingSeg();
 				collectTool(e);
 				emitLive("tool", { phase: e.phase, name: e.name, toolCallId: e.toolCallId, detail: e.detail });
-				if (e.phase === "pending") resolvePendingSeen();
+				if (e.phase === "pending") {
+					resolvePendingSeen();
+					notifyToolApprovalPending(bot.id, sessionId, e.toolCallId);
+				}
 			}
 		},
 	});
@@ -520,6 +535,48 @@ function conflictError(message: string): Error & { status: number } {
 	return Object.assign(new Error(message), { status: 409 });
 }
 
+function badRequestError(message: string): Error & { status: number } {
+	return Object.assign(new Error(message), { status: 400 });
+}
+
+// 工具待批通知（P2-4）：pending 事件到达时记录必然已落盘（内核在发事件
+// 之前 await 了 onToolApprovalPending），按 (sessionId, toolCallId) 取回
+// 记录 id，写一条 approval.pending 通知并带 toolApprovalId 深链到收件箱
+// 对应条目——与 Finding 的待批通知同一类型、同一入口，不另做渠道。
+function notifyToolApprovalPending(botId: string, sessionId: string, toolCallId: string): void {
+	const record = findToolApprovalByToolCall(sessionId, toolCallId);
+	if (!record) return;
+	const intent = toolIntentSnapshotOf(record);
+	const bot = getBot(botId);
+	const target = intent ? `${intent.repo} 的 ${intent.kind === "issue_comment" ? `Issue #${intent.issueNumber}` : `PR #${intent.prNumber}`}` : "目标页面";
+	addNotification({
+		type: "approval.pending",
+		title: `待批写操作：${record.toolName}`,
+		body: `${bot?.name ?? botId} 在对话中请求向 ${target} 发表评论，请到待批收件箱批准或驳回。`,
+		toolApprovalId: record.id,
+	});
+}
+
+// 工具待批改正文（P2-4）：只许改 body。请求里若带了锁定字段（repo /
+// kind / number）且与快照不一致回 400 且快照不变——编辑接口不得成为
+// 绕过策略仓库绑定的改参通道。正文本身的校验与状态要求在
+// updateToolApprovalBody（仅 pending、非空、长度、秘密）；成功写审计
+// edited（摘要即新正文），与 Finding 改文同一追溯口径。
+function editToolApprovalBodyRoute(id: string, body: { body?: unknown; repo?: unknown; kind?: unknown; number?: unknown }): ToolApproval | null {
+	const record = getToolApproval(id);
+	if (!record) return null;
+	const snap = toolIntentSnapshotOf(record);
+	if (snap) {
+		if (body?.repo !== undefined && body.repo !== snap.repo) throw badRequestError("仓库是锁定字段，不能在编辑时更改");
+		if (body?.kind !== undefined && body.kind !== snap.kind) throw badRequestError("评论种类是锁定字段，不能在编辑时更改");
+		const snapNumber = snap.kind === "issue_comment" ? snap.issueNumber : snap.prNumber;
+		if (body?.number !== undefined && body.number !== snapNumber) throw badRequestError("编号是锁定字段，不能在编辑时更改");
+	}
+	const next = updateToolApprovalBody(id, body?.body);
+	appendAudit({ botId: record.botId, intent: toolIntentSnapshotOf(next), result: "edited", toolApprovalId: id });
+	return next;
+}
+
 // 恢复续跑的落盘器：工具条目在 end 事件即时落盘（进程再重启也不丢），
 // assistant 文本在续跑结束时补上；seq 接在该会话既有最大值之后。
 function continuationPersister(botId: string, sessionId: string) {
@@ -541,6 +598,7 @@ function continuationPersister(botId: string, sessionId: string) {
 						seq: nextSeq++,
 						sessionId,
 					});
+					notifyToolApprovalPending(botId, sessionId, e.toolCallId);
 				}
 				return;
 			}
@@ -616,6 +674,14 @@ function rejectToolApprovalById(id: string): ToolApproval | null {
 	if (!record) return null;
 	if (record.status !== "pending" && record.status !== "approved") {
 		throw conflictError(`该工具待批已关闭（当前状态 ${record.status}），不能再驳回`);
+	}
+	// 已批准且写已在途时不能驳回（#36 审计 MAJOR）：在途的 POST 拦不住，
+	// 改成 rejected 只会让账本与外部副作用分叉（评论照发、记录却写驳回，
+	// 且状态机不许 rejected 再转 executed）。与中止接口同口径：在途写按
+	// 真实结果落账。未在途的已批准记录（等重试）仍可驳回，驳回后网关的
+	// 状态复查会拦下任何随后到达的执行。
+	if (record.status === "approved" && isToolWriteInFlight(id)) {
+		throw conflictError("该写操作正在执行，不能驳回；已发出的写会按真实结果落账");
 	}
 	const next = updateToolApproval(id, { status: "rejected", error: null });
 	appendAudit({
@@ -888,6 +954,31 @@ if (typeof body.timezone === "string") patch.timezone = body.timezone;
 return sendJson(res, 200, saveProfileSettings(patch));
 }
 if (path === "/api/chat" && req.method === "POST") return await handleChat(req, res);
+const runStateMatch = path.match(/^\/api\/chats\/([\w-]+)\/run-state$/);
+if (runStateMatch && req.method === "GET") {
+if (!getBot(runStateMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});
+// 对话窗格据此在 SSE 已收尾、run 仍停在待批或在途执行时保留中止入口
+// （#36 审计 MINOR）：active 只表示该 bot 此刻有活动 run（含停泊等待）。
+return sendJson(res, 200, { active: hasLiveRun(runStateMatch[1]) });
+}
+const abortMatch = path.match(/^\/api\/chats\/([\w-]+)\/abort$/);
+if (abortMatch && req.method === "POST") {
+if (!getBot(abortMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});
+const out = abortLiveRun(abortMatch[1]);
+if (!out.aborted) return sendJson(res, 200, { aborted: false});
+// 停在待批上的记录随 run 中止转 cancelled（P2-4）：基座会把等待以 deny
+// 结算、循环把该调用收尾为错误结果，但记录状态由宿主在这里定型，网关
+// 不会再碰 cancelled 的记录。正在执行中的调用不在此列（其结果由网关
+// 按真实结果落审计，中止不撤回已发出的写）。
+const cancelledToolApprovals: string[] = [];
+for (const rec of listToolApprovals({ status: "pending"})) {
+if (rec.sessionId !== out.sessionId) continue;
+updateToolApproval(rec.id, { status: "cancelled", error: null });
+appendAudit({ botId: rec.botId, intent: toolIntentSnapshotOf(rec), result: "cancelled", reason: "run_aborted", toolApprovalId: rec.id });
+cancelledToolApprovals.push(rec.id);
+}
+return sendJson(res, 200, { aborted: true, sessionId: out.sessionId, cancelledToolApprovals });
+}
 if (path === "/api/routines" && req.method === "GET") {
 const tz = profileTimezone();
 const status = scheduler.status(new Date());
@@ -930,7 +1021,10 @@ const approvalMatch = path.match(/^\/api\/approvals\/([\w-]+)\/(approve|reject|e
 if (approvalMatch && req.method === "POST") {
 // 工具待批（ta-…）与 Finding 共用批准/驳回路由，按 id 前缀分发（P2-3）。
 if (approvalMatch[1].startsWith("ta-")) {
-if (approvalMatch[2] === "edit") throw Object.assign(new Error("工具待批暂不支持修改参数"), { status: 409 });
+if (approvalMatch[2] === "edit") {
+const edited = editToolApprovalBodyRoute(approvalMatch[1], await readBody(req));
+return edited ? sendJson(res, 200, { approval: toToolApprovalView(edited) }) : sendJson(res, 404, { error: "待批项不存在" });
+}
 const handled = approvalMatch[2] === "approve" ? approveToolApprovalById(approvalMatch[1]) : rejectToolApprovalById(approvalMatch[1]);
 return handled ? sendJson(res, 200, { approval: toToolApprovalView(handled) }) : sendJson(res, 404, { error: "待批项不存在" });
 }
@@ -974,7 +1068,8 @@ throw err;
 }
 if (path === "/api/audit" && req.method === "GET") {
 const findingId = url.searchParams.get("findingId");
-return sendJson(res, 200, { records: listAudit(findingId? { findingId}: {})});
+const toolApprovalId = url.searchParams.get("toolApprovalId");
+return sendJson(res, 200, { records: listAudit({ ...(findingId? { findingId}: {}), ...(toolApprovalId? { toolApprovalId}: {})})});
 }
 if (path === "/api/findings" && req.method === "GET") {
 const filters: { status?: string; repo?: string; botId?: string } = {};

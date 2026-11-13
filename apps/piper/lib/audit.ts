@@ -16,7 +16,9 @@ import { redact } from "./redact.ts";
 // edited（拍板切片二）：批准前用户改了评论正文时落一条，intent 摘要即新正文；
 // 已批准状态下改文同时作废原批准（reason=approval_invalidated），审计里可追到
 // 「批的是哪一版、哪一版被改掉」。
-export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired", "edited"] as const;
+// cancelled（P2-4）：用户中止 run 时，仍停在待批的工具调用随之中止，
+// 记录转 cancelled 并落一条（reason=run_aborted），与 rejected_by_user 区分。
+export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired", "edited", "cancelled"] as const;
 export type AuditResult = (typeof AUDIT_RESULTS)[number];
 
 export interface IntentSummary {

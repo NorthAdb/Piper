@@ -6,9 +6,22 @@
 // 必须让用户在点下前看清后果）；下方加「已关闭」历史区（被驳回 / 被对账退役 /
 // 已执行的事项带原因留痕，不再无声消失）；通知里的「查看事项」经 focusId 直达
 // 本页对应条目并高亮（在已关闭区时自动展开该区）。
+// 人的介入面（P2-4）：同一收件箱并列对话工具待批（kind:"tool_call"，bot 在
+// 对话里经循环闸提出的写操作）——两类都能看全参数快照、批准、驳回、改
+// 评论正文；工具待批的批准只触发对话里继续执行，结果回流到本页与对话。
 import { ArrowLeftIcon, CheckIcon, ChevronDownIcon, ExternalLinkIcon, InboxIcon, PencilIcon, RotateCcwIcon, TriangleAlertIcon, XIcon } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { approveApproval, createAdHocApproval, editApprovalBody, listApprovals, rejectApproval, UnauthorizedError } from "./api";
+import {
+	approveApproval,
+	approveToolApproval,
+	createAdHocApproval,
+	editApprovalBody,
+	editToolApprovalBody,
+	listApprovals,
+	rejectApproval,
+	rejectToolApproval,
+	UnauthorizedError,
+} from "./api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -16,7 +29,7 @@ import { Input } from "@/components/ui/input";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import type { Approval, Bot } from "./model";
+import type { Approval, Bot, InboxItem, ToolApprovalItem } from "./model";
 
 const TYPE_LABEL: Record<string, string> = {
 	ci_failed: "CI 失败",
@@ -33,7 +46,23 @@ const CLOSED_STATUS_LABEL: Record<string, string> = {
 	executed: "已执行",
 	rejected: "已驳回",
 	expired: "已过期",
+	cancelled: "已取消",
+	failed: "执行失败",
 };
+
+// 工具待批（kind:"tool_call"）与 Finding 待批在同一列表里按 kind 分流渲染
+const isToolItem = (a: InboxItem): a is ToolApprovalItem => a.kind === "tool_call";
+
+function toolTitle(t: ToolApprovalItem): string {
+	return `对话写操作：${t.toolName}`;
+}
+
+// 工具待批的评论目标（快照里的 repo + 编号），批准回执与写操作框共用
+function toolTarget(t: ToolApprovalItem): string {
+	const s = t.argsSnapshot;
+	if (!s || typeof s.number !== "number") return "目标信息不完整";
+	return `${s.repo ?? ""} 的 ${s.kind === "issue_comment" ? "Issue" : "PR"} #${s.number}`;
+}
 
 // 关闭原因（后端给的是审计 reason 原文）→ 给人看的说明。
 function closeReasonText(a: Approval): string {
@@ -66,8 +95,8 @@ export function Inbox({
 	onUnauthorized: () => void;
 	focusId?: string | null;
 }) {
-	const [items, setItems] = useState<Approval[] | null>(null);
-	const [closed, setClosed] = useState<Approval[]>([]);
+	const [items, setItems] = useState<InboxItem[] | null>(null);
+	const [closed, setClosed] = useState<InboxItem[]>([]);
 	const [closedOpen, setClosedOpen] = useState(false);
 	const [confirmRejectId, setConfirmRejectId] = useState<string | null>(null);
 	const [highlightId, setHighlightId] = useState<string | null>(null);
@@ -118,12 +147,31 @@ export function Inbox({
 		return () => clearTimeout(t);
 	}, [focusTarget, items, closed]);
 
-	const act = async (a: Approval, action: "approve" | "reject") => {
+	const act = async (a: InboxItem, action: "approve" | "reject") => {
 		setBusyId(a.id);
 		setErr("");
 		setNotice("");
 		try {
-			if (action === "approve") {
+			if (isToolItem(a)) {
+				// 工具待批：批准只触发对话里继续执行（接口不等待执行完），结果
+				// 回流到对话工具卡与本页状态；驳回不产生任何写操作。
+				if (action === "approve") {
+					await approveToolApproval(a.id);
+					setNotice(
+						a.status === "approved"
+							? `已再次触发「${toolTitle(a)}」的执行，完成后状态会更新到这里。`
+							: `已批准「${toolTitle(a)}」，将在对话里继续执行，完成后状态会更新到这里。`,
+					);
+				} else {
+					await rejectToolApproval(a.id);
+					setConfirmRejectId(null);
+					setNotice(
+						a.status === "approved"
+							? `已驳回「${toolTitle(a)}」，将不再重试这条写操作。该事项已移入下方「已关闭」区。`
+							: `已驳回「${toolTitle(a)}」，不会执行任何写操作。该事项已移入下方「已关闭」区。`,
+					);
+				}
+			} else if (action === "approve") {
 				const { execution } = await approveApproval(a.id, a.intentHash);
 				if (execution.ok) {
 					setNotice(`已执行「${a.title}」，评论已发到 ${a.repo} 的 ${intentTarget(a)}${execution.commentUrl ? `：${execution.commentUrl}` : ""}`);
@@ -144,19 +192,25 @@ export function Inbox({
 		}
 	};
 
-	const saveEdit = async (a: Approval) => {
+	const saveEdit = async (a: InboxItem) => {
 		setBusyId(a.id);
 		setErr("");
 		setNotice("");
 		try {
-			const wasApproved = a.status === "approved";
-			await editApprovalBody(a.id, editText);
-			setEditId(null);
-			setNotice(
-				wasApproved
-					? `已保存「${a.title}」的新正文。原批准已作废，请按新正文重新批准。`
-					: `已保存「${a.title}」的新正文，批准时将按这份正文冻结执行。`,
-			);
+			if (isToolItem(a)) {
+				await editToolApprovalBody(a.id, editText);
+				setEditId(null);
+				setNotice(`已保存「${toolTitle(a)}」的新正文，批准时将按这份正文执行。`);
+			} else {
+				const wasApproved = a.status === "approved";
+				await editApprovalBody(a.id, editText);
+				setEditId(null);
+				setNotice(
+					wasApproved
+						? `已保存「${a.title}」的新正文。原批准已作废，请按新正文重新批准。`
+						: `已保存「${a.title}」的新正文，批准时将按这份正文冻结执行。`,
+				);
+			}
 			load();
 		} catch (e) {
 			if (e instanceof UnauthorizedError) onUnauthorized();
@@ -248,8 +302,32 @@ export function Inbox({
 							</div>
 						) : (
 							<div className="flex flex-col gap-4">
-								{items.map((a) => (
-									<Card
+								{items.map((a) =>
+									isToolItem(a) ? (
+										<ToolApprovalCard
+											key={a.id}
+											item={a}
+											botName={botName(a.botId)}
+											highlighted={highlightId === a.id}
+											cardRef={cardRef(a.id)}
+											busy={busyId === a.id}
+											editing={editId === a.id}
+											editText={editText}
+											confirmingReject={confirmRejectId === a.id}
+											onEditStart={() => {
+												setEditId(a.id);
+												setEditText(a.argsSnapshot?.body ?? "");
+											}}
+											onEditTextChange={setEditText}
+											onEditSave={() => void saveEdit(a)}
+											onEditCancel={() => setEditId(null)}
+											onApprove={() => void act(a, "approve")}
+											onAskReject={() => setConfirmRejectId(a.id)}
+											onCancelReject={() => setConfirmRejectId(null)}
+											onConfirmReject={() => void act(a, "reject")}
+										/>
+									) : (
+										<Card
 										key={a.id}
 										ref={cardRef(a.id)}
 										className={cn("gap-0 py-0 shadow-none", highlightId === a.id && "ring-2 ring-primary")}
@@ -448,8 +526,28 @@ export function Inbox({
 								</button>
 								{closedOpen ? (
 									<div className="mt-3 flex flex-col gap-3">
-										{closed.map((a) => (
-											<Card
+										{closed.map((a) =>
+											isToolItem(a) ? (
+												<Card
+													key={a.id}
+													ref={cardRef(a.id)}
+													className={cn("gap-0 py-0 opacity-80 shadow-none", highlightId === a.id && "opacity-100 ring-2 ring-primary")}
+												>
+													<CardHeader className="flex flex-row items-center gap-2 px-4 py-3">
+														<CardTitle className="min-w-0 flex-1 truncate text-sm">{toolTitle(a)}</CardTitle>
+														<Badge variant="outline">对话工具</Badge>
+														<Badge variant="secondary">{CLOSED_STATUS_LABEL[a.status] ?? a.status}</Badge>
+													</CardHeader>
+													<CardContent className="flex flex-col gap-1.5 px-4 pb-4 text-sm text-muted-foreground">
+														<span className="text-xs">
+															Bot：{botName(a.botId)} · 目标：{toolTarget(a)} · 关闭于 {new Date(a.updatedAt).toLocaleString()}
+														</span>
+														{a.status === "cancelled" ? <p>随对话 run 中止而取消，未执行。</p> : null}
+														{a.error ? <p>原因：{a.error}</p> : null}
+													</CardContent>
+												</Card>
+											) : (
+												<Card
 												key={a.id}
 												ref={cardRef(a.id)}
 												className={cn("gap-0 py-0 opacity-80 shadow-none", highlightId === a.id && "opacity-100 ring-2 ring-primary")}
@@ -482,5 +580,135 @@ export function Inbox({
 				)}
 			</div>
 		</div>
+	);
+}
+
+// 对话工具待批卡（P2-4）：与 Finding 卡同一版式语言——标题 + 种类/状态徽章、
+// 所属 bot 与目标、完整参数快照（写操作框）、批准 / 驳回。评论正文可在
+// 待批准时改（仓库、种类、编号是锁定字段，界面上就不给改，服务端也会拒）。
+// 批准只触发对话里继续执行，卡片随列表刷新变状态（执行完进「已关闭」区）。
+function ToolApprovalCard({
+	item: t,
+	botName,
+	highlighted,
+	cardRef,
+	busy,
+	editing,
+	editText,
+	confirmingReject,
+	onEditStart,
+	onEditTextChange,
+	onEditSave,
+	onEditCancel,
+	onApprove,
+	onAskReject,
+	onCancelReject,
+	onConfirmReject,
+}: {
+	item: ToolApprovalItem;
+	botName: string;
+	highlighted: boolean;
+	cardRef: (el: HTMLDivElement | null) => void;
+	busy: boolean;
+	editing: boolean;
+	editText: string;
+	confirmingReject: boolean;
+	onEditStart: () => void;
+	onEditTextChange: (v: string) => void;
+	onEditSave: () => void;
+	onEditCancel: () => void;
+	onApprove: () => void;
+	onAskReject: () => void;
+	onCancelReject: () => void;
+	onConfirmReject: () => void;
+}) {
+	const body = typeof t.argsSnapshot?.body === "string" ? t.argsSnapshot.body : null;
+	return (
+		<Card ref={cardRef} className={cn("gap-0 py-0 shadow-none", highlighted && "ring-2 ring-primary")}>
+			<CardHeader className="flex flex-row items-center gap-2 px-4 py-3">
+				<CardTitle className="min-w-0 flex-1 truncate text-sm">{toolTitle(t)}</CardTitle>
+				<Badge variant="outline">对话工具</Badge>
+				<Badge variant={t.status === "approved" ? "default" : "secondary"}>{t.status === "approved" ? "已批准 · 待执行" : "待批准"}</Badge>
+			</CardHeader>
+			<CardContent className="flex flex-col gap-3 px-4 pb-4">
+				<div className="flex flex-col gap-1 text-xs text-muted-foreground">
+					<span>
+						Bot：{botName} · 工具：{t.toolName}
+					</span>
+					<span>提出时间：{new Date(t.createdAt).toLocaleString()}</span>
+				</div>
+				<div className="rounded-lg border bg-card px-3 py-2.5">
+					<div className="flex items-center pb-1.5">
+						<p className="text-xs font-medium tracking-wider text-muted-foreground uppercase">批准后将执行的写操作</p>
+						{body !== null && t.status === "pending" && !editing ? (
+							<Button type="button" size="sm" variant="ghost" className="ml-auto h-6 px-2 text-xs" disabled={busy} onClick={onEditStart}>
+								<PencilIcon />
+								改正文
+							</Button>
+						) : null}
+					</div>
+					{body !== null ? (
+						<>
+							<p className="text-sm">在 {toolTarget(t)} 下发表评论：</p>
+							{editing ? (
+								<div className="flex flex-col gap-2 pt-1.5">
+									<Textarea value={editText} onChange={(e) => onEditTextChange(e.target.value)} rows={5} className="font-mono text-xs" />
+									<p className="text-xs text-muted-foreground">批准时按这份正文冻结，网关只发批准的那一版。仓库、种类与编号不可改。</p>
+									<div className="flex gap-2">
+										<Button type="button" size="sm" disabled={busy || !editText.trim()} onClick={onEditSave}>
+											保存正文
+										</Button>
+										<Button type="button" size="sm" variant="outline" disabled={busy} onClick={onEditCancel}>
+											取消
+										</Button>
+									</div>
+								</div>
+							) : (
+								<pre className="pt-1.5 font-mono text-xs break-words whitespace-pre-wrap">{body}</pre>
+							)}
+						</>
+					) : (
+						<pre className="font-mono text-xs break-words whitespace-pre-wrap">{JSON.stringify(t.argsSnapshot, null, 2)}</pre>
+					)}
+				</div>
+				{t.status === "approved" && t.error ? (
+					<p className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm">
+						上次执行未成功：{t.error}。问题解决后点「再次执行」重试，或驳回关闭本事项。
+					</p>
+				) : null}
+				{confirmingReject ? (
+					<div className="flex flex-col gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5">
+						<p className="flex items-start gap-2 text-sm">
+							<TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
+							<span>
+								{t.status === "approved"
+									? "这条写操作已批准：若正在执行，驳回会被拒绝（已发出的写按真实结果落账）；若在等重试，驳回后不再重试。"
+									: "驳回后这次工具调用不会执行，对话里会记为已拒绝。bot 之后仍可在对话中重新提出。"}
+							</span>
+						</p>
+						<div className="flex gap-2">
+							<Button type="button" size="sm" variant="destructive" disabled={busy} onClick={onConfirmReject}>
+								<XIcon />
+								确认驳回
+							</Button>
+							<Button type="button" size="sm" variant="outline" disabled={busy} onClick={onCancelReject}>
+								取消
+							</Button>
+						</div>
+					</div>
+				) : (
+					<div className="flex gap-2">
+						<Button type="button" size="sm" disabled={busy} onClick={onApprove}>
+							{t.status === "approved" ? <RotateCcwIcon /> : <CheckIcon />}
+							{t.status === "approved" ? "再次执行" : "批准并执行"}
+						</Button>
+						<Button type="button" size="sm" variant="outline" disabled={busy} onClick={onAskReject}>
+							<XIcon />
+							驳回
+						</Button>
+					</div>
+				)}
+			</CardContent>
+		</Card>
 	);
 }
