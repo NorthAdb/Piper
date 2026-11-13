@@ -379,6 +379,10 @@ export function historyToMessages(entries: HistoryEntry[]): ChatMessage[] {
 		if (e.role === "tool" && e.toolCallId) lastToolIndex.set(e.toolCallId, i);
 	});
 	for (const [i, e] of entries.entries()) {
+		// 上下文装配记录（P2-6）是轮元数据，不是对话内容：有自己的读取面
+		// （GET /api/sessions/:sessionId/context），不画成系统卡——与服务端
+		// buildTrace 跳过该 kind 同口径（#38 审计 MINOR）。
+		if (e.kind === "context_assembly") continue;
 		if (e.role === "thinking") {
 			pendingLead.push({
 				type: "reasoning",

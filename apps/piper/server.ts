@@ -453,7 +453,8 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
 		resolvePendingSeen = r;
 	});
 	const run = streamChat({
-		systemPrompt: `${bot.systemPrompt}\n\n${botSelfFacts(bot, { runsMorningScan: morningRoutine()?.botId === bot.id })}\n\n\n${readAboutMe()}`,
+		systemPrompt: `${bot.systemPrompt}\n\n${botSelfFacts(bot, { runsMorningScan: morningRoutine()?.botId === bot.id })}`,
+		aboutMe: readAboutMe(),
 		history,
 		message,
 		botId: bot.id,
@@ -957,6 +958,28 @@ if (botToolsMatch && req.method === "GET") {
 const bot = getBot(botToolsMatch[1]);
 if (!bot) return sendJson(res, 404, { error: "bot 不存在"});
 return sendJson(res, 200, { botId: bot.id, tools: toolRegistryForBot(bot)});
+}
+// 上下文装配记录（P2-6）：按 sessionId 查该轮的逐级装配记录（存在
+// 会话流水的 context_assembly 条目里，见 lib/context-assembler.ts 与
+// kernel 的落盘）。sessionId 逐轮唯一，跨 bot 流水找第一条命中；同
+// sessionId 有多条时取最后一条（同一轮只落一条，此为兜底）。
+const sessionContextMatch = path.match(/^\/api\/sessions\/([\w-]+)\/context$/);
+if (sessionContextMatch && req.method === "GET") {
+	const sid = sessionContextMatch[1];
+	for (const bot of listBots()) {
+		const assemblies = readSession(bot.id).filter((e) => e.kind === "context_assembly" && e.sessionId === sid);
+		const last = assemblies[assemblies.length - 1];
+		if (last) {
+			return sendJson(res, 200, {
+				sessionId: sid,
+				botId: bot.id,
+				modelId: typeof last.modelId === "string" ? last.modelId : null,
+				assembledAt: typeof last.assembledAt === "string" ? last.assembledAt : null,
+				stages: Array.isArray(last.stages) ? last.stages : [],
+			});
+		}
+	}
+	return sendJson(res, 404, { error: "该会话没有装配记录" });
 }
 if (path === "/api/about-me" && req.method === "GET") return sendJson(res, 200, { markdown: readAboutMe()});
 if (path === "/api/about-me" && req.method === "PUT") {

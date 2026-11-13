@@ -2680,3 +2680,71 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   不补只读实现（仅登记 + 策略先行）；不做工具搜索/延迟加载产品；
   不接新 MCP 市场。验收截图（两 bot 工具页签）按惯例以用户本机
   实例为准，VM 无真实数据不拿替身冒充——诚实延期，与 P2-4 同口径。
+
+## P2-6 可观测上下文装配器实测（第二件切片六，2026-11-13）
+
+- **装配器（新增 lib/context-assembler.ts）**：每趟 streamChat 一份
+  实例，按锁定顺序装配 system → tools → about_me → memory →
+  history → turn，逐级产出 AssemblerStageRecord{tokensBefore,
+  tokensAfter, dropped, cacheBreak?}。token 估算 = 字符数 / 4 向上
+  取整（与 pi-ai estimate 同族的启发式，是装配器自己的记账口径、
+  不冒充服务商真实分词）。memory 是预留空段（0/0 仍出记录），
+  以后插入记忆层时不打乱它前面的前缀。
+- **接线（kernel.streamChat，仅 botId + sessionId 在场的产品
+  路径）**：systemPrompt 改由装配器组装——调用方给 system 段
+  （人设 + botSelfFacts），about_me 改为单独入参，工具说明散文附
+  卷尾，拼串与本件之前线上字节序一致；工具声明由装配器按 name
+  排序后再建 Agent（稳定顺序口径锁定为 name 排序，记录顺序就是
+  实际发送顺序）；Agent 显式设置 sessionId（handleChat 传入的
+  s-…）；每个请求前经基座 prepareRequest（定型前缀四级 + 趟内
+  换模型检测）与 transformContext（历史窗口裁剪 + history/turn
+  两级定型）两钩接入——装配期的顺序与裁剪只走钩子，不在
+  initialState.messages 上直接动刀（第一轮格式转换 convertHistory
+  保留，toPiMessages 改为它的薄包装）。
+- **历史窗口归属变更**：streamChat 路径的「最近 20 条」窗口从
+  toPiMessages 的静默 slice 改为装配器在 transformContext 里
+  裁剪——被丢弃条目的 dropped.ids（流水条目下标 m<index>）与
+  before/after 数字从此可见。resumeToolApproval 的 transcript
+  重建不经装配器，仍走 toPiMessages 自带 slice，口径不变。本轮
+  user 条目（handleChat 在读流水前刚落盘、sessionId 与本轮相同）
+  记账上归 turn 级、不算 history；它仍留在 initialState 里，
+  基座 prompt() 也仍会再追加一份本轮消息——既有线上形状，本件
+  未改，只把记账口径分清。
+- **击穿记录**：换模型（与上一轮装配记录的 modelId 不同，或趟内
+  prepareRequest 报来不同模型）→ system 级 cacheBreak:
+  model_switch；装配顺序被改（stageOrder 覆盖、仅测试可达）→
+  被调换的级记 reorder，默认顺序的两趟装配不记任何击穿；history
+  的 tokensBefore 达到 contextWindow − 16384（沿用 coding-agent
+  压缩的预留口径）→ history 级记 compact——注意 Piper 的
+  agent-core 路径没有摘要压缩，本路径实际发生的削减就是窗口
+  裁剪，compact 在此表示「已越过 coding-agent 口径的压缩触发
+  点」，before/after 两侧数字把这件事摊开。cacheBreak 的 ttl
+  是词表预留值，本件不产生。
+- **记录落盘与读取**：run 收尾时装配记录以 kind:
+  context_assembly 条目落进会话流水（带 sessionId / modelId /
+  stages / assembledAt，落盘失败不挡对话）；新增
+  GET /api/sessions/:sessionId/context（登录可访，未登录 401、
+  无记录 404）返回该轮记录。装配记录是「关于这一轮」的元数据、
+  不是对话事件：buildTrace 显式跳过该 kind，不进轨迹时间线
+  （轨迹的逐轮事件序列口径因此不变，test:trace 全绿）；前端
+  historyToMessages 同样跳过该 kind，不画成空的系统卡（#38
+  审计 MINOR：初版只修了轨迹、漏了对话区历史还原，刷新/切 bot
+  后每轮会多出一张徽章为 context_assembly 的空卡，已一并修掉
+  并在测试里以源码断言钉住）。
+- **亲跑验收**（npm run test:context-assembler，新脚本，已并入
+  npm test 链）：**11/11**——A 段进程内 7 条（默认装配六级齐全
+  且数字与估算口径逐项一致、工具按 name 排序、拼串与既有格式
+  字节一致；history 与 about_me 对调 → 两级 reorder；跨轮与趟
+  内换模型 → model_switch；30 条大消息越阈值 → 保留 20 条、
+  dropped m0..m9、compact、before 3750 / after 2500；仅窗口未
+  到阈值 → 无 compact；异形消息不抛错且同趟幂等；前端
+  historyToMessages 跳过装配记录的源码断言钉）；B 段真实
+  server + 模型替身 4 条（启动登录、接口 401/404、聊一轮按
+  sessionId 读回六级记录、设置换 modelId 再聊 → 新会话 system
+  级 model_switch 且旧会话记录不变）。全套 npm test 与根级
+  npm run check 的最终数字以 PR 描述为准。
+- **明确不做**（按切片）：不重写 Clear → Prune → Compact →
+  Reset，不引 coding-agent 摘要压缩；不做记忆层写入（memory
+  段仅占位）；resume 恢复路径不接装配器（切片只点名
+  streamChat）；不做装配记录的前端页面（接口 + 流水条目即本
+  件的可见面）。

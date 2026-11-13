@@ -29,14 +29,15 @@ import { isThinkingLevel, readModelSettingsFile } from "./settings.ts";
 import type { ThinkingLevel } from "./settings.ts";
 import { getCatalogModel, resolveModelProviderId } from "./model-providers.ts";
 import { redact } from "./redact.ts";
-import { APP_DIR, getBot, readSession } from "./store.ts";
+import { APP_DIR, appendSession, getBot, readSession } from "./store.ts";
 import type { Bot, SessionEntry } from "./store.ts";
 import { PolicyEngine } from "./policy.ts";
 import { createToolApproval, findToolApprovalByToolCall, snapshotConflictReason, updateToolApproval } from "./tool-approvals.ts";
 import { GITHUB_COMMENT_TOOL_NAME } from "./github-comment.ts";
 import { agentToolsForBot } from "./tool-registry.ts";
+import { ContextAssembler, HISTORY_WINDOW_MESSAGES } from "./context-assembler.ts";
 import type { Api, ApiKeyAuth, AssistantMessage, CreateProviderOptions, Message, Model, ModelThinkingLevel, MutableModels, Provider, ProviderStreams, ToolCall, Usage } from "@earendil-works/pi-ai";
-import type { Agent, AgentTool, AgentToolResult, ThinkingLevel as AgentThinkingLevel } from "@earendil-works/pi-agent-core";
+import type { Agent, AgentMessage, AgentTool, AgentToolResult, ThinkingLevel as AgentThinkingLevel } from "@earendil-works/pi-agent-core";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
 
@@ -164,7 +165,11 @@ async function buildModelsAndModel(cfg: ModelConfig): Promise<{ models: MutableM
 	return { models, model, thinkingLevel };
 }
 
-function toPiMessages(history: SessionEntry[], cfg: ModelConfig): Message[] {
+// 会话流水 → 基座消息（第一轮格式转换）：只取 user/assistant 文本
+// 条目，不做窗口裁剪（裁剪的归属见下）。messages / ids / entries 逐条
+// 对齐：id = 条目在流水数组里的下标 m<index>，装配器 history 级的
+// dropped.ids 据此回指流水条目。
+function convertHistory(history: SessionEntry[], cfg: ModelConfig): { messages: Message[]; ids: string[]; entries: SessionEntry[] } {
 	const zeroUsage: Usage = {
 		input: 0,
 		output: 0,
@@ -173,15 +178,18 @@ function toPiMessages(history: SessionEntry[], cfg: ModelConfig): Message[] {
 		totalTokens: 0,
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	return history
-		.filter((h): h is SessionEntry & { text: string } => (h.role === "user" || h.role === "assistant") && typeof h.text === "string" && Boolean(h.text))
-		.slice(-20)
-		.map((h): Message =>
-			h.role === "user"
-				? { role: "user", content: [{ type: "text", text: h.text }], timestamp: Date.now() }
+	const kept = history
+		.map((h, i) => ({ h, i }))
+		.filter((x): x is { h: SessionEntry & { text: string }; i: number } => (x.h.role === "user" || x.h.role === "assistant") && typeof x.h.text === "string" && Boolean(x.h.text));
+	return {
+		entries: kept.map((x) => x.h),
+		ids: kept.map((x) => `m${x.i}`),
+		messages: kept.map((x): Message =>
+			x.h.role === "user"
+				? { role: "user", content: [{ type: "text", text: x.h.text }], timestamp: Date.now() }
 				: {
 						role: "assistant",
-						content: [{ type: "text", text: h.text }],
+						content: [{ type: "text", text: x.h.text }],
 						api: "openai-completions",
 						provider: "piper",
 						model: cfg.modelId,
@@ -189,7 +197,22 @@ function toPiMessages(history: SessionEntry[], cfg: ModelConfig): Message[] {
 						stopReason: "stop",
 						timestamp: Date.now(),
 					},
-		);
+		),
+	};
+}
+
+function toPiMessages(history: SessionEntry[], cfg: ModelConfig): Message[] {
+	return convertHistory(history, cfg).messages.slice(-HISTORY_WINDOW_MESSAGES);
+}
+
+// 上一轮装配记录里的模型（P2-6 换模型检测）：入参 history 是本轮开始
+// 前读到的全量流水，倒序第一条 context_assembly 即上一轮的装配记录。
+function previousAssemblyModelId(history: SessionEntry[]): string | null {
+	for (let i = history.length - 1; i >= 0; i--) {
+		const e = history[i];
+		if (e.kind === "context_assembly") return typeof e.modelId === "string" ? e.modelId : null;
+	}
+	return null;
 }
 
 // 从任意消息形状里掏纯文本（AgentMessage / AssistantMessage 的 content 块）。
@@ -414,6 +437,7 @@ function subscribeChatEvents(
 // 返回最终助手文本。失败抛错（err.code 区分 BASE_NOT_BUILT / MODEL_ERROR 等），由路由层转 SSE error 事件。
 export async function streamChat({
 	systemPrompt,
+	aboutMe,
 	history = [],
 	message,
 	onEvent,
@@ -421,6 +445,7 @@ export async function streamChat({
 	sessionId,
 }: {
 	systemPrompt: string;
+	aboutMe?: string;
 	history?: SessionEntry[];
 	message: string;
 	onEvent: (event: ChatEvent) => void;
@@ -438,19 +463,60 @@ export async function streamChat({
 	const tools = botId ? agentToolsForBot(getBot(botId), sessionId ?? "") : [];
 	const { agentCore } = await loadRuntime();
 	const { models, model, thinkingLevel } = await buildModelsAndModel(cfg);
-	const toolNote = tools.length
-		? `\n\n你可以使用这些工具：${tools.map((t) => t.name).join("、")}。其中写操作工具会先经用户批准才会真正执行；工具被拒绝或失败时，把原因如实告诉用户，不要编造结果。`
+	// 上下文装配（P2-6）：仅产品路径（botId + sessionId 在场）启用。
+	// 装配器接管四件事：systemPrompt 按锁定顺序组装（system 段由调用
+	// 方给、about_me 段单独入参、工具说明散文附卷尾）、工具声明按
+	// name 排序、Agent 显式设置 sessionId、每个请求前经
+	// prepareRequest / transformContext 两钩度量并在钩子里裁剪历史
+	// （装配期的顺序与裁剪只走钩子，不在 initialState 上直接动刀——
+	// 第一轮格式转换 convertHistory 仍在此处，窗口在钩子里生效）。
+	// 本轮 user 条目是 handleChat 在读流水前刚落盘的（条目 sessionId
+	// 与本轮相同）：记账上它不算 history（归 turn 级），但仍留在
+	// initialState 里——线上既有形状不变（基座 prompt() 还会再追加
+	// 一份本轮消息），本件只把记账口径分清，不改这件事。
+	const assembler =
+		botId && sessionId
+			? new ContextAssembler({
+					sessionId,
+					modelId: cfg.modelId,
+					previousModelId: previousAssemblyModelId(history),
+					contextWindow: model.contextWindow,
+				})
+			: null;
+	const orderedTools = assembler ? assembler.orderTools(tools) : tools;
+	const toolNote = orderedTools.length
+		? `\n\n你可以使用这些工具：${orderedTools.map((t) => t.name).join("、")}。其中写操作工具会先经用户批准才会真正执行；工具被拒绝或失败时，把原因如实告诉用户，不要编造结果。`
 		: "";
+	const converted = convertHistory(history, cfg);
+	let historyCount = converted.messages.length;
+	if (assembler) {
+		const lastEntry = converted.entries[converted.entries.length - 1];
+		if (lastEntry && lastEntry.role === "user" && lastEntry.sessionId === sessionId) historyCount -= 1;
+		assembler.setHistorySource(historyCount, converted.ids);
+	}
+	const composedSystemPrompt = assembler
+		? assembler.composeSystemPrompt({ system: systemPrompt, aboutMe: aboutMe ?? "", trailingNote: toolNote })
+		: systemPrompt + (aboutMe ? `\n\n\n${aboutMe}` : "") + toolNote;
 	const agent = new agentCore.Agent({
 		initialState: {
-			systemPrompt: systemPrompt + toolNote,
+			systemPrompt: composedSystemPrompt,
 			model,
-			messages: toPiMessages(history, cfg),
-			tools,
+			messages: assembler ? converted.messages : converted.messages.slice(-HISTORY_WINDOW_MESSAGES),
+			tools: orderedTools,
 			thinkingLevel,
 		},
 		streamFn: (m, context, options) => models.streamSimple(m, context, options),
+		...(sessionId ? { sessionId } : {}),
 		...(botId ? gateHooks(botId, sessionId ?? "") : {}),
+		...(assembler
+			? {
+					transformContext: (messages: AgentMessage[]) => assembler.transformContext(messages),
+					prepareRequest: ({ model: requestModel }: { model?: { id?: string } }) => {
+						assembler.notePrepareRequest(requestModel?.id);
+						return undefined;
+					},
+				}
+			: {}),
 	});
 	const state = { finalText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state, sessionId);
@@ -462,6 +528,23 @@ export async function streamChat({
 		throw Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" });
 	} finally {
 		unsubscribe();
+		// 装配记录落盘（P2-6）：挂在会话流水上（kind: context_assembly），
+		// 按 sessionId 经 GET /api/sessions/:sessionId/context 可读；
+		// 落盘失败不挡对话本身。
+		if (assembler && botId && sessionId && assembler.hasRecords()) {
+			try {
+				appendSession(botId, {
+					role: "system",
+					kind: "context_assembly",
+					sessionId,
+					modelId: cfg.modelId,
+					stages: assembler.records(),
+					assembledAt: new Date().toISOString(),
+				});
+			} catch {
+				/* 装配记录落盘失败不挡对话本身 */
+			}
+		}
 		if (sessionId && liveAgents.get(sessionId) === agent) liveAgents.delete(sessionId);
 		if (botId) clearLiveRun(botId, agent);
 	}
