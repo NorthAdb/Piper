@@ -985,6 +985,9 @@ if (sessionContextMatch && req.method === "GET") {
 				modelId: typeof last.modelId === "string" ? last.modelId : null,
 				assembledAt: typeof last.assembledAt === "string" ? last.assembledAt : null,
 				stages: Array.isArray(last.stages) ? last.stages : [],
+				// 预算计数快照（P2-8）：该段 run 的步数/token/外部
+				// 调用与跳闸项，随装配记录一并可读；旧记录无此字段回 null。
+				budget: (last as { budget?: unknown }).budget ?? null,
 			});
 		}
 	}
