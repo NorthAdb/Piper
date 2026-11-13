@@ -17,7 +17,7 @@ import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
 import { ArrowUpIcon, Loader2Icon, MessageSquareIcon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { abortChat, confirmDraft, getRunState, listMessages, streamChat, UnauthorizedError } from "./api";
+import { abortChat, confirmDraft, getRunState, listApprovals, listMessages, streamChat, UnauthorizedError } from "./api";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Bot, ChatMessage, ChatPart } from "./model";
@@ -128,30 +128,71 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		return () => clearInterval(t);
 	}, [running]);
 
-	// 待批轮询（#36 审计 MINOR）：对话里有待批准工具卡且本端不在 running
-	// （SSE 已按契约收尾）时，每 3 秒问一次 run-state；run 落定（active
-	// 由真变假）后重拉历史，工具卡从待批准切到终态。
+	// 待批轮询（#36 审计 MINOR + 复审留项）：本端不在 running（SSE 已按
+	// 契约收尾）但服务端 run 可能还活着时——对话里有待批准工具卡、或挂
+	// 载时探到活动 run——每 3 秒问一次 run-state；run 落定（active 由真
+	// 变假）后重拉历史，工具卡从待批准切到终态。轮询同时查待批记录
+	// 状态：历史仍是 pending 时，已批准在途与真待批要分开报（复审留项：
+	// 状态行不能把正在执行说成等待批准）；没有待批卡但 run 仍活跃
+	// （例如批准后续跑还在生成）时同样保留状态行与中止入口。
 	const pendingToolPart = messages
 		.flatMap((m) => m.parts)
 		.filter((p): p is Extract<ChatPart, { type: "tool" }> => p.type === "tool" && p.phase === "pending")
 		.at(-1);
 	const hasPendingTool = pendingToolPart !== undefined;
+	const [watchRun, setWatchRun] = useState(false);
+	const [pendingRecordStatus, setPendingRecordStatus] = useState<string | null>(null);
 	useEffect(() => {
-		if (running || !hasPendingTool) return;
+		if (hasPendingTool) setWatchRun(true);
+	}, [hasPendingTool]);
+	// 挂载时探一次：run 活跃但历史里没有待批准卡也要进轮询（复审留项）。
+	useEffect(() => {
+		let cancelled = false;
+		getRunState(bot.id)
+			.then((r) => {
+				if (!cancelled && r.active) {
+					serverRunActiveRef.current = true;
+					setServerRunActive(true);
+					setWatchRun(true);
+				}
+			})
+			.catch(() => {});
+		return () => {
+			cancelled = true;
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [bot.id]);
+	useEffect(() => {
+		if (running || !watchRun) return;
 		let cancelled = false;
 		const check = () => {
 			getRunState(bot.id)
 				.then((r) => {
 					if (cancelled) return;
-					if (serverRunActiveRef.current && !r.active) {
-						listMessages(bot.id)
-							.then((entries) => {
-								if (!cancelled) setMessages(historyToMessages(entries));
+					if (!r.active) {
+						if (serverRunActiveRef.current) {
+							listMessages(bot.id)
+								.then((entries) => {
+									if (!cancelled) setMessages(historyToMessages(entries));
+								})
+								.catch(() => {});
+						}
+						serverRunActiveRef.current = false;
+						setServerRunActive(false);
+						setWatchRun(false);
+						return;
+					}
+					serverRunActiveRef.current = true;
+					setServerRunActive(true);
+					if (pendingToolPart) {
+						listApprovals()
+							.then(({ approvals, closed }) => {
+								if (cancelled) return;
+								const rec = [...approvals, ...closed].find((a) => a.kind === "tool_call" && a.toolCallId === pendingToolPart.id);
+								setPendingRecordStatus(rec ? rec.status : null);
 							})
 							.catch(() => {});
 					}
-					serverRunActiveRef.current = r.active;
-					setServerRunActive(r.active);
 				})
 				.catch((e: unknown) => {
 					if (!cancelled && e instanceof UnauthorizedError) onUnauthorized();
@@ -164,7 +205,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 			clearInterval(t);
 		};
 		// eslint-disable-next-line react-hooks/exhaustive-deps
-	}, [running, hasPendingTool, bot.id]);
+	}, [running, watchRun, bot.id]);
 
 	const setMessages = (next: readonly ChatMessage[]) => {
 		messagesRef.current = [...next];
@@ -422,7 +463,13 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
 							<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
 								<Loader2Icon className="size-3.5 animate-spin" />
-								<span>{pendingToolPart ? `等待批准：${pendingToolPart.name}（请到待批收件箱处理，或在下方中止本轮）` : "已批准，正在执行…"}</span>
+								<span>
+									{pendingToolPart
+										? pendingRecordStatus === "approved"
+											? `已批准，正在执行：${pendingToolPart.name}…`
+											: `等待批准：${pendingToolPart.name}（请到待批收件箱处理，或在下方中止本轮）`
+										: "正在后台运行…（可在下方中止本轮）"}
+								</span>
 							</div>
 						</div>
 					) : null}

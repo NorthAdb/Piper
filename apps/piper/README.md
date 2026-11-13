@@ -2524,6 +2524,9 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   「执行失败」）；批准按钮文案区分「批准并执行」与执行失败后的「再次
   执行」；驳回两步确认（工具路径无去重冷却，bot 可重新提出，与
   Finding 的 14 天冷却文案分开）。左栏收件箱角标计数同步计入两类。
+  （审计返工补记：驳回确认文案按状态区分——pending 态仍明示不会执行；
+  approved 态明示正在执行时驳回会被拒绝、在等重试时驳回后不再重试，
+  成功提示亦随状态区分；见文末「P2-4 审计返工补记」。）
 - **对话内工具卡待批准态**：实时流与历史还原同一口径——工具条目按
   toolCallId 取最后一条，`status: "pending"` 还原为「待批准」卡（不显示
   结果区，提示去收件箱批准/驳回），不再据 endedAt 把 pending 显示成
@@ -2557,14 +2560,17 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
 - **亲跑验收**（`npm run test:intervention`，新脚本，已并入 `npm test`
   链）：A 段进程内 3 条——原子落盘无 .tmp 残留、损坏隔离（原文件改名
   保留内容、新写入从新表开始）、改正文 pending 只改 body / executed
-  回 409 / 空正文与疑似含秘密回 400；B 段真实 server + 双替身 9 条——
+  回 409 / 空正文与疑似含秘密回 400；B 段真实 server + 双替身 12 条——
   未登录中止 401、待批通知带 toolApprovalId、改正文锁定字段 400 且
   快照不变 + 审计 edited 预览为新正文、批准按新正文恰好发一次且
   `/api/audit?toolApprovalId=` 可追而 `?findingId=` 查不到、待批中
   中止（cancelled + 审计 + 零写入 + 会话 error 终态 + 再批准 409）、
   无 run 中止回 aborted:false、执行中中止（在途写完成落账、同批无
   额外写）、同批双待批批一后 SIGKILL 重启批二（两条正文各发一次、
-  第一条再批准 409）。全套 `npm test` 与根级 `npm run check` 结果见
+  第一条再批准 409）、在途驳回回 409（记录保持 approved、在途写完成落
+  executed 恰好一次、无 rejected 审计，B10）、run-state（无 run false /
+  待批停泊 true / 落定 false / 未登录 401，B11）、暂时性失败后驳回对照
+  （approved+error 未在途时驳回成功、零写入，B12）。全套 `npm test` 与根级 `npm run check` 结果见
   PR 描述。
 - **验收截图**：待批工具卡、收件箱两类并列、工具待批详情三张界面图
   需在真实界面核对——本机（VM）实例无用户数据，截图以用户本机实例
@@ -2585,12 +2591,14 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   未在途的已批准记录（等重试）仍可驳回。收件箱文案随之分态：确认框
   与成功提示对已批准记录不再说「不会执行任何写操作」。新验收 B10
   钉住：在途驳回 409、记录保持 approved、写完成落 executed 恰好
-  一次、无 rejected 审计。
+  一次、无 rejected 审计；在途的确定性信号是网关领取时同步写的
+  executing 审计；B12 对照：暂时性失败后 approved+error、未在途时
+  驳回仍成功、零写入。
 - **MINOR：待批后对话里中止入口随 SSE 收尾消失，已修。** 新增
   `GET /api/chats/:botId/run-state`（kernel `hasLiveRun`，含停在待批
   与已批准在途）；对话里有待批准工具卡且本端不在 running 时，窗格
   每 3 秒轮询该接口，run 活跃则保留「等待批准」状态行与「中止本轮」
   按钮，run 落定后自动重拉一次历史让工具卡切到终态。新验收 B11
   钉住 run-state 的 401 与 false→true→false。
-- 返工后亲跑：`test:intervention` 增至 **14/14**，其余套件计数不变，
+- 返工后亲跑：`test:intervention` 增至 **15/15**，其余套件计数不变，
   全套与根级 check 见 PR 回复评论。
