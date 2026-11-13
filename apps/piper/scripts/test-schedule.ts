@@ -1,4 +1,5 @@
-// 定时调度测试（P1-4）：假时钟驱动 lib/schedule.ts 的状态机，禁止依赖真实时间流逝。
+// 定时调度测试（P1-4；P2-7 起状态机在 lib/job-runtime.ts）：假时钟驱动
+// JobRuntime 的调度状态机与 lib/schedule.ts 的纯时间助手，禁止依赖真实时间流逝。
 // 用法（在 apps/piper 下）：node dist/scripts/test-schedule.js（或 npm run test:schedule）
 // 覆盖：下一次运行计算（时区换算）、到点只触发一次、失败有限补跑、成功后同周期不再跑、
 // 启动补跑判定（已过点未成功补一次 / 已成功不补 / 未到点不补）、并发重入防护、
@@ -12,7 +13,31 @@ import { join } from "node:path";
 const tmp = mkdtempSync(join(tmpdir(), "piper-schedule-"));
 process.env.PIPER_DATA_DIR = join(tmp, "data");
 
-const { createScheduler, migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../lib/schedule.ts");
+const { migrateScheduleFields, nextRunAfter, parseScheduleTime, shouldCatchUp } = await import("../lib/schedule.ts");
+const { createJobRuntime } = await import("../lib/job-runtime.ts");
+
+// P2-7 适配：原 createScheduler 的 run() 字符串口径经 makeRuntime 适配
+// 成 JobRuntime 的 runScan 结果；每个运行时给一个独立 botId——job 幂等
+// 键含 botId，各用例块之间不串扰（生产只有一个运行时、一个 bot）。
+let runtimeSeq = 0;
+function makeRuntime(opts: {
+	run: () => Promise<string>;
+	getRoutineState: () => { lastRunAt?: string | null; lastStatus?: string | null } | null | undefined;
+	timezoneFn: () => string;
+	timeFn: () => { hour: number; minute: number };
+	onError?: ((err: unknown) => void) | null;
+}) {
+	runtimeSeq += 1;
+	const botId = `test-bot-${runtimeSeq}`;
+	return createJobRuntime({
+		runScan: async () => ({ result: (await opts.run()) as "ok" | "failed" | "skipped" }),
+		botIdFn: () => botId,
+		getRoutineState: opts.getRoutineState,
+		timezoneFn: opts.timezoneFn,
+		timeFn: opts.timeFn,
+		onError: opts.onError ?? null,
+	});
+}
 
 const results: { seq: number; name: string; ok: boolean }[] = [];
 let seq = 0;
@@ -70,7 +95,7 @@ check(
 {
 	let calls = 0;
 	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => {
 			calls += 1;
 			state.lastRunAt = new Date().toISOString();
@@ -96,7 +121,7 @@ check(
 {
 	let calls = 0;
 	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => {
 			calls += 1;
 			state.lastRunAt = new Date().toISOString();
@@ -133,7 +158,7 @@ check(
 {
 	let calls = 0;
 	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => {
 			calls += 1;
 			const ok = calls >= 2;
@@ -158,7 +183,7 @@ check(
 {
 	let callsA = 0;
 	const stateA = { lastRunAt: "2026-11-09T00:05:00.000Z", lastStatus: "ok" }; // 昨日成功
-	const schedA = createScheduler({
+	const schedA = makeRuntime({
 		run: async () => {
 			callsA += 1;
 			return "ok";
@@ -170,7 +195,7 @@ check(
 	const tickA = await schedA.tick(T_0900);
 	let callsB = 0;
 	const stateB = { lastRunAt: "2026-11-10T00:01:00.000Z", lastStatus: "ok" }; // 今日已成功
-	const schedB = createScheduler({
+	const schedB = makeRuntime({
 		run: async () => {
 			callsB += 1;
 			return "ok";
@@ -195,7 +220,7 @@ check(
 		release = () => r();
 	});
 	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => {
 			calls += 1;
 			await gate;
@@ -220,7 +245,7 @@ check(
 {
 	let calls = 0;
 	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => {
 			calls += 1;
 			return calls === 1 ? "skipped" : "ok";
@@ -244,7 +269,7 @@ check(
 	let calls = 0;
 	const errors = [];
 	const state: { lastRunAt: string | null; lastStatus: string | null } = { lastRunAt: null, lastStatus: null };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => {
 			calls += 1;
 			return "ok";
@@ -265,7 +290,7 @@ check(
 		threw = true;
 	}
 	// 不带 onError 的调度器同样不得把异常抛给调用方（server 是 void tick(...)）。
-	const schedBare = createScheduler({
+	const schedBare = makeRuntime({
 		run: async () => "ok",
 		getRoutineState: () => state,
 		timezoneFn: () => {
@@ -297,7 +322,7 @@ check(
 // ---- 状态端点形状 ----
 {
 	const state = { lastRunAt: "2026-11-10T00:01:00.000Z", lastStatus: "ok" };
-	const sched = createScheduler({
+	const sched = makeRuntime({
 		run: async () => "ok",
 		getRoutineState: () => state,
 		timezoneFn: () => TZ,
