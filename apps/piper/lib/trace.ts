@@ -107,6 +107,11 @@ export function buildTrace(entries: unknown): { turns: TraceTurn[] } {
 	let current: TraceTurn | null = null;
 	for (const entry of Array.isArray(entries) ? entries : []) {
 		if (!entry || typeof entry !== "object") continue;
+		// 上下文装配记录（P2-6）是「关于这一轮」的元数据，不是对话事件：
+		// 它有自己的读取面（GET /api/sessions/:sessionId/context），不进
+		// 轨迹时间线——否则每轮事件序列都会被它顶出一项，轨迹口径被
+		// 非对话条目污染。
+		if ((entry as { kind?: unknown }).kind === "context_assembly") continue;
 		let cur: TraceTurn | null = current;
 		if (entry.role === "user" || !cur) {
 			cur = { index: turns.length, startedAt: null, endedAt: null, durationMs: null, events: [] };
