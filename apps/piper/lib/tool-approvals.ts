@@ -201,6 +201,48 @@ export function toolIntentSnapshotOf(record: ToolApproval | null | undefined): I
 	};
 }
 
+// 快照冲突判定（P2-5，#33 MAJOR-2 宿主契约 / #35 审计项）：批准与恢复
+// 两条路径放行时都必须把落盘的 argsSnapshot 经 resolveToolCall 的
+// arguments 回传，快照才是被批准的那份参数。恢复路径的 transcript 是从
+// 会话 JSONL 重建的，条目里存的是模型原始参数：它与快照在 body 之外
+// 任一字段不一致，说明落盘记录与会话流水已经对不上（被篡改或写坏），
+// 此时由本层判定冲突、调用方拒绝放行，绝不拿对不上的参数执行。
+// body 是唯一豁免字段：它是 pending 时可经 updateToolApprovalBody 合法
+// 改写的字段，快照里的正文比流水里的原始正文新，分歧以快照为准、
+// 不算冲突。快照本身不是对象（异常记录）时不判冲突——返回 null 的
+// 路径由各工具 execute / 网关的形状校验兜底。
+function deepEqualJson(a: unknown, b: unknown): boolean {
+	if (a === b) return true;
+	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+	if (Array.isArray(a) !== Array.isArray(b)) return false;
+	if (Array.isArray(a) && Array.isArray(b)) {
+		return a.length === b.length && a.every((v, i) => deepEqualJson(v, b[i]));
+	}
+	const ao = a as Record<string, unknown>;
+	const bo = b as Record<string, unknown>;
+	const keys = new Set([...Object.keys(ao), ...Object.keys(bo)]);
+	for (const k of keys) {
+		if (!deepEqualJson(ao[k], bo[k])) return false;
+	}
+	return true;
+}
+
+export function snapshotConflictReason(record: ToolApproval, candidateArgs: unknown): string | null {
+	const snap = record.argsSnapshot;
+	if (!snap || typeof snap !== "object" || Array.isArray(snap)) return null;
+	if (!candidateArgs || typeof candidateArgs !== "object" || Array.isArray(candidateArgs)) {
+		return "会话流水里的调用参数不是对象，与落盘快照形状不一致";
+	}
+	const snapObj = snap as Record<string, unknown>;
+	const candObj = candidateArgs as Record<string, unknown>;
+	const keys = new Set([...Object.keys(snapObj), ...Object.keys(candObj)]);
+	for (const key of keys) {
+		if (key === "body") continue;
+		if (!deepEqualJson(snapObj[key], candObj[key])) return `参数 ${key} 与批准快照不一致`;
+	}
+	return null;
+}
+
 // 收件箱联合视图里的工具待批项（§1.1：每一项必须带 kind）。
 export interface ToolApprovalView extends ToolApproval {
 	kind: "tool_call";

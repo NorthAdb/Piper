@@ -699,20 +699,23 @@ try {
 		`len=${sessionText.length}`,
 	);
 
-	// 直断言（真机 bug）：直接调用内核的工具组装，返回的每个模型侧工具名都必须
-	// 满足服务商的 function name 模式 ^[a-zA-Z0-9_-]+$（点名在这里直接红）。
+	// 直断言（真机 bug）：直接调用工具注册表的物化（P2-5 起工具只从注册表
+	// 出），网页工具的每个模型侧工具名都必须满足服务商的 function name
+	// 模式 ^[a-zA-Z0-9_-]+$（点名在这里直接红）。
 	let directToolNames: string[] = [];
 	let directErr = "";
 	try {
 		process.env.PIPER_DATA_DIR = TMP_DATA;
-		const { webToolsForBot } = await import("../lib/kernel.ts");
-		// 直断言只关心工具名：传最小 Bot 形状（函数内只读 id/tools），cast 到其参数类型。
-		directToolNames = webToolsForBot({ id: "piper-main" } as Parameters<typeof webToolsForBot>[0]).map((t) => t.name);
+		const { agentToolsForBot } = await import("../lib/tool-registry.ts");
+		// 直断言只关心网页工具名：传最小 Bot 形状（物化只读 id/tools/isMain），cast 到其参数类型。
+		directToolNames = agentToolsForBot({ id: "piper-main", isMain: true, tools: [] } as unknown as Parameters<typeof agentToolsForBot>[0], "s-direct")
+			.map((t) => t.name)
+			.filter((n) => n.startsWith("web_"));
 	} catch (e) {
 		directErr = String((e as Error | null)?.message ?? e);
 	}
 	check(
-		"直断言：webToolsForBot 返回的工具名全匹配 ^[a-zA-Z0-9_-]+$（web_fetch / web_search）",
+		"直断言：注册表物化的网页工具名全匹配 ^[a-zA-Z0-9_-]+$（web_fetch / web_search）",
 		directToolNames.length === 2 && directToolNames.every((n) => /^[a-zA-Z0-9_-]+$/.test(n)),
 		directErr || `names=${JSON.stringify(directToolNames)}`,
 	);
