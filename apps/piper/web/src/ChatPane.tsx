@@ -17,7 +17,7 @@ import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
 import { ArrowUpIcon, Loader2Icon, MessageSquareIcon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { abortChat, confirmDraft, listMessages, streamChat, UnauthorizedError } from "./api";
+import { abortChat, confirmDraft, getRunState, listMessages, streamChat, UnauthorizedError } from "./api";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Bot, ChatMessage, ChatPart } from "./model";
@@ -115,6 +115,10 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 	// 进行时状态行用：本轮起点 + 每秒 tick（仅 running 期间挂定时器）
 	const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
 	const [tickNow, setTickNow] = useState(() => Date.now());
+	// SSE 收尾后 run 仍可能停在待批或在途执行（#36 审计 MINOR）：轮询
+	// run-state 保留状态行与中止入口；run 落定后重拉一次历史让工具卡更新。
+	const [serverRunActive, setServerRunActive] = useState(false);
+	const serverRunActiveRef = useRef(false);
 	const messagesRef = useRef<ChatMessage[]>([]);
 
 	useEffect(() => {
@@ -123,6 +127,44 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		const t = setInterval(() => setTickNow(Date.now()), 1000);
 		return () => clearInterval(t);
 	}, [running]);
+
+	// 待批轮询（#36 审计 MINOR）：对话里有待批准工具卡且本端不在 running
+	// （SSE 已按契约收尾）时，每 3 秒问一次 run-state；run 落定（active
+	// 由真变假）后重拉历史，工具卡从待批准切到终态。
+	const pendingToolPart = messages
+		.flatMap((m) => m.parts)
+		.filter((p): p is Extract<ChatPart, { type: "tool" }> => p.type === "tool" && p.phase === "pending")
+		.at(-1);
+	const hasPendingTool = pendingToolPart !== undefined;
+	useEffect(() => {
+		if (running || !hasPendingTool) return;
+		let cancelled = false;
+		const check = () => {
+			getRunState(bot.id)
+				.then((r) => {
+					if (cancelled) return;
+					if (serverRunActiveRef.current && !r.active) {
+						listMessages(bot.id)
+							.then((entries) => {
+								if (!cancelled) setMessages(historyToMessages(entries));
+							})
+							.catch(() => {});
+					}
+					serverRunActiveRef.current = r.active;
+					setServerRunActive(r.active);
+				})
+				.catch((e: unknown) => {
+					if (!cancelled && e instanceof UnauthorizedError) onUnauthorized();
+				});
+		};
+		check();
+		const t = setInterval(check, 3000);
+		return () => {
+			cancelled = true;
+			clearInterval(t);
+		};
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [running, hasPendingTool, bot.id]);
 
 	const setMessages = (next: readonly ChatMessage[]) => {
 		messagesRef.current = [...next];
@@ -376,6 +418,14 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 							</div>
 						</div>
 					) : null}
+					{!running && serverRunActive ? (
+						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
+							<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
+								<Loader2Icon className="size-3.5 animate-spin" />
+								<span>{pendingToolPart ? `等待批准：${pendingToolPart.name}（请到待批收件箱处理，或在下方中止本轮）` : "已批准，正在执行…"}</span>
+							</div>
+						</div>
+					) : null}
 					<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
 						<ComposerPrimitive.Root
 							className="flex w-full flex-col rounded-2xl border bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring/60 focus-within:ring-2 focus-within:ring-ring/30"
@@ -387,7 +437,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 								submitOnEnter
 							/>
 							<div className="flex items-center justify-between gap-2 px-3 pb-2.5">
-								{running ? (
+								{running || serverRunActive ? (
 									<button
 										type="button"
 										onClick={onAbort}

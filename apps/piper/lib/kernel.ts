@@ -354,6 +354,12 @@ export function abortLiveRun(botId: string): { aborted: boolean; sessionId?: str
 	return { aborted: true, sessionId: entry.sessionId };
 }
 
+// 该 bot 此刻是否有活动 run（含停在待批等待、已批准在途执行）：对话
+// 窗格的 run-state 轮询据此保留中止入口（#36 审计 MINOR）。
+export function hasLiveRun(botId: string): boolean {
+	return liveRunsByBot.has(botId);
+}
+
 // 闸的三个钩子（botId 在场时才装）：beforeToolCall 问 PolicyEngine——
 // deny 原样返回（本引擎的 deny 没有任何后续钩子能翻案，钩子链里它就是
 // 唯一裁决者）；ask 不带改参（本件不支持钩子改参放行，参数以模型原提

@@ -165,7 +165,11 @@ export function Inbox({
 				} else {
 					await rejectToolApproval(a.id);
 					setConfirmRejectId(null);
-					setNotice(`已驳回「${toolTitle(a)}」，不会执行任何写操作。该事项已移入下方「已关闭」区。`);
+					setNotice(
+						a.status === "approved"
+							? `已驳回「${toolTitle(a)}」，将不再重试这条写操作。该事项已移入下方「已关闭」区。`
+							: `已驳回「${toolTitle(a)}」，不会执行任何写操作。该事项已移入下方「已关闭」区。`,
+					);
 				}
 			} else if (action === "approve") {
 				const { execution } = await approveApproval(a.id, a.intentHash);
@@ -676,7 +680,11 @@ function ToolApprovalCard({
 					<div className="flex flex-col gap-2 rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2.5">
 						<p className="flex items-start gap-2 text-sm">
 							<TriangleAlertIcon className="mt-0.5 size-4 shrink-0" />
-							<span>驳回后这次工具调用不会执行，对话里会记为已拒绝。bot 之后仍可在对话中重新提出。</span>
+							<span>
+								{t.status === "approved"
+									? "这条写操作已批准：若正在执行，驳回会被拒绝（已发出的写按真实结果落账）；若在等重试，驳回后不再重试。"
+									: "驳回后这次工具调用不会执行，对话里会记为已拒绝。bot 之后仍可在对话中重新提出。"}
+							</span>
 						</p>
 						<div className="flex gap-2">
 							<Button type="button" size="sm" variant="destructive" disabled={busy} onClick={onConfirmReject}>

@@ -443,6 +443,51 @@ try {
 			reapproveA.status === 409,
 		`posts=${JSON.stringify(bodies)} reapproveA=${reapproveA.status}`,
 	);
+	// ---- 在途驳回（#36 审计 MAJOR）：已批准且写在途时驳回回 409，
+	// 记录不被改成 rejected，在途写按真实结果落 executed、恰好一次 ----
+	ghDelayMs = 2500;
+	const seenIds = new Set([p1.id, p2.id, p3.id, pA.id, pB.id]);
+	await chatEvents("repo-keeper", "第四次给 PR 1 留评");
+	const p4 = await waitFor(async () => (await toolApprovalsViaApi()).find((a) => a.status === "pending" && !seenIds.has(a.id)));
+	const startedBefore4 = ghPostStarted;
+	const postsBefore4 = ghPosts.length;
+	await req(`/api/approvals/${p4.id}/approve`, { method: "POST", body: JSON.stringify({}) });
+	await waitFor(() => (ghPostStarted > startedBefore4 ? true : null), 10000);
+	const rejectInFlight = await req(`/api/approvals/${p4.id}/reject`, { method: "POST", body: JSON.stringify({}) });
+	const p4Mid = (await toolApprovalsViaApi()).find((a) => a.id === p4.id);
+	const p4Done = await waitFor(async () => (await toolApprovalsViaApi()).find((a) => a.id === p4.id && a.status === "executed"), 30000);
+	ghDelayMs = 0;
+	check(
+		"B10 在途驳回回 409 且记录保持 approved，在途写完成落 executed、恰好一次（账本与副作用不分叉）",
+		rejectInFlight.status === 409 &&
+			p4Mid?.status === "approved" &&
+			Boolean(p4Done) &&
+			ghPosts.length === postsBefore4 + 1 &&
+			readAuditEntries().some((x) => x.toolApprovalId === p4.id && x.result === "executed") &&
+			!readAuditEntries().some((x) => x.toolApprovalId === p4.id && x.result === "rejected"),
+		`reject=${rejectInFlight.status} mid=${p4Mid?.status} posts=${ghPosts.length - postsBefore4}`,
+	);
+
+	// ---- run-state（#36 审计 MINOR）：无 run 为 false，待批停泊期间为
+	// true（SSE 已收尾），落定后回到 false；未登录 401 ----
+	const unauthState = await fetch(`${BASE}/api/chats/repo-keeper/run-state`);
+	const stateIdle = await req("/api/chats/repo-keeper/run-state");
+	await chatEvents("repo-keeper", "第五次给 PR 1 留评");
+	const p5 = await waitFor(async () => (await toolApprovalsViaApi()).find((a) => a.status === "pending" && !seenIds.has(a.id) && a.id !== p4.id));
+	const stateParked = await req("/api/chats/repo-keeper/run-state");
+	await req(`/api/approvals/${p5.id}/reject`, { method: "POST", body: JSON.stringify({}) });
+	const stateSettled = await waitFor(async () => {
+		const s = await req("/api/chats/repo-keeper/run-state");
+		return s.json?.active === false ? s : null;
+	});
+	check(
+		"B11 run-state：未登录 401；无 run 时 active:false；待批停泊（SSE 已收尾）时 active:true；驳回落定后回到 false",
+		unauthState.status === 401 &&
+			stateIdle.json?.active === false &&
+			stateParked.json?.active === true &&
+			stateSettled.json?.active === false,
+		`unauth=${unauthState.status} idle=${JSON.stringify(stateIdle.json)} parked=${JSON.stringify(stateParked.json)}`,
+	);
 } finally {
 	proc?.kill("SIGKILL");
 	ghStub.close();

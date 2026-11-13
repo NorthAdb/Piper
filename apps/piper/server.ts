@@ -28,15 +28,22 @@
 // POST /api/approvals/:id/approve {intentHash} 批准并经薄网关执行批准快照（P1-6 + R1）：回 { approval, execution }；
 //   intentHash 与当前内容不一致回 409「内容已变，请重新查看」；正在 executing 回 409；
 //   执行失败时 Finding 保持 approved、execution 带 reason，再次批准即重试
-// POST /api/approvals/:id/reject 驳回（状态 rejected，不产生任何对外写操作）
+// POST /api/approvals/:id/reject 驳回 Finding（状态 rejected，不产生任何对外写操作；
+//   执行中（executing）驳回回 409，见 lib/approvals.ts）
 // POST /api/approvals/:id/edit {body} 改评论正文（切片二）：open 直接改；approved 改文同时作废原批准退回 open；已关闭/executing 回 409；空正文/超长/疑似含密钥回 400；改动写审计 edited
 // 工具待批（P2-3）：GET /api/approvals 同时返回 kind:"tool_call" 的工具待批项（每项带 kind 与 Finding 区分）；
 //   POST 对 ta-… id 同样有效——approve 置 approved 并触发循环放行（原 run 或重启后恢复，不 await 续跑到底），
-//   reject 置 rejected（原 run 还在等待时以 deny 放行收尾）
+//   reject 置 rejected（原 run 还在等待时以 deny 放行收尾）；已批准且网关正在
+//   执行时回 409（写已发出、驳回无效，记录保持 approved 按真实结果落账），
+//   已批准但未在途时驳回仍置 rejected（暂时性失败后 approved+error 可重试的
+//   记录，驳回即放弃重试）
 // 工具待批改正文（P2-4）：POST /api/approvals/:id/edit 对 ta-… 只许改评论正文（{body}，仅 pending 可改，
 //   非 pending 回 409；请求若带 repo/kind/number 且与快照不一致回 400 且快照不变）；改文写审计 edited
 // POST /api/chats/:botId/abort 中止该 bot 当前 run（P2-4，需登录）：停在待批上的记录转 cancelled
 //   并写审计 cancelled/run_aborted；无活动 run 回 { aborted: false }；bot 不存在回 404
+// GET /api/chats/:botId/run-state 该 bot 是否有活动 run（#36 审计 MINOR）：{ active }，
+//   含停在待批与已批准在途；对话窗格据此在 SSE 收尾后保留中止入口；bot 不存在回 404
+// 工具待批驳回补充（#36 审计 MAJOR）：已批准且写在途时 reject 回 409（在途写按真实结果落账）
 // POST /api/findings/ad-hoc {repo, prNumber} 即席开单（切片二，/api/findings 下唯一的写路由）：对指定 PR 即时取证开 pr_needs_review 事项（判定与扫描同一套）；已有同键未关闭/冷却中事项回 200 {existing:true}；已合并/关闭/draft/已批准回 409；PR 不存在回 404；仓库未绑定任何 bot 回 400
 // GET /api/audit 网关审计记录（可按 findingId 或 toolApprovalId 过滤）：denied / approved / executing / executed / failed / rejected / edited / cancelled
 // GET /api/findings Finding 列表（只读，可按 status/repo/botId 过滤）
@@ -99,7 +106,8 @@ listArtifacts,
 readArtifact,
 readBotMemory,
 } from "./lib/store.ts";
-import { abortLiveRun, botSelfFacts, getLiveAgent, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { abortLiveRun, botSelfFacts, getLiveAgent, hasLiveRun, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent, webToolsForBot} from "./lib/kernel.ts";
+import { isToolWriteInFlight } from "./lib/gateway.ts";
 import type { ChatEvent} from "./lib/kernel.ts";
 import { githubCommentToolsForBot } from "./lib/github-comment.ts";
 import { findToolApprovalByToolCall, getToolApproval, listToolApprovals, listToolApprovalViews, toToolApprovalView, toolIntentSnapshotOf, updateToolApproval, updateToolApprovalBody } from "./lib/tool-approvals.ts";
@@ -667,6 +675,14 @@ function rejectToolApprovalById(id: string): ToolApproval | null {
 	if (record.status !== "pending" && record.status !== "approved") {
 		throw conflictError(`该工具待批已关闭（当前状态 ${record.status}），不能再驳回`);
 	}
+	// 已批准且写已在途时不能驳回（#36 审计 MAJOR）：在途的 POST 拦不住，
+	// 改成 rejected 只会让账本与外部副作用分叉（评论照发、记录却写驳回，
+	// 且状态机不许 rejected 再转 executed）。与中止接口同口径：在途写按
+	// 真实结果落账。未在途的已批准记录（等重试）仍可驳回，驳回后网关的
+	// 状态复查会拦下任何随后到达的执行。
+	if (record.status === "approved" && isToolWriteInFlight(id)) {
+		throw conflictError("该写操作正在执行，不能驳回；已发出的写会按真实结果落账");
+	}
 	const next = updateToolApproval(id, { status: "rejected", error: null });
 	appendAudit({
 		botId: record.botId,
@@ -938,6 +954,13 @@ if (typeof body.timezone === "string") patch.timezone = body.timezone;
 return sendJson(res, 200, saveProfileSettings(patch));
 }
 if (path === "/api/chat" && req.method === "POST") return await handleChat(req, res);
+const runStateMatch = path.match(/^\/api\/chats\/([\w-]+)\/run-state$/);
+if (runStateMatch && req.method === "GET") {
+if (!getBot(runStateMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});
+// 对话窗格据此在 SSE 已收尾、run 仍停在待批或在途执行时保留中止入口
+// （#36 审计 MINOR）：active 只表示该 bot 此刻有活动 run（含停泊等待）。
+return sendJson(res, 200, { active: hasLiveRun(runStateMatch[1]) });
+}
 const abortMatch = path.match(/^\/api\/chats\/([\w-]+)\/abort$/);
 if (abortMatch && req.method === "POST") {
 if (!getBot(abortMatch[1])) return sendJson(res, 404, { error: "bot 不存在"});

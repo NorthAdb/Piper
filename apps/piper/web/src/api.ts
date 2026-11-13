@@ -127,6 +127,12 @@ export async function editToolApprovalBody(id: string, body: string): Promise<To
 	return (await api<{ approval: ToolApprovalItem }>(`/api/approvals/${id}/edit`, { method: "POST", body: JSON.stringify({ body }) })).approval;
 }
 
+// 该 bot 是否有活动 run（#36 审计 MINOR）：含停在待批与已批准在途执行；
+// 对话窗格在 SSE 收尾后据此保留中止入口
+export async function getRunState(botId: string): Promise<{ active: boolean }> {
+	return api<{ active: boolean }>(`/api/chats/${botId}/run-state`);
+}
+
 // 中止当前 run（P2-4）：无活动 run 时 aborted 为 false；停在待批上的记录
 // 会随之中止（cancelledToolApprovals 带回被取消的记录 id）
 export async function abortChat(botId: string): Promise<{ aborted: boolean; sessionId?: string; cancelledToolApprovals?: string[] }> {
