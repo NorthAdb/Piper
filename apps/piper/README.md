@@ -2388,7 +2388,7 @@ repo-keeper 默认不开放文件工具。
   注意这与网页抓取的可见文本 8000 字上限是两个不同的数，不要混。
 
 实测（本地，含下方返工补记后的计数）：`npm run test:workspace`
-**34/34 全绿**，逐条对应切片验收 1–6 与审计钉死项——界内写入落在
+**43/43 全绿**，逐条对应切片验收 1–6 与审计钉死项——界内写入落在
 `workspaces/bot-a/hello.txt` 且 list 可见、read 读回一致；越界三形态
 （绝对路径、`../bot-b/…` 与 `../outside.txt` 相对穿越、工作区内符号
 链接指向根外后经链接读写）全部以 escape 失败且目标文件内容不变、
@@ -2399,7 +2399,7 @@ execute）后 execute 仍 escape 失败；bot-a 读 bot-b 文件（相对与绝�
 `botWorkspace("../sessions")` 与带 `/` 的 botId 抛错、Guard 对非法
 botId 返回 escape 不抛。验收 7：`apps/piper` 全套 `npm test` 退出码 0
 （findings 30、scan 20、pr-review 16、schedule 14、gateway 43、
-workspace 34、recovery 7、listen 9、badtz 4、secrets 21、model-stub 11、
+workspace 43、recovery 7、listen 9、badtz 4、secrets 21、model-stub 11、
 model-providers 57、r10 22、webfetch 48、trace 24、eval 23、
 regression 72），无回退。根级 `npm run check` 退出码 0。可复制命令：
 在 `apps/piper` 下跑 `npm run test:workspace`（或全套 `npm test`）。
@@ -2428,6 +2428,12 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   edit 出现 0 次/2 次不改文件、read 64 KiB 截断；含 NUL 的路径在
   Guard 层直接 escape；订正本节 read 上限与网页抓取 8000 字的比附
   句、补 `workspaceAllowedRoots` 相对条目走出 `DATA_DIR` 的说明。
+- **复审（head `2c499d5`）结论通过**；复审留项——原只在审计独立探针
+  里覆盖的形态（嵌套链接、相对目标含 `..`、链接环、链接到悬挂链接、
+  中途目录链接加多层尾分量、跨层悬挂、检查路径与写入路径为同一条）
+  ——已按萧北指示补进官方 `test:workspace`（34 → 43 条）防回归。
+  硬链接改同一 inode 不属路径越界、Guard 与写入之间的 TOCTOU 需外部
+  进程抢窗口，复审已定性记录，本切片不处理。
 
 - 明确不做（按切片）：未提供 bash/exec 等未隔离 shell；未做每 bot
   云电脑或 Docker 隔离；未改 coding-agent 的 path-utils；文件工具未

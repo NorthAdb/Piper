@@ -289,6 +289,84 @@ try {
 		wsThrew && WorkspaceGuard.resolve("bot-c", "x.txt").ok === false,
 	);
 
+	// ---------- 审计探针形态补进官方套件（复审留项，防回归） ----------
+	// 嵌套链接：link1 → link2（界内）→ 根外目录，两跳后仍须 escape。
+	symlinkSync(outsideDir, join(wsA, "nested-2"));
+	symlinkSync("nested-2", join(wsA, "nested-1"));
+	const nestedWrite = await toolsA.get("workspace_write")!({ path: "nested-1/evil.txt", content: "pwned" });
+	check(
+		"复审留项 嵌套链接 write escape 且根外无新文件",
+		nestedWrite.isError === true && nestedWrite.details?.reason === "escape" && !existsSync(join(outsideDir, "evil.txt")),
+		resultText(nestedWrite),
+	);
+	const nestedRead = await toolsA.get("workspace_read")!({ path: "nested-1/secret.txt" });
+	check(
+		"复审留项 嵌套链接 read escape",
+		nestedRead.isError === true && nestedRead.details?.reason === "escape",
+		resultText(nestedRead),
+	);
+	// 相对目标含 ..：链接目标按链接所在目录解析，走出工作区即 escape。
+	const relTarget = join(TMP_ROOT, "rel-pwned.txt");
+	symlinkSync("../../../rel-pwned.txt", join(wsA, "rel-file"));
+	const dotdotLinkWrite = await toolsA.get("workspace_write")!({ path: "rel-file", content: "pwned" });
+	check(
+		"复审留项 相对 .. 目标的链接 write escape 且目标未被创建",
+		dotdotLinkWrite.isError === true && dotdotLinkWrite.details?.reason === "escape" && !existsSync(relTarget),
+		resultText(dotdotLinkWrite),
+	);
+	// 链接环：展开上限收尾，Guard 与工具都按 escape。
+	symlinkSync("loop-b", join(wsA, "loop-a"));
+	symlinkSync("loop-a", join(wsA, "loop-b"));
+	const loopWrite = await toolsA.get("workspace_write")!({ path: "loop-a/x.txt", content: "pwned" });
+	check(
+		"复审留项 链接环 Guard escape、write escape",
+		WorkspaceGuard.resolve("bot-a", "loop-a/x.txt").ok === false && loopWrite.isError === true && loopWrite.details?.reason === "escape",
+		resultText(loopWrite),
+	);
+	// 链到悬挂链接：link → 界内另一链接 → 根外不存在目标。
+	const chainTarget = join(TMP_ROOT, "chain-pwned.txt");
+	symlinkSync(chainTarget, join(wsA, "chain-2"));
+	symlinkSync("chain-2", join(wsA, "chain-1"));
+	const chainWrite = await toolsA.get("workspace_write")!({ path: "chain-1", content: "pwned" });
+	check(
+		"复审留项 链到悬挂链接 write escape 且最终目标未被创建",
+		chainWrite.isError === true && chainWrite.details?.reason === "escape" && !existsSync(chainTarget),
+		resultText(chainWrite),
+	);
+	// 中途目录链接加多层尾分量：链接后还有两层不存在的目录。
+	const deepWrite = await toolsA.get("workspace_write")!({ path: "link/deep/deeper.txt", content: "pwned" });
+	check(
+		"复审留项 中途目录链接加尾分量 write escape 且根外无新目录",
+		deepWrite.isError === true && deepWrite.details?.reason === "escape" && !existsSync(join(outsideDir, "deep")),
+		resultText(deepWrite),
+	);
+	// 跨层悬挂：悬挂目录链接之后再叠不存在的中间目录与文件。
+	const crossTarget = join(TMP_ROOT, "cross-target");
+	symlinkSync(crossTarget, join(wsA, "cross-link"));
+	const crossWrite = await toolsA.get("workspace_write")!({ path: "cross-link/mid/file.txt", content: "pwned" });
+	check(
+		"复审留项 跨层悬挂 write escape 且根外目录未被创建",
+		crossWrite.isError === true && crossWrite.details?.reason === "escape" && !existsSync(crossTarget),
+		resultText(crossWrite),
+	);
+	// 检查路径与写入路径同一条：界内活链接指向界内子目录时，Guard 返回
+	// 解析后的真实路径（不是字面链接路径），工具写入恰好落在该处。
+	mkdirSync(join(wsA, "real-dir"), { recursive: true });
+	symlinkSync("real-dir", join(wsA, "inner-link"));
+	const innerResolved = WorkspaceGuard.resolve("bot-a", "inner-link/same.txt");
+	const expectedReal = store.resolveRealPath(join(wsA, "real-dir", "same.txt"));
+	check(
+		"复审留项 Guard 返回解析后的真实路径（与 resolveRealPath 一致，非字面链接路径）",
+		innerResolved.ok === true && innerResolved.path === expectedReal && innerResolved.path !== join(wsA, "inner-link", "same.txt"),
+		innerResolved.ok ? innerResolved.path : "escape",
+	);
+	const innerWrite = await toolsA.get("workspace_write")!({ path: "inner-link/same.txt", content: "same-path" });
+	check(
+		"复审留项 经界内链接写入落在解析目标处且内容一致",
+		!innerWrite.isError && readFileSync(join(wsA, "real-dir", "same.txt"), "utf8") === "same-path",
+		resultText(innerWrite),
+	);
+
 	// ---------- 策略表其余锁定项 ----------
 	check(
 		"策略默认：web_fetch/web_search allow、github.read allow、github_comment ask、未知工具 deny",
