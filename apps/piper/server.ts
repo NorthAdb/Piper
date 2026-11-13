@@ -124,7 +124,8 @@ import { redact } from "./lib/redact.ts";
 import { buildTrace} from "./lib/trace.ts";
 import { createAdHocReviewFinding, runMorningScan} from "./lib/scan.ts";
 import { getFinding, listFindings} from "./lib/findings.ts";
-import { createScheduler, formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.ts";
+import { formatScheduleText, migrateScheduleFields, parseScheduleTime, profileTimezone} from "./lib/schedule.ts";
+import { createJobRuntime} from "./lib/job-runtime.ts";
 import { approveApproval, editApprovalBody, getApproval, listApprovals, listClosedApprovals, recoverInterruptedExecutions, rejectApproval, sweepExpiredFindings} from "./lib/approvals.ts";
 import { appendAudit, listAudit} from "./lib/audit.ts";
 
@@ -801,11 +802,19 @@ if (migrated) updateRoutine(routine.id, migrated);
 }
 }
 
-const scheduler = createScheduler({
-run: async () => {
+// 任务运行时（P2-7）：调度状态机与 job 记录都在 lib/job-runtime.ts，
+// server 只装配依赖（扫描执行体、例程状态、时区/时刻现读）并驱动 tick。
+// executeMorningScan 的返回形状经 payload 原样透传给手动入口的响应。
+const jobRuntime = createJobRuntime({
+runScan: async () => {
 const result = await executeMorningScan();
-return result.skipped? "skipped": result.failed? "failed": "ok";
+return {
+result: result.skipped? "skipped": result.failed? "failed": "ok",
+error: result.error? String((result.error as { message?: unknown } | null | undefined)?.message?? result.error): null,
+payload: result,
+};
 },
+botIdFn: () => morningRoutine()?.botId?? "repo-keeper",
 getRoutineState: () => morningRoutine()?? {},
 timezoneFn: () => profileTimezone(),
 // "08:00" 恒可解析（与 lib/schedule.ts migrate 的兜底同口径），字面量仅为类型完备。
@@ -1023,7 +1032,7 @@ return sendJson(res, 200, { aborted: true, sessionId: out.sessionId, cancelledTo
 }
 if (path === "/api/routines" && req.method === "GET") {
 const tz = profileTimezone();
-const status = scheduler.status(new Date());
+const status = jobRuntime.status(new Date());
 return sendJson(res, 200, {
 routines: listRoutines().map((r) => {
 if (r.id!== "morning-scan") return r;
@@ -1033,14 +1042,31 @@ return { ...r, scheduleText: formatScheduleText(time, tz), nextRunAt: status.nex
 });
 }
 if (path === "/api/schedule/status" && req.method === "GET") {
-const s = scheduler.status(new Date());
+const s = jobRuntime.status(new Date());
 return sendJson(res, 200, { timezone: s.timezone, routines: [{ id: "morning-scan", nextRunAt: s.nextRunAt, nextRetryAt: s.nextRetryAt, running: s.running, attempts: s.attempts, lastRunAt: s.lastRunAt, lastStatus: s.lastStatus}]});
 }
 if (path === "/api/routines/morning-scan/run" && req.method === "POST") {
-const result = await executeMorningScan();
-if (result.skipped) return sendJson(res, 409, { error: "晨间扫描正在运行中，请稍后再试"});
+// 手动触发也走 JobRuntime（P2-7）：建一条 trigger "manual" 的 job 再
+// 执行，响应多带 jobId 供按 id 查记录。body 可带 trigger 字段（缺省
+// manual）；"channel" 等未实现 trigger 在运行时入口被明确拒绝（400，
+// 经外层 catch 按 status 出），绝不悄悄当成 manual。
+const body = await readBody(req);
+const { job, outcome } = await jobRuntime.runManual({ trigger: (body as { trigger?: unknown } | null)?.trigger });
+const result = outcome.payload as MorningScanResult;
+if (job.status === "skipped") return sendJson(res, 409, { error: "晨间扫描正在运行中，请稍后再试", jobId: job.id });
 if (result.error) throw result.error;
-return sendJson(res, 200, result.failed? { artifact: result.artifact, report: result.report, failed: true, findings: result.findings}: { artifact: result.artifact, report: result.report, findings: result.findings});
+return sendJson(res, 200, result.failed? { artifact: result.artifact, report: result.report, failed: true, findings: result.findings, jobId: job.id }: { artifact: result.artifact, report: result.report, findings: result.findings, jobId: job.id });
+}
+// Job 记录查询（P2-7）：列表可按 botId 过滤（右栏例程的 bot 隔离口径
+// 一致）；按 id 查单条，无此 id 404。
+if (path === "/api/jobs" && req.method === "GET") {
+const botId = url.searchParams.get("botId")?? undefined;
+return sendJson(res, 200, { jobs: jobRuntime.listJobs(botId? { botId }: undefined) });
+}
+const jobMatch = path.match(/^\/api\/jobs\/([\w-]+)$/);
+if (jobMatch && req.method === "GET") {
+const job = jobRuntime.getJob(jobMatch[1]);
+return job? sendJson(res, 200, { job }): sendJson(res, 404, { error: "job 不存在"});
 }
 if (path === "/api/notifications" && req.method === "GET") return sendJson(res, 200, { notifications: listNotifications(), unread: countUnread()});
 if (path === "/api/notifications/read" && req.method === "POST") {
@@ -1147,9 +1173,19 @@ return sendJson(res, e?.status || 500, { error: redact(String(e?.message?? err))
 
 server.listen(PORT, HOST, () => {
 console.log(`Piper prototype listening on http://${HOST}:${PORT} (token: ${USING_DEFAULT_TOKEN? "default piper-dev": "from env"}, model: ${modelConfig().configured? "configured": "NOT configured"})`);
-// 定时调度启动：先 tick 一次（处理启动补跑与首次规划），之后每 30 秒推进状态机，
-// 并顺带做过期清理（R10 的显式触发点之二：GET 读路径不再写数据，靠周期点收口）。
-void scheduler.tick(new Date());
+// 任务运行时启动（P2-7）：先恢复上一进程残留的 job（running 标
+// interrupted 后按幂等键对账重排队并排空队列），再 tick 一次（处理
+// 启动补跑与首次规划）；之后每 30 秒推进状态机，并顺带做过期清理
+// （R10 的显式触发点之二：GET 读路径不再写数据，靠周期点收口）。
+void (async () => {
+try {
+const recoveredJobs = await jobRuntime.start();
+if (recoveredJobs.interrupted > 0) console.log(`[piper] JobRuntime 启动恢复：${recoveredJobs.interrupted} 条残留 running job 已标 interrupted，${recoveredJobs.requeued} 条重新入队执行`);
+} catch (err) {
+console.error(`[piper] JobRuntime 启动恢复失败（继续启动）：${(err as { message?: unknown } | null | undefined)?.message ?? err}`);
+}
+await jobRuntime.tick(new Date());
+})();
 const timer = setInterval(() => {
 try {
 sweepExpiredFindings();
@@ -1163,7 +1199,7 @@ if (recovered > 0) console.log(`[piper] 周期恢复：${recovered} 条超时的
 } catch (err) {
 console.error(`[piper] executing 恢复失败（下个周期重试）：${(err as { message?: unknown } | null | undefined)?.message ?? err}`);
 }
-void scheduler.tick(new Date());
+void jobRuntime.tick(new Date());
 }, 30 * 1000);
 timer.unref();
 });

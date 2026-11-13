@@ -2748,3 +2748,72 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   段仅占位）；resume 恢复路径不接装配器（切片只点名
   streamChat）；不做装配记录的前端页面（接口 + 流水条目即本
   件的可见面）。
+
+## P2-7 任务运行时 JobRuntime 实测（第二件切片七，2026-11-13）
+
+- **运行时（新增 lib/job-runtime.ts）**：晨间扫描的调度收成循环
+  外的任务运行时——唤醒与执行分离：定时 tick 只负责到点入队
+  （queued）并叫醒 runner，runner 再执行扫描；每一次执行都是
+  一条可查的 Job 记录。P1-4 的调度状态机（到点一次、失败有限
+  补跑、启动补跑、并发防护、tick 异常不杀进程）整段迁自
+  lib/schedule.ts 的 createScheduler——本件起全仓只有这一份
+  tick，schedule.ts 只留纯时间助手（时刻解析、时区换算、下一次
+  运行、补跑判定）与 RETRY_DELAYS_MS 常量（[5 分钟 ×3]，未迁
+  移、未改值，运行时直接引用）。副作用仍走既有路径（runner 调
+  server 的 executeMorningScan → runMorningScan → 网关闸），
+  定时器回调里不直接碰 GitHub 写 API。
+- **Job 记录**：Job{id: "job-…", botId, type: "morning-scan"
+  （本件只实现这一种）, trigger, idempotencyKey, checkpoint,
+  status, createdAt, updatedAt, error?}；状态词表锁定为
+  queued | running | succeeded | failed | skipped |
+  interrupted，trigger 词表 cron | manual | approval |
+  channel（channel 仅预留，见下）。存储
+  PIPER_DATA_DIR/jobs.json，落盘纪律与 tool-approvals 同口径：
+  整表原子落盘、损坏改名隔离（.corrupt-<时间戳>）不静默覆盖；
+  保留上限 500 条，超出先丢最旧的终态记录，queued/running
+  一条不丢。查询面：GET /api/jobs（可按 botId 过滤）、
+  GET /api/jobs/:id（无此 id 404，未登录 401）；列表按 bot
+  隔离与右栏例程口径一致（主 bot 查不到管家的晨间扫描 job）。
+- **幂等**：cron job 的幂等键 = morning-scan:<botId>:<时区
+  日期>:<HH:MM>（时槽键）。同键已有 queued/running 时不重复
+  建、不重复跑（同一窗口内 tick 两次只有一份副作用）；已有
+  succeeded 时本时槽视为已完成、按成功推进计划但不重跑；
+  failed/skipped/interrupted 的同键 job 不挡新尝试——失败
+  补跑即新尝试、另建一条 job（与补跑节奏共用同一时槽键），
+  否则第一次失败就会把补跑堵死。手动 job 每请求一条、键唯一。
+- **手动入口**：POST /api/routines/morning-scan/run 改走
+  JobRuntime.runManual（建 manual job 后执行），HTTP 语义与
+  本件之前逐项一致（在途 409、异常上抛、失败带 failed:true），
+  响应多带 jobId 供按 id 回查；一处可见变化：在途被跳过的
+  手动尝试现在会留下一条 skipped 的 job 记录（以前不留痕）。
+- **启动恢复**：server 启动先调 JobRuntime.start() 再首次
+  tick——残留 running 标 interrupted 并在 checkpoint 留痕
+  （recoveredAt / fromStatus）；同键没有 succeeded 的
+  interrupted job 重新入队，随后连同崩溃前遗留的 queued 一并
+  按创建顺序排空执行。对齐 recoverInterruptedExecutions 的
+  「至少一次 + 对账」精神，不假装恰好一次：重跑的安全边界在
+  扫描层（Finding 扫描前对账、评论幂等标记）。
+- **channel 拒绝**：trigger "channel" 只存在于类型词表。
+  运行时入口（enqueue / runManual）收到它明确抛
+  TRIGGER_NOT_IMPLEMENTED（400），手动 HTTP 入口在请求体带
+  trigger: "channel" 时得 400——绝不悄悄当成 manual。
+  approval 在运行时词表内已实现（enqueue 可建），但本件尚无
+  产品流产生 approval job。
+- **亲跑验收**：新增 npm run test:jobs（已并入 npm test
+  链）**13/13**——A 段进程内 6 条（手动 job 落盘可查且按
+  bot 隔离；cron 时槽幂等；ok/failed/skipped/抛错四种结果
+  映射；channel 双入口拒绝 + 源码断言钉
+  IMPLEMENTED_TRIGGERS；启动恢复：2 条 running 标
+  interrupted、1 条对账重排队、同键已 succeeded 的不重跑、
+  重跑与遗留 queued 各执行一次；jobs.json 损坏隔离）；
+  B 段真实 server + GitHub 替身 7 条（启动登录、手动扫描
+  回 jobId、按 id 查到 manual/succeeded、channel 经 HTTP
+  400、未知 id 404、列表按 botId 隔离、未登录 401、落盘
+  含 manual 记录）。test:schedule **14/14** 不降：状态机用例
+  经 makeRuntime 适配器改指 createJobRuntime（run 字符串
+  口径转 runScan 结果、每块独立 botId 防幂等键串扰），纯
+  时间助手用例不动。全套 npm test 与根级 npm run check 的
+  最终数字以 PR 描述为准。
+- **明确不做**（按切片）：不接 Slack/邮件/心跳等 channel
+  产品（只留类型与拒绝口径）；不引 Temporal 式编排；
+  Job.type 本件只有 morning-scan；不深化分诊规则。

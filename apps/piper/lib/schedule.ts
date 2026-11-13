@@ -1,14 +1,10 @@
-// 定时调度（P1-4）：在 server.ts 长驻进程内调度晨间扫描，不另起服务、不加外部依赖。
+// 定时调度的时间助手（P1-4）：计划时刻解析、时区换算、下一次运行与启动
+// 补跑判定、补跑节奏常量。调度状态机本体（到点一次 / 失败有限补跑 / 启动
+// 补跑 / 并发防护 / 异常不杀进程）P2-7 起迁入 lib/job-runtime.ts，本文件
+// 只留纯函数与常量，不再有第二份 tick（见 job-runtime.ts 文件头）。
 // 计划：每天固定时刻（routines.json 的 schedule 字段，机器可解析的 "HH:MM"），时区读
 // L0-3 基础资料（readProfileSettings().timezone，缺省 Asia/Hong_Kong），每次决策现读，
 // 设置页改时区后下一周期即生效。
-// 语义（本模块状态机钉死，测试以假时钟驱动，不依赖真实时间流逝）：
-//   - 到点只触发一次；成功后同一周期不再跑；失败（整轮失败或抛错）后按 RETRY_DELAYS_MS
-//     有限补跑（15 分钟窗口内最多 3 次），超过则保持失败状态等下一周期；
-//   - 同一例程不并行：tick 时已有运行在途则跳过（busy），运行函数自身再做一层重入防护；
-//   - 启动补跑：进程启动时若今日计划时刻已过、且今日尚未成功跑过（按存储中的例程状态
-//     lastRunAt/lastStatus 判断），补跑一次，避免「服务 7:50 才启动、今天就空了」——
-//     这不是随时乱扫：只在启动后的第一次规划时判定，且今日已成功则绝不补。
 import { readProfileSettings } from "./settings.ts";
 
 export const DEFAULT_SCHEDULE_TIME = "08:00";
@@ -134,135 +130,6 @@ export function shouldCatchUp({
 	if (now.getTime() < todaySlot(now, timeZone, time).getTime()) return false;
 	if (lastStatus === "ok" && lastRunAt && zonedDateKey(new Date(lastRunAt), timeZone) === zonedDateKey(now, timeZone)) return false;
 	return true;
-}
-
-// 调度状态机。run() 返回 "ok" | "failed" | "skipped"（skipped = 运行函数侧重入防护命中，
-// 不计成败、不推进计划，等下一次 tick）；抛错按 "failed" 处理。
-// getRoutineState() 返回存储中的例程状态（{ lastRunAt, lastStatus }），供启动补跑与状态端点。
-// timezoneFn / timeFn 每次规划时现读，使设置变更无需重启即生效。
-// 防崩（审计 B3）：tick 整体包一层 try/catch——规划阶段（时区换算等）或状态推进抛错时
-// 不把异常抛给调用方（server 用 void tick(...) 驱动，抛出去就是 unhandledRejection 杀
-// 进程），改为复位 running、经 onError 钩子通知（server 侧落 routine.failed 通知）并
-// 返回 { action: "error" }，调度器保持可用。
-export interface RoutineState {
-	lastRunAt?: string | null;
-	lastStatus?: string | null;
-}
-
-export interface SchedulerOptions {
-	run: () => Promise<string>;
-	getRoutineState: () => RoutineState | null | undefined;
-	timezoneFn: () => string;
-	timeFn: () => ScheduleTime;
-	retryDelaysMs?: number[];
-	onError?: ((err: unknown) => void) | null;
-}
-
-export interface TickResult {
-	action: string;
-	nextRunAt?: Date;
-	result?: string;
-	attempts?: number;
-	gaveUp?: boolean;
-	error?: string;
-}
-
-export interface SchedulerStatus {
-	timezone: string;
-	nextRunAt: string;
-	nextRetryAt: string | null;
-	running: boolean;
-	attempts: number;
-	lastRunAt: string | null;
-	lastStatus: string | null;
-}
-
-export interface Scheduler {
-	tick: (now?: Date) => Promise<TickResult>;
-	status: (now?: Date) => SchedulerStatus;
-}
-
-export function createScheduler({ run, getRoutineState, timezoneFn, timeFn, retryDelaysMs = RETRY_DELAYS_MS, onError = null }: SchedulerOptions): Scheduler {
-	let running = false;
-	let attempts = 0;
-	let nextDueAt: Date | null = null;
-	let nextRetryAt: Date | null = null;
-
-	function plan(now: Date): void {
-		const timeZone = timezoneFn();
-		const time = timeFn();
-		const state = getRoutineState() ?? {};
-		if (shouldCatchUp({ now, timeZone, time, lastRunAt: state.lastRunAt ?? null, lastStatus: state.lastStatus ?? null })) {
-			nextDueAt = now;
-		} else {
-			nextDueAt = nextRunAfter(now, timeZone, time);
-		}
-	}
-
-	async function tick(now: Date = new Date()): Promise<TickResult> {
-		try {
-			return await tickInner(now);
-		} catch (err) {
-			running = false;
-			if (onError) {
-				try {
-					onError(err);
-				} catch {
-					/* 通知钩子自身失败不得再拖垮调度 */
-				}
-			}
-			return { action: "error", error: String((err as { message?: unknown } | null | undefined)?.message ?? err) };
-		}
-	}
-
-	async function tickInner(now: Date): Promise<TickResult> {
-		if (running) return { action: "busy" };
-		if (!nextDueAt) plan(now);
-		// plan() 两条分支都给 nextDueAt 赋值，到此必非空。
-		const dueAt = (nextRetryAt ?? nextDueAt) as Date;
-		if (now.getTime() < dueAt.getTime()) return { action: "idle", nextRunAt: dueAt };
-		running = true;
-		let outcome;
-		try {
-			outcome = await run();
-		} catch {
-			outcome = "failed";
-		} finally {
-			running = false;
-		}
-		if (outcome === "skipped") return { action: "skipped", nextRunAt: nextDueAt as Date };
-		if (outcome === "ok") {
-			attempts = 0;
-			nextRetryAt = null;
-			nextDueAt = nextRunAfter(now, timezoneFn(), timeFn());
-			return { action: "ran", result: "ok", nextRunAt: nextDueAt };
-		}
-		attempts += 1;
-		if (attempts <= retryDelaysMs.length) {
-			nextRetryAt = new Date(now.getTime() + retryDelaysMs[attempts - 1]);
-			return { action: "ran", result: "failed", attempts, nextRunAt: nextRetryAt };
-		}
-		attempts = 0;
-		nextRetryAt = null;
-		nextDueAt = nextRunAfter(now, timezoneFn(), timeFn());
-		return { action: "ran", result: "failed", gaveUp: true, nextRunAt: nextDueAt };
-	}
-
-	function status(now: Date = new Date()): SchedulerStatus {
-		if (!nextDueAt) plan(now);
-		const state = getRoutineState() ?? {};
-		return {
-			timezone: timezoneFn(),
-			nextRunAt: ((nextRetryAt ?? nextDueAt) as Date).toISOString(),
-			nextRetryAt: nextRetryAt ? nextRetryAt.toISOString() : null,
-			running,
-			attempts,
-			lastRunAt: state.lastRunAt ?? null,
-			lastStatus: state.lastStatus ?? null,
-		};
-	}
-
-	return { tick, status };
 }
 
 // 服务端装配用：时区直接读基础资料（缺省 Asia/Hong_Kong 在 readProfileSettings 内兜底）。
