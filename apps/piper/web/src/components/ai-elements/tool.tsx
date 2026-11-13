@@ -40,7 +40,7 @@ export type ToolHeaderProps = {
 );
 
 const statusLabels: Record<ToolPart["state"], string> = {
-	"approval-requested": "Awaiting Approval",
+	"approval-requested": "待批准",
 	"approval-responded": "Responded",
 	"input-available": "Running",
 	"input-streaming": "Pending",

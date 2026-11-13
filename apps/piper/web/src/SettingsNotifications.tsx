@@ -92,8 +92,8 @@ export function NotificationsSettings({
 										{n.body ? <p className="mt-0.5 text-sm text-muted-foreground">{n.body}</p> : null}
 									</div>
 									<div className="flex shrink-0 flex-col items-end gap-1">
-										{n.findingId && onOpenFinding ? (
-											<Button type="button" size="sm" variant="ghost" onClick={() => onOpenFinding(n.findingId as string)}>
+										{(n.findingId ?? n.toolApprovalId) && onOpenFinding ? (
+											<Button type="button" size="sm" variant="ghost" onClick={() => onOpenFinding((n.findingId ?? n.toolApprovalId) as string)}>
 												查看事项
 											</Button>
 										) : null}

@@ -10,12 +10,14 @@ import type {
 	Connector,
 	GithubSelfCheck,
 	HistoryEntry,
+	InboxItem,
 	ModelProvider,
 	ModelSettings,
 	NotificationEntry,
 	ModelSettingsInput,
 	ProfileSettings,
 	Routine,
+	ToolApprovalItem,
 	TraceData,
 } from "./model";
 
@@ -94,8 +96,8 @@ export async function getArtifact(id: string): Promise<Artifact> {
 	return (await api<{ artifact: Artifact }>(`/api/artifacts/${id}`)).artifact;
 }
 
-export async function listApprovals(): Promise<{ approvals: Approval[]; closed: Approval[] }> {
-	return api<{ approvals: Approval[]; closed: Approval[] }>("/api/approvals");
+export async function listApprovals(): Promise<{ approvals: InboxItem[]; closed: InboxItem[] }> {
+	return api<{ approvals: InboxItem[]; closed: InboxItem[] }>("/api/approvals");
 }
 
 export async function approveApproval(id: string, intentHash: string): Promise<{ approval: Approval; execution: ApprovalExecution }> {
@@ -109,6 +111,26 @@ export async function rejectApproval(id: string): Promise<Approval> {
 // 改评论正文（切片二）：approved 状态下改文会作废原批准（返回的 approval 回到 open）
 export async function editApprovalBody(id: string, body: string): Promise<Approval> {
 	return (await api<{ approval: Approval }>(`/api/approvals/${id}/edit`, { method: "POST", body: JSON.stringify({ body }) })).approval;
+}
+
+// 对话工具待批（P2-4）：批准只触发循环放行、接口不等待执行完，结果回流到
+// 对话与收件箱状态；改正文只发 body，锁定字段由服务端校验（改了回 400）
+export async function approveToolApproval(id: string): Promise<ToolApprovalItem> {
+	return (await api<{ approval: ToolApprovalItem }>(`/api/approvals/${id}/approve`, { method: "POST", body: "{}" })).approval;
+}
+
+export async function rejectToolApproval(id: string): Promise<ToolApprovalItem> {
+	return (await api<{ approval: ToolApprovalItem }>(`/api/approvals/${id}/reject`, { method: "POST", body: "{}" })).approval;
+}
+
+export async function editToolApprovalBody(id: string, body: string): Promise<ToolApprovalItem> {
+	return (await api<{ approval: ToolApprovalItem }>(`/api/approvals/${id}/edit`, { method: "POST", body: JSON.stringify({ body }) })).approval;
+}
+
+// 中止当前 run（P2-4）：无活动 run 时 aborted 为 false；停在待批上的记录
+// 会随之中止（cancelledToolApprovals 带回被取消的记录 id）
+export async function abortChat(botId: string): Promise<{ aborted: boolean; sessionId?: string; cancelledToolApprovals?: string[] }> {
+	return api(`/api/chats/${botId}/abort`, { method: "POST", body: "{}" });
 }
 
 // 即席开单（切片二）：对指定 PR 即时取证开事项；已有同键事项时 existing=true

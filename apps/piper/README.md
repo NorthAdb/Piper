@@ -2514,3 +2514,61 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
 - **明确不做**（按切片）：收件箱与工具卡的工具待批视觉（P2-4）、中止
   接口（P2-4）、文件工具挂进 streamChat（P2-5；本 PR 未挂）、新写意图
   种类、把网关收成通用 WriteExecutor。
+
+## P2-4 人的介入面实测（第二件切片四，2026-11-13）
+
+- **收件箱联合视图**：`GET /api/approvals` 的工具待批项（`kind: "tool_call"`）
+  与 Finding 项并列展示（P2-3 已备数据，本件补前端）——活动与已关闭两栏
+  均按 kind 分支渲染；工具卡含目标（repo + PR/Issue 号）、参数全文、
+  提出 bot 与时间、状态徽章（cancelled 显示「已取消」、failed 显示
+  「执行失败」）；批准按钮文案区分「批准并执行」与执行失败后的「再次
+  执行」；驳回两步确认（工具路径无去重冷却，bot 可重新提出，与
+  Finding 的 14 天冷却文案分开）。左栏收件箱角标计数同步计入两类。
+- **对话内工具卡待批准态**：实时流与历史还原同一口径——工具条目按
+  toolCallId 取最后一条，`status: "pending"` 还原为「待批准」卡（不显示
+  结果区，提示去收件箱批准/驳回），不再据 endedAt 把 pending 显示成
+  已完成（#35 审计建议 4 的前端半边）；运行状态行显示「等待批准：
+  <工具名>」；运行中可点「中止本轮」。待批产生时写 `approval.pending`
+  通知（新增 `toolApprovalId` 字段，通知中心「查看事项」深链两类
+  通用）；批准后回主视图由 ChatPane 重挂载重拉历史，工具卡随之更新。
+- **批准前改正文（工具待批）**：`POST /api/approvals/:id/edit` 对
+  `ta-…` 由 409 改为真编辑，但只许改正文、且只许 pending 态——请求
+  携带 repo/kind/number 且与快照不一致回 400、快照不变；正文校验与
+  Finding 改文同口径（非空、上限 10000 字、疑似含秘密拒绝）；成功写
+  审计 `edited`（intent 预览即新正文），批准后网关按新正文发。
+  已批准记录正文即冻结快照：要改先驳回重提，不新开状态迁移。
+- **中止接口**：`POST /api/chats/:botId/abort`（未登录 401、bot 不存在
+  404、无活动 run 回 `{aborted:false}`）。语义分三段：停在等待批准的
+  调用以 deny 结算，本会话 pending 工具待批记录随之置 `cancelled` +
+  审计 `cancelled`/`run_aborted`，零写入；同批未开始的调用不再执行；
+  **已在执行中的写不撤回**——基座 execute 不被 abort 信号抢占，已发出
+  的请求按真实结果落审计（与 Finding executing 中断恢复同口径），
+  中止不谎报「未写」。kernel 新增按 bot 索引的活动 run 登记
+  （`abortLiveRun`），streamChat 与恢复续跑都登记/摘除。
+- **#35 审计留项落地**：建议 2——`GET /api/audit` 透传 `toolApprovalId`
+  过滤（`listAudit` 本已支持）；建议 3——`tool-approvals.json` 改走
+  原子写（tmp+rename），解析失败/非数组时把原文件改名
+  `.corrupt-<时间戳>` 隔离留痕后从空表继续，绝不把损坏当空表静默
+  覆盖；建议 4 的后端半边——恢复重建待批集合按 toolCallId 取最后
+  一条且 status 为 pending，再滤掉 ToolApproval 记录已终态
+  （executed/rejected/cancelled/failed）的调用：防「第一条已在原 run
+  执行完、终态条目未及落盘就被杀进程」时重建把第一条误当待批重发
+  （建议 1 的 argsSnapshot 回传归 P2-5 文件工具挂载，本件未动）。
+- **亲跑验收**（`npm run test:intervention`，新脚本，已并入 `npm test`
+  链）：A 段进程内 3 条——原子落盘无 .tmp 残留、损坏隔离（原文件改名
+  保留内容、新写入从新表开始）、改正文 pending 只改 body / executed
+  回 409 / 空正文与疑似含秘密回 400；B 段真实 server + 双替身 9 条——
+  未登录中止 401、待批通知带 toolApprovalId、改正文锁定字段 400 且
+  快照不变 + 审计 edited 预览为新正文、批准按新正文恰好发一次且
+  `/api/audit?toolApprovalId=` 可追而 `?findingId=` 查不到、待批中
+  中止（cancelled + 审计 + 零写入 + 会话 error 终态 + 再批准 409）、
+  无 run 中止回 aborted:false、执行中中止（在途写完成落账、同批无
+  额外写）、同批双待批批一后 SIGKILL 重启批二（两条正文各发一次、
+  第一条再批准 409）。全套 `npm test` 与根级 `npm run check` 结果见
+  PR 描述。
+- **验收截图**：待批工具卡、收件箱两类并列、工具待批详情三张界面图
+  需在真实界面核对——本机（VM）实例无用户数据，截图以用户本机实例
+  为准，PR 中如实标注，不拿替身数据冒充产品界面。
+- **明确不做**（按切片）：计划模式、平行观察系统、Slack/邮件通知、
+  整套视觉重做；argsSnapshot 经 resolveToolCall 回传与冲突拒绝
+  （P2-5，文件工具挂循环前落地）。

@@ -14,10 +14,10 @@ import {
 	useExternalStoreRuntime,
 } from "@assistant-ui/react";
 import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
-import { ArrowUpIcon, Loader2Icon, MessageSquareIcon } from "lucide-react";
+import { ArrowUpIcon, Loader2Icon, MessageSquareIcon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { FormEvent } from "react";
-import { confirmDraft, listMessages, streamChat, UnauthorizedError } from "./api";
+import { abortChat, confirmDraft, listMessages, streamChat, UnauthorizedError } from "./api";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Bot, ChatMessage, ChatPart } from "./model";
@@ -317,12 +317,22 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		.filter((p): p is Extract<ChatPart, { type: "tool" }> => p.type === "tool" && p.phase !== "end")
 		.at(-1);
 	const statusLabel: string | null = runningToolPart
-		? `正在调用 ${runningToolPart.name}…`
+		? runningToolPart.phase === "pending"
+			? `等待批准：${runningToolPart.name}`
+			: `正在调用 ${runningToolPart.name}…`
 		: activeMessage?.parts.some((p) => p.type === "text" && p.text.length > 0)
 			? "正在生成回答…"
 			: activeMessage?.parts.some((p) => p.type === "reasoning")
 				? null
 				: "正在思考…";
+
+	// 中止（P2-4）：调服务端中止接口，run 自己收尾（待批转取消、未开始的
+	// 调用不再执行）；本端不直接改消息状态，收尾事件仍走 SSE 回来。
+	const onAbort = () => {
+		void abortChat(bot.id).catch((e: unknown) => {
+			if (e instanceof UnauthorizedError) onUnauthorized();
+		});
+	};
 	const elapsedSec = runStartedAt ? Math.max(0, Math.floor((tickNow - runStartedAt) / 1000)) : 0;
 
 	const runtime = useExternalStoreRuntime<ChatMessage>({
@@ -377,7 +387,18 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 								submitOnEnter
 							/>
 							<div className="flex items-center justify-between gap-2 px-3 pb-2.5">
-								<span className="hidden text-xs text-muted-foreground sm:block">Enter 发送 · Shift+Enter 换行</span>
+								{running ? (
+									<button
+										type="button"
+										onClick={onAbort}
+										className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+									>
+										<SquareIcon className="size-3.5" />
+										中止本轮
+									</button>
+								) : (
+									<span className="hidden text-xs text-muted-foreground sm:block">Enter 发送 · Shift+Enter 换行</span>
+								)}
 								<ComposerPrimitive.Send className={cn(buttonVariants({ size: "sm" }), "ml-auto rounded-full pr-3 pl-3.5")}>
 									发送
 									<ArrowUpIcon className="size-4" />
