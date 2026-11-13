@@ -7,9 +7,9 @@
 //   artifacts/<id>.md         产物（Markdown），文件头注释里带结构化元数据
 //   routines.json             routine 定义 + 上次运行结果
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync } from "node:fs";
-import type { WriteFileOptions } from "node:fs";
-import { join, dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, readdirSync, renameSync, rmSync, lstatSync, readlinkSync } from "node:fs";
+import type { Stats, WriteFileOptions } from "node:fs";
+import { join, dirname, resolve, sep, parse, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 import { redact } from "./redact.ts";
 
@@ -26,6 +26,9 @@ export interface Bot {
 	isMain: boolean;
 	canManageBots: boolean;
 	createdAt: string;
+	// P2-2：除自身工作区根外，额外允许文件工具访问的根（绝对路径，或相对
+	// DATA_DIR 解析）。缺省 []；旧 bots.json 没有该字段时按 [] 读（listBots 归一）。
+	workspaceAllowedRoots?: string[];
 }
 
 // 建 bot 入参：来自请求体（wire 输入），字段在 createBot 内逐个收窄，
@@ -39,6 +42,7 @@ export interface BotInput {
 	repos?: unknown;
 	routines?: unknown;
 	canManageBots?: unknown;
+	workspaceAllowedRoots?: unknown;
 }
 
 export interface BotPatch {
@@ -49,6 +53,7 @@ export interface BotPatch {
 	repos?: string[];
 	routines?: string[];
 	canManageBots?: boolean;
+	workspaceAllowedRoots?: string[];
 }
 
 export interface Routine {
@@ -251,8 +256,72 @@ export function acquireDataLock(): () => void {
 	};
 }
 
+// 路径真实解析（工作区硬闸的判定基础，botWorkspace / WorkspaceGuard 共用）：
+// 逐分量 lstat，符号链接按 readlink 展开（相对目标按链接所在目录解析），
+// 悬挂链接（目标尚不存在）也照样算出最终落点；真正不存在的分量只可能出现在
+// 已解析前缀之后（其下不可能再有链接），按字面拼回。
+// 不能用 existsSync/realpathSync 做这件事：它们跟随链接，悬挂链接会被误判为
+// 「不存在」，其目标就此漏过判定——writeFileSync 随后跟随该链接把文件写到
+// 界外（P2-2 审计 BLOCKER 的根因）。
+const MAX_SYMLINK_EXPANSIONS = 40;
+export function resolveRealPath(absPath: string): string {
+	let pending = resolve(absPath);
+	let expansions = 0;
+	for (;;) {
+		const { root } = parse(pending);
+		const components = pending.slice(root.length).split(sep).filter((part) => part.length > 0);
+		let prefix = root;
+		let restarted = false;
+		for (let i = 0; i < components.length; i += 1) {
+			const candidate = join(prefix, components[i]);
+			let stat: Stats;
+			try {
+				stat = lstatSync(candidate);
+			} catch (err) {
+				if ((err as { code?: unknown } | null | undefined)?.code === "ENOENT") {
+					// 该分量不存在：其后分量不可能是链接，整体按字面拼回
+					return join(prefix, ...components.slice(i));
+				}
+				throw err;
+			}
+			if (stat.isSymbolicLink()) {
+				expansions += 1;
+				if (expansions > MAX_SYMLINK_EXPANSIONS) throw new Error(`符号链接展开次数过多: ${absPath}`);
+				const target = readlinkSync(candidate);
+				const targetAbs = isAbsolute(target) ? target : join(dirname(candidate), target);
+				const rest = components.slice(i + 1);
+				pending = rest.length ? join(targetAbs, ...rest) : targetAbs;
+				restarted = true;
+				break;
+			}
+			prefix = candidate;
+		}
+		if (!restarted) return prefix;
+	}
+}
+
+export function isPathWithin(candidate: string, root: string): boolean {
+	return candidate === root || candidate.startsWith(root + sep);
+}
+
+const BOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export function assertValidBotId(botId: string): void {
+	if (typeof botId !== "string" || !BOT_ID_PATTERN.test(botId)) {
+		throw new Error(`非法 botId: ${JSON.stringify(botId)}`);
+	}
+}
+
 export function botWorkspace(botId: string): string {
-	return join(DATA_DIR, "workspaces", botId);
+	assertValidBotId(botId);
+	const root = join(DATA_DIR, "workspaces");
+	const candidate = join(root, botId);
+	// 硬闸（P2-2）：工作区目录本身若被符号链接指到 workspaces/ 之外，
+	// realpath 后越界，直接拒绝——不能让一个链接把整间工作区搬走。
+	if (!isPathWithin(resolveRealPath(candidate), resolveRealPath(root))) {
+		throw new Error(`bot 工作区越界: ${botId}`);
+	}
+	return candidate;
 }
 
 export function ensureData(): void {
@@ -270,8 +339,14 @@ export function ensureData(): void {
 
 export function listBots(): Bot[] {
 	const { bots } = readJson<{ bots: Bot[] }>(BOTS_FILE, { bots: [] });
+	// 旧数据兼容（P2-2）：workspaceAllowedRoots 缺失或非数组一律归一为 []，
+	// 消费方（WorkspaceGuard 等）不必再各自判空。
+	const normalized = bots.map((b) => ({
+		...b,
+		workspaceAllowedRoots: Array.isArray(b.workspaceAllowedRoots) ? b.workspaceAllowedRoots.map(String) : [],
+	}));
 	// 主 bot 置顶，其余按创建时间
-	return [...bots].sort((a, b) => Number(b.isMain) - Number(a.isMain) || String(a.createdAt).localeCompare(String(b.createdAt)));
+	return normalized.sort((a, b) => Number(b.isMain) - Number(a.isMain) || String(a.createdAt).localeCompare(String(b.createdAt)));
 }
 
 export function getBot(id: string): Bot | null {
@@ -281,6 +356,9 @@ export function getBot(id: string): Bot | null {
 export function createBot(input: BotInput): Bot {
 	const bots = listBots();
 	const id = input.id || `bot-${Date.now().toString(36)}`;
+	// 校验必须在写盘之前（P2-2 审计 MAJOR）：先落盘再在 botWorkspace 处抛错，
+	// 会把非法 id 留在 bots.json 里，之后 ensureData 每次启动都会再抛一次。
+	assertValidBotId(id);
 	if (bots.some((b) => b.id === id)) throw Object.assign(new Error(`bot id 已存在: ${id}`), { status: 409 });
 	const bot: Bot = {
 		id,
@@ -292,6 +370,7 @@ export function createBot(input: BotInput): Bot {
 		routines: Array.isArray(input.routines) ? input.routines.map(String) : [],
 		isMain: false,
 		canManageBots: Boolean(input.canManageBots),
+		workspaceAllowedRoots: Array.isArray(input.workspaceAllowedRoots) ? input.workspaceAllowedRoots.map(String) : [],
 		createdAt: new Date().toISOString(),
 	};
 	writeJson(BOTS_FILE, { bots: [...bots, bot] });
@@ -312,6 +391,7 @@ export function updateBot(id: string, patch: BotPatch): Bot | null {
 		...(patch.memoryScope !== undefined ? { memoryScope: String(patch.memoryScope) } : {}),
 		...(patch.repos !== undefined ? { repos: patch.repos.map(String) } : {}),
 		...(patch.routines !== undefined ? { routines: patch.routines.map(String) } : {}),
+		...(patch.workspaceAllowedRoots !== undefined ? { workspaceAllowedRoots: patch.workspaceAllowedRoots.map(String) } : {}),
 		// isMain / canManageBots 不允许通过普通编辑摘掉主 bot 的管理权
 		isMain: cur.isMain,
 		canManageBots: cur.isMain ? true : Boolean(patch.canManageBots ?? cur.canManageBots),

@@ -2348,3 +2348,93 @@ transcript 原参数（见落点的快照契约）。验收 5 的「落盘」在
   `resolveToolCall` 会等整段续跑结束，P2-4 的 HTTP 处理器不得直接
   `await` 它；批次中途 abort 时尚未处理的后续调用没有 tool result，
   下一轮请求会带着悬空 tool_use。
+
+## P2-2 权限策略与每 bot 文件工作区硬闸实测（第二件切片二，2026-11-12）
+
+权限与沙箱同批落地，全部改动在 `apps/piper` 内，不动基座：新增
+`lib/workspace-guard.ts`（`WorkspaceGuard`）、`lib/policy.ts`
+（`PolicyEngine`）、`lib/workspace-tools.ts`（四个文件工具），加固
+`lib/store.ts` 的 `botWorkspace`，`Bot` 增可选字段
+`workspaceAllowedRoots?: string[]`（缺省 `[]`，`listBots` 对旧数据归一，
+读写 bots.json 向后兼容）。按切片要求，本切片**不**把文件工具挂进
+`streamChat`——产品对话出现这四个工具要等 P2-5 注册表（或与 P2-5 合并时）；
+repo-keeper 默认不开放文件工具。
+
+- **硬闸口径**：`WorkspaceGuard.resolve(botId, rawPath)`——相对路径以
+  `botWorkspace(botId)` 为根，绝对路径只有落在该根或该 bot 的
+  `workspaceAllowedRoots` 内才放行；判定一律走 store.ts 的
+  `resolveRealPath`（逐分量 lstat 展开符号链接，悬挂链接也按 readlink
+  算出最终落点，详见下方审计返工补记），符号链接指向根外、`..` 穿越、
+  未授权绝对路径、含 NUL 的路径一律 `{ ok: false, reason: "escape" }`。
+  放行时返回判定所用的真实路径，工具直接拿它落盘。允许根的相对条目
+  按相对 `DATA_DIR` 解析（落点，管理者手写 bots.json 时以数据目录
+  为锚）；**注意**：相对条目若经 `..` 走出 `DATA_DIR`（如填 `".."`），
+  效果与填其绝对路径相同，会放开 `DATA_DIR` 的父目录——这是管理者
+  配置特权面，模型无从自行打开。`botWorkspace` 同步加固：botId 只允许
+  `^[A-Za-z0-9][A-Za-z0-9._-]*$`（含 `/`、`..` 等一律抛错），且工作区
+  目录本身被符号链接指到 `workspaces/` 外时抛错。
+- **策略口径（锁定默认）**：`PolicyEngine.decide({ botId, toolName, args })`——
+  `workspace_list` / `workspace_read` 界内 allow、越界 deny；
+  `workspace_write` / `workspace_edit` 界内 ask、越界 deny；
+  `web_fetch` / `web_search` allow；`github.read` allow（规则先行，工具
+  尚未物化）；`github_comment` ask（仓库绑定校验在 P2-3 补进本引擎）；
+  未知工具一律 deny。decide 先问 Guard，工具 `execute()` 开头再问一次
+  Guard——策略被人为改成 allow，越界执行仍然失败（验收 3 已钉住）。
+- **工具口径**：参数形状按切片锁定（list 的 path 可缺省为 `"."`）；
+  越界返回 `isError` 且 `details.reason === "escape"`，与普通 IO 失败
+  （`"io"`）、参数形状错误（`"args"`）可区分；被拒的写不在盘上留任何
+  字节。`workspace_edit` 要求 oldText 恰好出现一次，0 次或多次都不改
+  文件。`workspace_read` 回喂上限 64 KiB（落点），超出截断并注明；
+  注意这与网页抓取的可见文本 8000 字上限是两个不同的数，不要混。
+
+实测（本地，含下方返工补记后的计数）：`npm run test:workspace`
+**43/43 全绿**，逐条对应切片验收 1–6 与审计钉死项——界内写入落在
+`workspaces/bot-a/hello.txt` 且 list 可见、read 读回一致；越界三形态
+（绝对路径、`../bot-b/…` 与 `../outside.txt` 相对穿越、工作区内符号
+链接指向根外后经链接读写）全部以 escape 失败且目标文件内容不变、
+根外无新文件；PolicyEngine 被测试人为改成恒 allow（先 decide 再
+execute）后 execute 仍 escape 失败；bot-a 读 bot-b 文件（相对与绝对
+两路）失败；额外目录未授权时失败、写入 bot-a 的
+`workspaceAllowedRoots` 后可读、其父目录仍不可读、授权根内写为 ask；
+`botWorkspace("../sessions")` 与带 `/` 的 botId 抛错、Guard 对非法
+botId 返回 escape 不抛。验收 7：`apps/piper` 全套 `npm test` 退出码 0
+（findings 30、scan 20、pr-review 16、schedule 14、gateway 43、
+workspace 43、recovery 7、listen 9、badtz 4、secrets 21、model-stub 11、
+model-providers 57、r10 22、webfetch 48、trace 24、eval 23、
+regression 72），无回退。根级 `npm run check` 退出码 0。可复制命令：
+在 `apps/piper` 下跑 `npm run test:workspace`（或全套 `npm test`）。
+
+### 审计返工补记（PA—design 审 PR #34，结论不通过，2026-11-13）
+
+- **BLOCKER——悬挂符号链接绕过硬闸（已修）**：原 `realpathExistingPrefix`
+  用 `existsSync` 判存在性，它跟随链接：工作区内放一个指向根外
+  尚不存在文件的悬挂链接，`existsSync` 返回 false，判定回退到链接的
+  父目录（界内）并放行，`writeFileSync` 随后跟随链接在根外建文件。
+  修法：`realpathExistingPrefix` 换成逐分量解析的 `resolveRealPath`
+  ——每层 `lstat`，遇符号链接按 `readlink` 展开（相对目标按链接所在
+  目录解析）后重新判定，目标存不存在都算出最终落点；真正不存在的
+  分量只可能出现在已解析前缀之后（其下无链接），才按字面拼回。Guard
+  放行时返回该真实路径，四个工具一律用它落盘/读取（检查与写入同一
+  条路径）。`test:workspace` 钉死：悬挂文件链接 write/read/edit 一律
+  escape 且根外零字节、悬挂目录链接 write escape 且根外目录不被建、
+  工作区目录本身被换成悬挂链接时 `botWorkspace` 抛错且 Guard escape、
+  Guard 与 decide 对悬挂链接口径一致（写不再 ask、读不再 allow）。
+- **MAJOR——`createBot` 先写盘后校验（已修）**：非法 id 先经
+  `writeJson` 进了 `bots.json` 才在 `botWorkspace` 抛错，毒记录会让
+  之后的 `ensureData` 每次启动都抛。修法：id 计算后、写盘前先
+  `assertValidBotId`；用例钉死「抛错且 bots.json 一字不变」。
+- **顺手项（已修）**：验收 3 改走「先 decide（人为恒 allow 并实际
+  返回 allow）、再 execute」钉住 execute 与策略层答案无关；补钉
+  edit 出现 0 次/2 次不改文件、read 64 KiB 截断；含 NUL 的路径在
+  Guard 层直接 escape；订正本节 read 上限与网页抓取 8000 字的比附
+  句、补 `workspaceAllowedRoots` 相对条目走出 `DATA_DIR` 的说明。
+- **复审（head `2c499d5`）结论通过**；复审留项——原只在审计独立探针
+  里覆盖的形态（嵌套链接、相对目标含 `..`、链接环、链接到悬挂链接、
+  中途目录链接加多层尾分量、跨层悬挂、检查路径与写入路径为同一条）
+  ——已按萧北指示补进官方 `test:workspace`（34 → 43 条）防回归。
+  硬链接改同一 inode 不属路径越界、Guard 与写入之间的 TOCTOU 需外部
+  进程抢窗口，复审已定性记录，本切片不处理。
+
+- 明确不做（按切片）：未提供 bash/exec 等未隔离 shell；未做每 bot
+  云电脑或 Docker 隔离；未改 coding-agent 的 path-utils；文件工具未
+  挂进生产 `streamChat`。
