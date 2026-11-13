@@ -2647,23 +2647,32 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   参数与记录同源（记录即由它在 ask 时落盘），不存在第二份可冲突的
   参数；可冲突的只有流水重建这条路。
 - **落点 3（请审计裁断）：本地工具待批记录定型。** 工作区写/编辑
-  执行结束后，kernel 在 tool_execution_end 把记录 approved →
-  executed（工具出错时 error 记工具错误文本，状态仍 executed：
-  批准已被消费、成败看会话里的工具结果）。github_comment 明确
-  跳过——其记录生命周期归网关（暂时性失败保持 approved 可重试，
-  口径不变）。没有这一步，文件工具的待批会永远停在 approved
-  挂在收件箱活动栏。
+  执行结束后，kernel 在 tool_execution_end 给记录定型：成功 →
+  executed；确定性失败 → failed（工作区工具结果 details.reason 的
+  escape=硬闸越界、args=参数形状不对，同一快照永远不会成功，与
+  网关校验级拒绝同口径）；暂时性失败（reason io 等）→ 保持
+  approved + error（与网关暂时性失败同口径，留在收件箱活动栏可
+  人工驳回关闭）。github_comment 明确跳过——其记录生命周期归
+  网关（口径不变）。没有这一步，文件工具的待批会永远停在
+  approved 挂在收件箱活动栏。**订正（PR #37 审计 MINOR，
+  2026-11-13）**：初版定型不分失败类别、出错一律 executed，账本
+  会把零落盘的越界写记成「已执行」；审计指出后改为上述三分类，
+  B6/B7 两条全链用例钉住（批准后种入越界符号链接 → failed 且
+  界外零落盘；写入已存在目录的 IO 错 → 保持 approved）。
 - **亲跑验收**（`npm run test:tool-registry`，新脚本，已并入
-  `npm test` 链）：**12/12**——A 段进程内 7 条（种子两 bot 清单逐项
+  `npm test` 链）：**14/14**——A 段进程内 7 条（种子两 bot 清单逐项
   对表；物化集合恰为 offered 集且 parameters 与登记深等，未实现/
   非 offered 永不物化；网页启用+搜索配置后主 bot 物化多出
   web_fetch/web_search、管家不在范围内不物化、关闭后消失；快照
   冲突判定口径；源码断言无第二条组装路径）；B 段真实 server +
-  模型替身 5 条（接口 401/404/全文形状；模型请求里实际带的 tools
+  模型替身 7 条（接口 401/404/全文形状；模型请求里实际带的 tools
   集合逐项核对——主 bot 恰四个工作区工具、管家恰 [github_comment]；
   workspace_write 批准后原 run 执行、记录定型 executed、文件按
   快照内容落盘；杀进程后篡改会话流水参数再批准，恢复被快照冲突
-  拒绝、文件不落盘、记录保持 approved）。其余套件计数与 P2-4
+  拒绝、文件不落盘、记录保持 approved；定型分类两件——批准后种入
+  越界符号链接使执行被硬闸拦下、记录定型 failed 且界外零落盘，
+  写入已存在目录的 IO 失败、记录保持 approved + error）。其余
+  套件计数与 P2-4
   基线逐项一致（gateway 43、tool-gateway 19、intervention 15、
   workspace 43、webfetch 48、regression 72 等），全套 `npm test`
   退出 0、根级 `npm run check` 退出 0（最终数字以 PR head 为准）。

@@ -318,17 +318,37 @@ function gateHooks(botId: string, sessionId: string) {
 	};
 }
 
-// 本地工具待批记录的执行定型（P2-5）：github_comment 的记录生命周期归
-// 网关管（暂时性失败保持 approved + error 等重试，见 gateway.ts），本
-// 函数跳过它；其余 ask 工具（工作区写/编辑）没有第二方定型者——run 的
-// tool_execution_end 就是终点：approved → executed（工具出错时把错误
-// 文本记进 error，状态仍为 executed：批准已被消费、结果成败看会话里
-// 的工具结果，bot 要改会重新提出新调用）。定型失败不挡 run 本身。
-function settleLocalToolApproval(sessionId: string, toolCallId: string, isError: boolean, errorText: string | null): void {
+// 本地工具待批记录的执行定型（P2-5；失败分类经 PR #37 审计 MINOR
+// 订正）：github_comment 的记录生命周期归网关管（暂时性失败保持
+// approved + error 等重试，见 gateway.ts），本函数跳过它；其余 ask
+// 工具（工作区写/编辑）没有第二方定型者——run 的 tool_execution_end
+// 就是终点，按结果定型：
+// - 成功 → executed；
+// - 确定性失败 → failed（终态）：工作区工具的结果 details.reason 已
+//   把失败分好类——"escape"（硬闸越界）与 "args"（参数形状不对）用
+//   同一份快照永远不会成功，与网关校验级拒绝同口径（见
+//   tool-approvals.ts 文件头）；
+// - 其余失败（"io" 等暂时性错误）→ 保持 approved、只记 error，与网关
+//   暂时性失败同口径：记录留在收件箱活动栏，人工可驳回关闭，bot 也
+//   可重新提出新调用。
+// 定型失败不挡 run 本身。
+function settleLocalToolApproval(
+	sessionId: string,
+	toolCallId: string,
+	isError: boolean,
+	errorText: string | null,
+	errorReason: string | null,
+): void {
 	try {
 		const rec = findToolApprovalByToolCall(sessionId, toolCallId);
 		if (!rec || rec.status !== "approved" || rec.toolName === GITHUB_COMMENT_TOOL_NAME) return;
-		updateToolApproval(rec.id, { status: "executed", error: isError ? errorText : null });
+		if (!isError) {
+			updateToolApproval(rec.id, { status: "executed", error: null });
+		} else if (errorReason === "escape" || errorReason === "args") {
+			updateToolApproval(rec.id, { status: "failed", error: errorText });
+		} else {
+			updateToolApproval(rec.id, { status: "approved", error: errorText });
+		}
 	} catch {
 		/* 记录定型失败不挡 run 本身 */
 	}
@@ -367,7 +387,14 @@ function subscribeChatEvents(
 				if (errText) detail.error = errText.slice(0, 300);
 			}
 			onEvent({ type: "tool", phase: "end", name: event.toolName, toolCallId: event.toolCallId, detail });
-			if (sessionId) settleLocalToolApproval(sessionId, event.toolCallId, event.isError, typeof detail.error === "string" ? detail.error : null);
+			if (sessionId)
+				settleLocalToolApproval(
+					sessionId,
+					event.toolCallId,
+					event.isError,
+					typeof detail.error === "string" ? detail.error : null,
+					typeof detail.reason === "string" ? detail.reason : null,
+				);
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			state.finalText = textOf(event.message) || state.finalText;
 		}
