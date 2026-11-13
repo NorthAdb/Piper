@@ -7,7 +7,10 @@
 // 按 toolApprovalId 过滤；待批中中止（记录 cancelled、零写入、会话以
 // error 终态落盘、再批准 409）；无 run 中止回 aborted:false；执行中中止
 // （已发出的写按真实结果落账、同批不再有其他写）；同批双待批 + 杀进程
-// 重启后恢复第二个（第一个已执行的绝不重发）。
+// 重启后恢复第二个（第一个已执行的绝不重发）；在途驳回回 409（B10，
+// 记录保持 approved、在途写完成落 executed 恰好一次）；run-state
+// （B11，无 run false / 待批停泊 true / 落定 false / 未登录 401）；
+// 暂时性失败后驳回对照（B12，approved+error 未在途时驳回成功、零写入）。
 // 用法（在 apps/piper 下）：node dist/scripts/test-intervention.js
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -113,6 +116,7 @@ check(
 const ghPosts: { path: string; body: string }[] = [];
 const ghComments = new Map<string, { body: string; html_url: string }[]>();
 let ghDelayMs = 0;
+let ghFailPost = false;
 let ghPostStarted = 0;
 const ghStub: Server = createServer((reqHttp, resHttp) => {
 	const url = reqHttp.url ?? "";
@@ -128,6 +132,11 @@ const ghStub: Server = createServer((reqHttp, resHttp) => {
 		if ((m = /^\/repos\/(.+)\/issues\/(\d+)$/.exec(url))) return send({ state: "open" });
 		if ((m = /^\/repos\/(.+)\/issues\/(\d+)\/comments\?/.exec(url))) return send(ghComments.get(`${m[1]}#${m[2]}`) ?? []);
 		if ((m = /^\/repos\/(.+)\/issues\/(\d+)\/comments$/.exec(url)) && reqHttp.method === "POST") {
+			if (ghFailPost) {
+				resHttp.writeHead(500, { "Content-Type": "application/json" });
+				resHttp.end(JSON.stringify({ message: "stub post failure" }));
+				return;
+			}
 			ghPostStarted += 1;
 			const repoPart = m[1];
 			const numberPart = m[2];
@@ -453,6 +462,9 @@ try {
 	const postsBefore4 = ghPosts.length;
 	await req(`/api/approvals/${p4.id}/approve`, { method: "POST", body: JSON.stringify({}) });
 	await waitFor(() => (ghPostStarted > startedBefore4 ? true : null), 10000);
+	// 在途的确定性信号：网关领取时同步写 executing 审计（先于任何网络
+	// 调用），等到它再驳回，不靠固定 sleep 猜时序。
+	await waitFor(() => (readAuditEntries().some((x) => x.toolApprovalId === p4.id && x.result === "executing") ? true : null), 10000);
 	const rejectInFlight = await req(`/api/approvals/${p4.id}/reject`, { method: "POST", body: JSON.stringify({}) });
 	const p4Mid = (await toolApprovalsViaApi()).find((a) => a.id === p4.id);
 	const p4Done = await waitFor(async () => (await toolApprovalsViaApi()).find((a) => a.id === p4.id && a.status === "executed"), 30000);
@@ -463,6 +475,7 @@ try {
 			p4Mid?.status === "approved" &&
 			Boolean(p4Done) &&
 			ghPosts.length === postsBefore4 + 1 &&
+			readAuditEntries().some((x) => x.toolApprovalId === p4.id && x.result === "executing") &&
 			readAuditEntries().some((x) => x.toolApprovalId === p4.id && x.result === "executed") &&
 			!readAuditEntries().some((x) => x.toolApprovalId === p4.id && x.result === "rejected"),
 		`reject=${rejectInFlight.status} mid=${p4Mid?.status} posts=${ghPosts.length - postsBefore4}`,
@@ -487,6 +500,32 @@ try {
 			stateParked.json?.active === true &&
 			stateSettled.json?.active === false,
 		`unauth=${unauthState.status} idle=${JSON.stringify(stateIdle.json)} parked=${JSON.stringify(stateParked.json)}`,
+	);
+
+	// ---- 对照（#36 审计 MAJOR）：暂时性失败后 approved+error、未在途时
+	// 驳回仍成功、零写入。GitHub 替身对 POST 回 500 造一次暂时性失败
+	// （comment_failed），记录保持 approved 并记 error；再驳回即放弃重试。
+	ghFailPost = true;
+	const seenIds12 = new Set([p1.id, p2.id, p3.id, pA.id, pB.id, p4.id, p5.id]);
+	await chatEvents("repo-keeper", "第六次给 PR 1 留评");
+	const p6 = await waitFor(async () => (await toolApprovalsViaApi()).find((a) => a.status === "pending" && !seenIds12.has(a.id)));
+	const postsBefore6 = ghPosts.length;
+	await req(`/api/approvals/${p6.id}/approve`, { method: "POST", body: JSON.stringify({}) });
+	const p6Failed = await waitFor(async () => {
+		const r = (await toolApprovalsViaApi()).find((a) => a.id === p6.id);
+		return r && r.status === "approved" && typeof r.error === "string" && r.error.includes("comment_failed") ? r : null;
+	}, 30000);
+	ghFailPost = false;
+	const rejectFailed = await req(`/api/approvals/${p6.id}/reject`, { method: "POST", body: JSON.stringify({}) });
+	const p6After = (await toolApprovalsViaApi()).find((a) => a.id === p6.id);
+	check(
+		"B12 暂时性失败后驳回：写失败后记录 approved+error（未在途），驳回回 200、记录 rejected、零写入",
+		Boolean(p6Failed) &&
+			rejectFailed.status === 200 &&
+			p6After?.status === "rejected" &&
+			ghPosts.length === postsBefore6 &&
+			!readAuditEntries().some((x) => x.toolApprovalId === p6.id && x.result === "executed"),
+		`failed=${JSON.stringify(p6Failed?.error)} reject=${rejectFailed.status} after=${p6After?.status} posts=${ghPosts.length - postsBefore6}`,
 	);
 } finally {
 	proc?.kill("SIGKILL");
