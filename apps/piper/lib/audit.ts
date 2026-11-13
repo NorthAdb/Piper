@@ -18,7 +18,10 @@ import { redact } from "./redact.ts";
 // 「批的是哪一版、哪一版被改掉」。
 // cancelled（P2-4）：用户中止 run 时，仍停在待批的工具调用随之中止，
 // 记录转 cancelled 并落一条（reason=run_aborted），与 rejected_by_user 区分。
-export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired", "edited", "cancelled"] as const;
+// budget_exceeded（P2-8）：run 触达预算上限（步数 / token / 外部调用）
+// 跳闸时落一条，reason 为超限项（steps / tokens / external_calls），
+// 当时计数与策略在 budget 字段，sessionId 标明是哪一轮会话。
+export const AUDIT_RESULTS = ["denied", "approved", "executing", "executed", "failed", "rejected", "expired", "edited", "cancelled", "budget_exceeded"] as const;
 export type AuditResult = (typeof AUDIT_RESULTS)[number];
 
 export interface IntentSummary {
@@ -42,6 +45,9 @@ export interface AuditEntry {
 	// 对话工具待批（P2-3）的审计按此 id 追溯；Finding 路径恒为 null。
 	toolApprovalId: string | null;
 	commentUrl: string | null;
+	// 预算跳闸（P2-8）才有：哪一轮会话、当时计数与生效策略；其余条目恒 null。
+	sessionId?: string | null;
+	budget?: { limit: string | null; steps: number; tokens: number; externalCalls: number; policy: { maxSteps: number; maxTokens: number; maxExternalCalls: number } } | null;
 }
 
 function auditFile(): string {
@@ -75,6 +81,8 @@ export function appendAudit({
 	approvalId = null,
 	toolApprovalId = null,
 	commentUrl = null,
+	sessionId = null,
+	budget = null,
 }: {
 	botId?: string | null;
 	intent?: unknown;
@@ -84,6 +92,8 @@ export function appendAudit({
 	approvalId?: string | null;
 	toolApprovalId?: string | null;
 	commentUrl?: string | null;
+	sessionId?: string | null;
+	budget?: AuditEntry["budget"];
 }): AuditEntry {
 	if (!(AUDIT_RESULTS as readonly string[]).includes(result)) throw new Error(`未知审计结果: ${result}`);
 	const entry: AuditEntry = {
@@ -98,6 +108,8 @@ export function appendAudit({
 		approvalId,
 		toolApprovalId,
 		commentUrl,
+		sessionId,
+		budget,
 	};
 	ensureData();
 	appendFileSync(auditFile(), JSON.stringify(entry) + "\n", "utf8");

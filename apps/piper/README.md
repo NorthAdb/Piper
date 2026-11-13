@@ -2817,3 +2817,57 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
 - **明确不做**（按切片）：不接 Slack/邮件/心跳等 channel
   产品（只留类型与拒绝口径）；不引 Temporal 式编排；
   Job.type 本件只有 morning-scan；不深化分诊规则。
+
+## P2-8 预算熔断实测（第二件切片八，2026-11-13）
+
+- **策略（新增 lib/budget.ts）**：BudgetPolicy{maxSteps,
+  maxTokens, maxExternalCalls}，形状与默认值为切片锁定值
+  （20 / 100_000 / 30）；策略数字只在 apps/piper 侧，基座
+  agent-loop 一字未动——结束 run 用的是基座现成的 finishTurn
+  出口（返回 { action: "end" } 在轮次边界收尾），本件没有改
+  packages/ 任何文件。配置三级：代码缺省 ←
+  PIPER_DATA_DIR/settings-budget.json（正整数才收，损坏按
+  缺省走）← 环境变量 PIPER_BUDGET_MAX_STEPS /
+  PIPER_BUDGET_MAX_TOKENS / PIPER_BUDGET_MAX_EXTERNAL_CALLS
+  （运维与测试用）；每次 run 现读，改配置下一轮即生效。默认
+  值按第一件规模定：晨间扫描是脚本直跑、不经对话循环，短
+  对话一轮个位数步数，不会被误伤（S5 与全套绿为证）。
+- **计数口径**：步数与 token 在 finishTurn 按轮累计（步数
+  +1、token 加本轮 usage.totalTokens；error/aborted 轮不
+  计）。token 是事后数字，跨限那轮必然已消费，熔断挡的是
+  它之后的请求。外部调用只认 web_fetch / web_search /
+  github_comment 三个走出进程的副作用工具，在 execute 入口
+  计数：真的要执行了才 +1——待批未执行的、被策略闸拒的都
+  到不了 execute、不计数；达到上限后下一次 execute 不真正
+  执行、直接回 isError 的预算错误结果（模型能看到原因）。
+  工作区文件工具是本地副作用，由步数兜底。
+- **跳闸留痕**：跳闸只发生一次，那一刻写审计（audit 新增
+  结果值 budget_exceeded，reason 为超限项 steps / tokens /
+  external_calls，条目带 sessionId 与 budget{当时计数 + 生效
+  策略}）并往会话流水落一条 kind: budget_trip 的系统提示；
+  每段 run 的计数快照同时写进当轮装配记录（context_assembly
+  条目的 budget 字段，GET /api/sessions/:sessionId/context
+  的响应已带出）。跳闸后仍未批准的工具调用保持 pending——
+  结束只发生在轮次边界，停泊中的批次由批准/中止按既有语义
+  处置，不偷偷执行、不改成 error（S4 为证）。
+- **计数边界（落点）**：计数以一段 run（一个 Agent 生命周期）
+  为界——待批恢复续跑是新的一段、重新起算。人工批准本身
+  就是一道闸，恢复段从零计数；跨段累计需要把计数持久化进
+  会话，本件不做。晨间扫描 job 不经对话循环，不受本预算
+  约束（它有自己的补跑与失败口径）。
+- **亲跑验收**（npm run test:budget，新脚本，已并入 npm
+  test 链）：**15/15**——A 段进程内 7 条（三级配置与无效值
+  忽略；steps/tokens/external_calls 三个跳闸点与 onTrip 只
+  触发一次；execute 闸达上限后真的不再调 execute、本地工具
+  不拦）；B 段真实 server + 模型/搜索/GitHub 替身 8 条
+  （maxSteps=2 → 模型请求恰 2 次便停、审计与装配记录对上、
+  进程仍在、已产生条目保留；每轮 usage 60000、限 100000 →
+  第 2 轮 tokens 跳闸于 120000；maxExternalCalls=1 → 搜索
+  替身只收到 1 次请求、被拦结果在会话里可见；
+  maxSteps=1 + github_comment 待批 → 保持 pending、批准后
+  恰发 1 条评论且记录 executed、续跑段跳闸审计落盘；缺省
+  预算下普通对话不跳闸）。全套 npm test 与根级 npm run
+  check 的最终数字以 PR 描述为准。
+- **明确不做**（按切片）：不与循环闸（P2-1/P2-3）同 PR
+  （本件独立成 PR）；不做多模型路由或自动换模型省钱；不把
+  「提示词里写了请节约」当验收。

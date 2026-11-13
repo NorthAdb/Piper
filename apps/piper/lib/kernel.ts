@@ -36,6 +36,8 @@ import { createToolApproval, findToolApprovalByToolCall, snapshotConflictReason,
 import { GITHUB_COMMENT_TOOL_NAME } from "./github-comment.ts";
 import { agentToolsForBot } from "./tool-registry.ts";
 import { ContextAssembler, HISTORY_WINDOW_MESSAGES } from "./context-assembler.ts";
+import { BUDGET_LIMIT_LABELS, BudgetTracker, readBudgetPolicy, withBudgetGate } from "./budget.ts";
+import { appendAudit } from "./audit.ts";
 import type { Api, ApiKeyAuth, AssistantMessage, CreateProviderOptions, Message, Model, ModelThinkingLevel, MutableModels, Provider, ProviderStreams, ToolCall, Usage } from "@earendil-works/pi-ai";
 import type { Agent, AgentMessage, AgentTool, AgentToolResult, ThinkingLevel as AgentThinkingLevel } from "@earendil-works/pi-agent-core";
 
@@ -320,6 +322,41 @@ export function hasLiveRun(botId: string): boolean {
 // 它之后才发 pending 事件、才进等待）；waitForToolApproval 本身只停泊——
 // 决定经 Agent.resolveToolCall 由基座的等待桥交付（agent.ts 内部 race），
 // 停泊的 promise 永不自行 settle，abort 时基座按取消处理。
+// 预算熔断（P2-8）：一段 run 一个计数器，跳闸当刻写审计并在会话里
+// 留一条系统提示（kind budget_trip，用户在历史里能看到为什么停）。
+// 计数经两路喂入：finishTurn 按轮累计步数/token；外部工具的
+// execute 闸（withBudgetGate）计外部调用。恢复续跑是新的一段、
+// 重新计数（人工批准本身就是一道闸，见 lib/budget.ts 文件头）。
+function createRunBudget(botId: string, sessionId: string): BudgetTracker {
+	return new BudgetTracker(readBudgetPolicy(), (snap) => {
+		appendAudit({
+			botId,
+			result: "budget_exceeded",
+			reason: snap.tripped,
+			sessionId,
+			budget: { limit: snap.tripped, steps: snap.steps, tokens: snap.tokens, externalCalls: snap.externalCalls, policy: snap.policy },
+		});
+		appendSession(botId, {
+			role: "system",
+			kind: "budget_trip",
+			sessionId,
+			text: `本轮已达预算上限（${BUDGET_LIMIT_LABELS[snap.tripped ?? "steps"]}：步数 ${snap.steps}/${snap.policy.maxSteps}，token ${snap.tokens}/${snap.policy.maxTokens}，外部调用 ${snap.externalCalls}/${snap.policy.maxExternalCalls}），已停止继续执行；已产生的内容保留。`,
+			budget: snap,
+		});
+	});
+}
+
+// finishTurn 出口：正常轮把计数喂给跟踪器，已跳闸就回 end 结束
+// 本轮（基座在轮次边界收尾，已流出的文本不删、进程不死）；
+// error / aborted 轮是硬退出路径，不计也不干预。
+function budgetFinishTurn(tracker: BudgetTracker) {
+	return (turn: { message: { stopReason?: string; usage?: { totalTokens?: number } } }) => {
+		if (turn.message.stopReason === "error" || turn.message.stopReason === "aborted") return undefined;
+		tracker.noteTurn(turn.message.usage?.totalTokens ?? 0);
+		return tracker.tripped ? { action: "end" as const } : undefined;
+	};
+}
+
 function gateHooks(botId: string, sessionId: string) {
 	return {
 		toolExecution: "sequential" as const,
@@ -484,6 +521,10 @@ export async function streamChat({
 				})
 			: null;
 	const orderedTools = assembler ? assembler.orderTools(tools) : tools;
+	// 预算（P2-8）：产品路径建计数器，外部工具经 withBudgetGate
+	// 计数/拦截；非产品路径（无 botId/sessionId）不设预算。
+	const budget = botId && sessionId ? createRunBudget(botId, sessionId) : null;
+	const gatedTools = budget ? withBudgetGate(orderedTools, budget) : orderedTools;
 	const toolNote = orderedTools.length
 		? `\n\n你可以使用这些工具：${orderedTools.map((t) => t.name).join("、")}。其中写操作工具会先经用户批准才会真正执行；工具被拒绝或失败时，把原因如实告诉用户，不要编造结果。`
 		: "";
@@ -502,7 +543,7 @@ export async function streamChat({
 			systemPrompt: composedSystemPrompt,
 			model,
 			messages: assembler ? converted.messages : converted.messages.slice(-HISTORY_WINDOW_MESSAGES),
-			tools: orderedTools,
+			tools: gatedTools,
 			thinkingLevel,
 		},
 		streamFn: (m, context, options) => models.streamSimple(m, context, options),
@@ -517,6 +558,7 @@ export async function streamChat({
 					},
 				}
 			: {}),
+		...(budget ? { finishTurn: budgetFinishTurn(budget) } : {}),
 	});
 	const state = { finalText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state, sessionId);
@@ -540,6 +582,9 @@ export async function streamChat({
 					modelId: cfg.modelId,
 					stages: assembler.records(),
 					assembledAt: new Date().toISOString(),
+					// 预算计数快照（P2-8）：这一段 run 的步数/token/
+					// 外部调用与是否跳闸，随装配记录一起可读。
+					...(budget ? { budget: budget.snapshot() } : {}),
 				});
 			} catch {
 				/* 装配记录落盘失败不挡对话本身 */
@@ -654,16 +699,21 @@ export async function resumeToolApproval({
 		assistantMessage,
 	];
 	const tools = agentToolsForBot(bot, sessionId);
+	// 预算（P2-8）：续跑是新的一段 run，计数器重新起算（人工批准
+	// 本身就是一道闸）；外部工具同样经 execute 闸计数/拦截。
+	const budget = createRunBudget(botId, sessionId);
+	const gatedTools = withBudgetGate(tools, budget);
 	const agent = new agentCore.Agent({
 		initialState: {
 			systemPrompt: bot.systemPrompt,
 			model,
 			messages,
-			tools,
+			tools: gatedTools,
 			thinkingLevel,
 		},
 		streamFn: (m, context, options) => models.streamSimple(m, context, options),
 		...gateHooks(botId, sessionId),
+		finishTurn: budgetFinishTurn(budget),
 	});
 	const state = { finalText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state, sessionId);
