@@ -2362,11 +2362,15 @@ repo-keeper 默认不开放文件工具。
 
 - **硬闸口径**：`WorkspaceGuard.resolve(botId, rawPath)`——相对路径以
   `botWorkspace(botId)` 为根，绝对路径只有落在该根或该 bot 的
-  `workspaceAllowedRoots` 内才放行；判定一律走 realpath（尚不存在的路径
-  解析其已存在的最长前缀，检查 store.ts 的 `realpathExistingPrefix`），
-  符号链接指向根外、`..` 穿越、未授权绝对路径一律 `{ ok: false, reason: "escape" }`。
-  允许根的相对条目按相对 `DATA_DIR` 解析（落点，管理者手写 bots.json 时
-  以数据目录为锚）。`botWorkspace` 同步加固：botId 只允许
+  `workspaceAllowedRoots` 内才放行；判定一律走 store.ts 的
+  `resolveRealPath`（逐分量 lstat 展开符号链接，悬挂链接也按 readlink
+  算出最终落点，详见下方审计返工补记），符号链接指向根外、`..` 穿越、
+  未授权绝对路径、含 NUL 的路径一律 `{ ok: false, reason: "escape" }`。
+  放行时返回判定所用的真实路径，工具直接拿它落盘。允许根的相对条目
+  按相对 `DATA_DIR` 解析（落点，管理者手写 bots.json 时以数据目录
+  为锚）；**注意**：相对条目若经 `..` 走出 `DATA_DIR`（如填 `".."`），
+  效果与填其绝对路径相同，会放开 `DATA_DIR` 的父目录——这是管理者
+  配置特权面，模型无从自行打开。`botWorkspace` 同步加固：botId 只允许
   `^[A-Za-z0-9][A-Za-z0-9._-]*$`（含 `/`、`..` 等一律抛错），且工作区
   目录本身被符号链接指到 `workspaces/` 外时抛错。
 - **策略口径（锁定默认）**：`PolicyEngine.decide({ botId, toolName, args })`——
@@ -2380,24 +2384,50 @@ repo-keeper 默认不开放文件工具。
   越界返回 `isError` 且 `details.reason === "escape"`，与普通 IO 失败
   （`"io"`）、参数形状错误（`"args"`）可区分；被拒的写不在盘上留任何
   字节。`workspace_edit` 要求 oldText 恰好出现一次，0 次或多次都不改
-  文件。`workspace_read` 回喂上限 64 KiB，超出截断并注明（落点，与网页
-  抓取的截断口径一致）。
+  文件。`workspace_read` 回喂上限 64 KiB（落点），超出截断并注明；
+  注意这与网页抓取的可见文本 8000 字上限是两个不同的数，不要混。
 
-实测（本地）：新增 `npm run test:workspace` **23/23 全绿**，逐条对应
-切片验收 1–6——界内写入落在 `workspaces/bot-a/hello.txt` 且 list 可见、
-read 读回一致；越界三形态（绝对路径、`../bot-b/…` 与 `../outside.txt`
-相对穿越、工作区内符号链接指向根外后经链接读写）全部以 escape 失败
-且目标文件内容不变、根外无新文件；PolicyEngine 被测试人为改成
-恒 allow 后 execute 仍 escape 失败；bot-a 读 bot-b 文件（相对与绝对
+实测（本地，含下方返工补记后的计数）：`npm run test:workspace`
+**34/34 全绿**，逐条对应切片验收 1–6 与审计钉死项——界内写入落在
+`workspaces/bot-a/hello.txt` 且 list 可见、read 读回一致；越界三形态
+（绝对路径、`../bot-b/…` 与 `../outside.txt` 相对穿越、工作区内符号
+链接指向根外后经链接读写）全部以 escape 失败且目标文件内容不变、
+根外无新文件；PolicyEngine 被测试人为改成恒 allow（先 decide 再
+execute）后 execute 仍 escape 失败；bot-a 读 bot-b 文件（相对与绝对
 两路）失败；额外目录未授权时失败、写入 bot-a 的
 `workspaceAllowedRoots` 后可读、其父目录仍不可读、授权根内写为 ask；
 `botWorkspace("../sessions")` 与带 `/` 的 botId 抛错、Guard 对非法
 botId 返回 escape 不抛。验收 7：`apps/piper` 全套 `npm test` 退出码 0
 （findings 30、scan 20、pr-review 16、schedule 14、gateway 43、
-workspace 23、recovery 7、listen 9、badtz 4、secrets 21、model-stub 11、
+workspace 34、recovery 7、listen 9、badtz 4、secrets 21、model-stub 11、
 model-providers 57、r10 22、webfetch 48、trace 24、eval 23、
 regression 72），无回退。根级 `npm run check` 退出码 0。可复制命令：
 在 `apps/piper` 下跑 `npm run test:workspace`（或全套 `npm test`）。
+
+### 审计返工补记（PA—design 审 PR #34，结论不通过，2026-11-13）
+
+- **BLOCKER——悬挂符号链接绕过硬闸（已修）**：原 `realpathExistingPrefix`
+  用 `existsSync` 判存在性，它跟随链接：工作区内放一个指向根外
+  尚不存在文件的悬挂链接，`existsSync` 返回 false，判定回退到链接的
+  父目录（界内）并放行，`writeFileSync` 随后跟随链接在根外建文件。
+  修法：`realpathExistingPrefix` 换成逐分量解析的 `resolveRealPath`
+  ——每层 `lstat`，遇符号链接按 `readlink` 展开（相对目标按链接所在
+  目录解析）后重新判定，目标存不存在都算出最终落点；真正不存在的
+  分量只可能出现在已解析前缀之后（其下无链接），才按字面拼回。Guard
+  放行时返回该真实路径，四个工具一律用它落盘/读取（检查与写入同一
+  条路径）。`test:workspace` 钉死：悬挂文件链接 write/read/edit 一律
+  escape 且根外零字节、悬挂目录链接 write escape 且根外目录不被建、
+  工作区目录本身被换成悬挂链接时 `botWorkspace` 抛错且 Guard escape、
+  Guard 与 decide 对悬挂链接口径一致（写不再 ask、读不再 allow）。
+- **MAJOR——`createBot` 先写盘后校验（已修）**：非法 id 先经
+  `writeJson` 进了 `bots.json` 才在 `botWorkspace` 抛错，毒记录会让
+  之后的 `ensureData` 每次启动都抛。修法：id 计算后、写盘前先
+  `assertValidBotId`；用例钉死「抛错且 bots.json 一字不变」。
+- **顺手项（已修）**：验收 3 改走「先 decide（人为恒 allow 并实际
+  返回 allow）、再 execute」钉住 execute 与策略层答案无关；补钉
+  edit 出现 0 次/2 次不改文件、read 64 KiB 截断；含 NUL 的路径在
+  Guard 层直接 escape；订正本节 read 上限与网页抓取 8000 字的比附
+  句、补 `workspaceAllowedRoots` 相对条目走出 `DATA_DIR` 的说明。
 
 - 明确不做（按切片）：未提供 bash/exec 等未隔离 shell；未做每 bot
   云电脑或 Docker 隔离；未改 coding-agent 的 path-utils；文件工具未

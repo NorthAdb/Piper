@@ -14,7 +14,7 @@ export const WORKSPACE_READ_TOOL_NAME = "workspace_read";
 export const WORKSPACE_WRITE_TOOL_NAME = "workspace_write";
 export const WORKSPACE_EDIT_TOOL_NAME = "workspace_edit";
 
-// read 的回喂上限：与网页抓取的截断口径一致，避免一个大文件把整轮上下文吃满。
+// read 的回喂上限 64 KiB（落点）：避免一个大文件把整轮上下文吃满。
 const READ_MAX_BYTES = 64 * 1024;
 
 function textResult(text: string, details: Record<string, unknown>): AgentToolResult<any> {

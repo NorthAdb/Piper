@@ -109,6 +109,43 @@ try {
 		linkWrite.isError === true && linkWrite.details?.reason === "escape" && !existsSync(join(outsideDir, "new.txt")),
 		resultText(linkWrite),
 	);
+
+	// 悬挂符号链接（审计 BLOCKER）：链接目标尚不存在时，existsSync 会把链接
+	// 误判为「不存在」而漏掉目标——判定必须按 readlink 算出最终落点。
+	const danglingTarget = join(TMP_ROOT, "dangling-pwned.txt");
+	symlinkSync(danglingTarget, join(wsA, "dangling-file"));
+	const danglingWrite = await toolsA.get("workspace_write")!({ path: "dangling-file", content: "PWNED-DANGLING" });
+	check(
+		"审计BLOCKER 悬挂文件链接 write 为 escape 且根外零字节（目标未被创建）",
+		danglingWrite.isError === true && danglingWrite.details?.reason === "escape" && !existsSync(danglingTarget),
+		resultText(danglingWrite),
+	);
+	const danglingRead = await toolsA.get("workspace_read")!({ path: "dangling-file" });
+	check(
+		"审计BLOCKER 悬挂文件链接 read 统一为 escape（不是 io/ENOENT）",
+		danglingRead.isError === true && danglingRead.details?.reason === "escape",
+		resultText(danglingRead),
+	);
+	const danglingEdit = await toolsA.get("workspace_edit")!({ path: "dangling-file", oldText: "a", newText: "b" });
+	check(
+		"审计BLOCKER 悬挂文件链接 edit 同样为 escape 且目标未被创建",
+		danglingEdit.isError === true && danglingEdit.details?.reason === "escape" && !existsSync(danglingTarget),
+		resultText(danglingEdit),
+	);
+	const danglingDirTarget = join(TMP_ROOT, "dangling-dir-target");
+	symlinkSync(danglingDirTarget, join(wsA, "dangling-dir"));
+	const danglingDirWrite = await toolsA.get("workspace_write")!({ path: "dangling-dir/new.txt", content: "pwned" });
+	check(
+		"审计BLOCKER 悬挂目录链接 write 为 escape 且根外目录未被创建",
+		danglingDirWrite.isError === true && danglingDirWrite.details?.reason === "escape" && !existsSync(danglingDirTarget),
+		resultText(danglingDirWrite),
+	);
+	check(
+		"审计BLOCKER Guard 与策略对悬挂链接口径一致（decide 写 ask 不再出现、读不再 allow）",
+		WorkspaceGuard.resolve("bot-a", "dangling-file").ok === false &&
+			PolicyEngine.decide({ botId: "bot-a", toolName: "workspace_write", args: { path: "dangling-file", content: "" } }) === "deny" &&
+			PolicyEngine.decide({ botId: "bot-a", toolName: "workspace_read", args: { path: "dangling-file" } }) === "deny",
+	);
 	check(
 		"策略默认：越界路径在 decide 层就是 deny（读与写）",
 		PolicyEngine.decide({ botId: "bot-a", toolName: "workspace_read", args: { path: outsideFile } }) === "deny" &&
@@ -116,19 +153,25 @@ try {
 	);
 
 	// ---------- 验收 3：策略人为放行，execute 仍越界失败 ----------
+	// 按审计意见走「先 decide、再 execute」的完整形状：decide 被人为改成恒
+	// allow 并真的先跑一遍拿到 allow，execute 仍须以 escape 拒绝——钉住
+	// 「execute 的 Guard 独立于策略层答案」这一性质。
 	const originalDecide = PolicyEngine.decide;
 	(PolicyEngine as any).decide = () => "allow";
+	let stubbedDecision = "";
 	let forcedRead: any;
 	let forcedWrite: any;
 	try {
+		stubbedDecision = PolicyEngine.decide({ botId: "bot-a", toolName: "workspace_write", args: { path: outsideFile, content: "pwned" } });
 		forcedRead = await toolsA.get("workspace_read")!({ path: outsideFile });
 		forcedWrite = await toolsA.get("workspace_write")!({ path: outsideFile, content: "pwned" });
 	} finally {
 		(PolicyEngine as any).decide = originalDecide;
 	}
 	check(
-		"验收3 PolicyEngine 被人为改成 allow，execute 仍以 escape 失败、目标不变",
-		forcedRead.isError === true &&
+		"验收3 decide 被人为改成 allow（且已实际返回 allow），execute 仍以 escape 失败、目标不变",
+		stubbedDecision === "allow" &&
+			forcedRead.isError === true &&
 			forcedRead.details?.reason === "escape" &&
 			forcedWrite.isError === true &&
 			forcedWrite.details?.reason === "escape" &&
@@ -186,6 +229,65 @@ try {
 	}
 	check("验收6 botWorkspace('../sessions') 与带 / 的 botId 都抛错", threwTraversal && threwSlash);
 	check("验收6 Guard 对非法 botId 返回 escape 而不是抛错", WorkspaceGuard.resolve("../sessions", "x.txt").ok === false);
+
+	// ---------- edit 出现次数与 read 截断（审计建议钉死） ----------
+	writeFileSync(join(wsA, "multi.txt"), "foo bar foo", "utf8");
+	const editMissing = await toolsA.get("workspace_edit")!({ path: "multi.txt", oldText: "baz", newText: "x" });
+	check(
+		"workspace_edit oldText 出现 0 次失败且文件不变",
+		editMissing.isError === true && readFileSync(join(wsA, "multi.txt"), "utf8") === "foo bar foo",
+		resultText(editMissing),
+	);
+	const editTwice = await toolsA.get("workspace_edit")!({ path: "multi.txt", oldText: "foo", newText: "x" });
+	check(
+		"workspace_edit oldText 出现 2 次失败且文件不变",
+		editTwice.isError === true && readFileSync(join(wsA, "multi.txt"), "utf8") === "foo bar foo",
+		resultText(editTwice),
+	);
+	writeFileSync(join(wsA, "big.txt"), "x".repeat(70 * 1024), "utf8");
+	const readBig = await toolsA.get("workspace_read")!({ path: "big.txt" });
+	check(
+		"workspace_read 超过 64 KiB 截断并注明（details.truncated）",
+		!readBig.isError && readBig.details?.truncated === true && resultText(readBig).includes("已截断"),
+	);
+
+	// ---------- NUL 路径（审计顺手项） ----------
+	check(
+		"含 NUL 的路径在 Guard 层直接 escape、策略层 deny",
+		WorkspaceGuard.resolve("bot-a", "a\0b").ok === false &&
+			PolicyEngine.decide({ botId: "bot-a", toolName: "workspace_read", args: { path: "a\0b" } }) === "deny",
+	);
+
+	// ---------- createBot 先验后写（审计 MAJOR） ----------
+	const botsFile = join(TMP_DATA, "bots.json");
+	const botsFileBefore = readFileSync(botsFile, "utf8");
+	let createThrew = false;
+	try {
+		store.createBot({ id: "../sessions", name: "poison" });
+	} catch {
+		createThrew = true;
+	}
+	check(
+		"审计MAJOR createBot 非法 id 抛错且 bots.json 一字不变（无毒记录）",
+		createThrew && readFileSync(botsFile, "utf8") === botsFileBefore && store.getBot("../sessions") === null,
+	);
+
+	// ---------- 工作区目录本身被换成悬挂链接 ----------
+	const botC = store.createBot({ id: "bot-c", name: "Bot C" });
+	const wsC = store.botWorkspace(botC.id);
+	rmSync(wsC, { recursive: true, force: true });
+	const wsCTarget = join(TMP_ROOT, "bot-c-elsewhere");
+	symlinkSync(wsCTarget, wsC);
+	let wsThrew = false;
+	try {
+		store.botWorkspace("bot-c");
+	} catch {
+		wsThrew = true;
+	}
+	check(
+		"审计BLOCKER 工作区目录本身是悬挂链接时 botWorkspace 抛错、Guard 返回 escape",
+		wsThrew && WorkspaceGuard.resolve("bot-c", "x.txt").ok === false,
+	);
 
 	// ---------- 策略表其余锁定项 ----------
 	check(
