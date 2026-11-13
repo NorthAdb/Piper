@@ -2726,14 +2726,19 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
   GET /api/sessions/:sessionId/context（登录可访，未登录 401、
   无记录 404）返回该轮记录。装配记录是「关于这一轮」的元数据、
   不是对话事件：buildTrace 显式跳过该 kind，不进轨迹时间线
-  （轨迹的逐轮事件序列口径因此不变，test:trace 全绿）。
+  （轨迹的逐轮事件序列口径因此不变，test:trace 全绿）；前端
+  historyToMessages 同样跳过该 kind，不画成空的系统卡（#38
+  审计 MINOR：初版只修了轨迹、漏了对话区历史还原，刷新/切 bot
+  后每轮会多出一张徽章为 context_assembly 的空卡，已一并修掉
+  并在测试里以源码断言钉住）。
 - **亲跑验收**（npm run test:context-assembler，新脚本，已并入
-  npm test 链）：**10/10**——A 段进程内 6 条（默认装配六级齐全
+  npm test 链）：**11/11**——A 段进程内 7 条（默认装配六级齐全
   且数字与估算口径逐项一致、工具按 name 排序、拼串与既有格式
   字节一致；history 与 about_me 对调 → 两级 reorder；跨轮与趟
   内换模型 → model_switch；30 条大消息越阈值 → 保留 20 条、
   dropped m0..m9、compact、before 3750 / after 2500；仅窗口未
-  到阈值 → 无 compact；异形消息不抛错且同趟幂等）；B 段真实
+  到阈值 → 无 compact；异形消息不抛错且同趟幂等；前端
+  historyToMessages 跳过装配记录的源码断言钉）；B 段真实
   server + 模型替身 4 条（启动登录、接口 401/404、聊一轮按
   sessionId 读回六级记录、设置换 modelId 再聊 → 新会话 system
   级 model_switch 且旧会话记录不变）。全套 npm test 与根级

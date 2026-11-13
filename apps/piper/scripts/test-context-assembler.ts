@@ -167,6 +167,22 @@ const byStage = (records: any[], stage: string): any => records.find((r) => r.st
 	);
 }
 
+// ---- A7：前端历史还原同样跳过装配记录（#38 审计 MINOR 的钉） ----
+// 装配记录若被 historyToMessages 画成系统卡，刷新/切 bot 后对话区每轮
+// 多一张空卡。web 源码不在 server 构建面里，这里按源码断言钉住跳过
+// 逻辑（与 test:tool-gateway 的源码检索断言同法）。
+{
+	const { readFileSync } = await import("node:fs");
+	const modelSrc = readFileSync(join(APP_DIR, "web", "src", "model.ts"), "utf8");
+	const fnStart = modelSrc.indexOf("export function historyToMessages");
+	const fnSlice = fnStart >= 0 ? modelSrc.slice(fnStart, fnStart + 1200) : "";
+	check(
+		"A7 前端钉：web/src/model.ts 的 historyToMessages 跳过 kind context_assembly（不画空系统卡）",
+		fnSlice.includes('e.kind === "context_assembly") continue'),
+		`fnStart=${fnStart} slice=${fnSlice.slice(0, 200)}`,
+	);
+}
+
 // ================= B 段：真实 server + 模型替身 =================
 const modelStub: Server = createServer((reqHttp, resHttp) => {
 	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
