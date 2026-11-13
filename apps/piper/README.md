@@ -2438,3 +2438,79 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
 - 明确不做（按切片）：未提供 bash/exec 等未隔离 shell；未做每 bot
   云电脑或 Docker 隔离；未改 coding-agent 的 path-utils；文件工具未
   挂进生产 `streamChat`。
+
+## P2-3 网关挂循环闸 + github_comment 实测（第二件切片三，2026-11-13）
+
+- **做了什么**：`streamChat` 接入循环闸——入参增 `botId`/`sessionId`，Agent 设
+  `toolExecution: "sequential"` 与 `sessionId`；`beforeToolCall` 问 `PolicyEngine`
+  （deny 即拒绝且无后续钩子可翻案）；ask 时 `onToolApprovalPending` 先把待批
+  记录落盘（新文件 `lib/tool-approvals.ts`，`PIPER_DATA_DIR/tool-approvals.json`，
+  状态机 pending → approved/rejected/cancelled、approved → executed/failed/
+  rejected），再停泊等待，决定经 `Agent.resolveToolCall` 交付。
+- **github_comment**（新文件 `lib/github-comment.ts`）：参数
+  `{repo, kind: pr_comment|issue_comment, number, body}` 按 §1.1 锁定；仅当
+  bot 的 tools 含 `github_comment` 时注册（种子 repo-keeper 已带，主 bot 默认
+  不带，验收 B9 钉死）；`execute()` 只在 resolve allow 后调用
+  `gatewayExecuteWrite({toolApprovalId, snapshot})`，不自拼 GitHub 请求；
+  策略层补齐仓库绑定校验（P2-2 留项）：参数不全/种类不对/编号非正整数/
+  正文为空/仓库不在 bot.repos 内一律 deny 不进收件箱，绑定且形状合法才 ask。
+- **网关扩展**：`gatewayExecuteWrite` 增 `toolApprovalId` 入参，与 Finding
+  路径共用同一段评论写入尾段（目标状态复检、幂等查重翻页、POST、executed
+  审计）；Finding 路径的参数、返回值与语义不变（`test:gateway` 43 条全绿，
+  含「除 gateway.ts 外无人构造评论写端点」的源码检索断言）。审计增
+  `toolApprovalId` 字段，工具待批的 approved/executing/executed/failed/
+  denied/rejected 均可按它追溯。
+- **批准面**：`POST /api/approvals/:id/approve|reject` 对 `ta-…` 同样有效
+  （按 id 前缀分发）；`GET /api/approvals` 返回联合视图（Finding 项包
+  `kind: "finding"`、工具待批项 `kind: "tool_call"`，含 closed）。批准只
+  置 approved + 写审计 + 触发放行，不 await 整个续跑：原 Agent 还活着走
+  `resolveToolCall` 在原 run 继续；不在（重启过）走 `kernel.resumeToolApproval`
+  从会话 JSONL 重建 transcript（本轮之前的文本历史 + 本轮 user 条目 + 只含
+  待批调用的 assistant 消息）再 resolve，不用 `continue()`。
+- **SSE 与落盘**：工具待批时 SSE 发 `tool` 的 `phase: "pending"` 后即发
+  `done` 结束本条请求（不无限挂起 HTTP）；run 本身停泊等待，批准后由浮动
+  收尾补齐本轮落盘。pending 事件到达时本轮未结束调用即以 `status: "pending"`
+  落盘——不走「回合结束仍 running 就写 error」的旧分支；同批被闸拦下、
+  从未 start 的后续调用同样记 pending。
+- **亲跑验收**（`npm run test:tool-gateway`，新脚本，已并入 `npm test` 链）：
+  A 段进程内 10 条——策略绑定 ask/未绑定 deny/形状 deny、存储状态机与
+  快照整形、网关未批准 denied/not_approved 零写入、批准后恰好一次且正文
+  含本记录幂等标记、重复执行 denied/already_executed、快照篡改
+  denied/intent_changed 且记录 failed、未绑定 denied/repo_not_bound、
+  崩溃重放标记复用不重发；B 段真实 server + 模型/GitHub 双替身 9 条——
+  对话提出评论出现 pending 相位且无 start、批准前写 API 0 次、批准后恰好
+  一条且审计三段齐、驳回零写入且原 run 以 error 终态收尾落盘、SIGKILL 后
+  JSONL 里该调用是 pending 不是 error、重启批准走恢复路径仍恰好一次且
+  再批准回 409、未绑定仓 deny 无待批、主 bot 请求里无 github_comment。
+  共 19/19。回归：findings 30、scan 20、pr-review 16、schedule 14、
+  gateway 43、workspace 43、recovery 7、listen 9、badtz 4、secrets 21、
+  model-stub 11、model-providers 57、r10 22、webfetch 48、trace 24、
+  eval:scan 23、regression 72 全绿；根级 `npm run check` 退出 0。本切片
+  只动 `apps/piper`，CI 走精简门禁。
+- **落点（与切片字面有出入或切片未写明处，逐条留痕）**：
+  1. 网关工具路径不套用扫描规则前提复检（PR 仍待审、Issue 仍无人回应）：
+     那是扫描规则的前提，不是评论合法性——用户在对话里明确要求发的评论，
+     PR 已被批准或 Issue 已有回复都不构成不发的理由。目标状态复检
+     （PR/Issue 仍 open、Issue 不是 PR）、绑定、秘密、幂等一律保留。
+  2. 工具待批的校验级 denied（快照不符、含秘密、不支持的意图、未绑定、
+     未批准直调）把记录置 `failed` 终态：这类重试也不会变。Finding 没有
+     failed 态故其 denied 保持 approved，两套状态机按各自锁定形状走；
+     暂时性失败（目标已关、网络、无令牌）工具路径同样保持 approved +
+     error 记原因，再次批准即重试。
+  3. 工具路径的领取用进程内在途集合（§1.1 状态机没有 executing 态）；
+     领取时先写 executing 审计再发网络调用，崩溃后记录仍是 approved，
+     重试靠幂等标记防双发，与 Finding 的中断恢复同理。
+  4. `test:workspace` 第 43 条原钉的「github_comment 无参 ask」是 P2-2
+     占位口径（当时注释即写明绑定校验 P2-3 补进），本切片按 P2-3 验收 5
+     更新为绑定校验口径（未绑定/无参 deny），ask 的正向断言移到
+     `test:tool-gateway` A1。
+  5. 已有数据里的 repo-keeper 不会自动获得 `github_comment`（种子只对
+     新数据生效）；在 bot 编辑里给 tools 补上该能力字符串即注册，本件
+     不静默改写用户已有 bot 数据。
+  6. 模型在提出工具调用前流出的正文不单独落盘：恢复重建的 assistant
+     消息只含工具调用块，该轮的事实记录以 tool 条目为准。
+  7. `POST /api/approvals/:id/edit` 对 `ta-…` 回 409：本件不支持批准时
+     改参（快照不可变），正文编辑口径归 P2-4 一并设计。
+- **明确不做**（按切片）：收件箱与工具卡的工具待批视觉（P2-4）、中止
+  接口（P2-4）、文件工具挂进 streamChat（P2-5；本 PR 未挂）、新写意图
+  种类、把网关收成通用 WriteExecutor。

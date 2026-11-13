@@ -149,7 +149,7 @@ const SEED_BOTS: Bot[] = [
 		name: "仓库管家",
 		systemPrompt:
 			"你是仓库管家，一个面向开发者运维的 bot，负责盯住绑定的 GitHub 仓库：CI 红绿、待处理 PR 与 issue、最近提交。你只做只读巡检与汇报，不擅自改代码或合并 PR；发现异常先汇报并给出证据链接。",
-		tools: ["github.read"],
+		tools: ["github.read", "github_comment"],
 		memoryScope: "self+about-me",
 		repos: ["NorthAdb/LinkForge", "NorthAdb/Loom"],
 		routines: ["morning-scan"],

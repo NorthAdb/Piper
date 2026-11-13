@@ -30,9 +30,12 @@ import type { ThinkingLevel } from "./settings.ts";
 import { getCatalogModel, resolveModelProviderId } from "./model-providers.ts";
 import { webFetch, webSearch } from "./webfetch.ts";
 import { redact } from "./redact.ts";
-import { APP_DIR } from "./store.ts";
+import { APP_DIR, getBot, readSession } from "./store.ts";
 import type { Bot, SessionEntry } from "./store.ts";
-import type { Api, ApiKeyAuth, CreateProviderOptions, Message, Model, ModelThinkingLevel, MutableModels, Provider, ProviderStreams, Usage } from "@earendil-works/pi-ai";
+import { PolicyEngine } from "./policy.ts";
+import { createToolApproval } from "./tool-approvals.ts";
+import { githubCommentToolsForBot } from "./github-comment.ts";
+import type { Api, ApiKeyAuth, AssistantMessage, CreateProviderOptions, Message, Model, ModelThinkingLevel, MutableModels, Provider, ProviderStreams, ToolCall, Usage } from "@earendil-works/pi-ai";
 import type { Agent, AgentTool, AgentToolResult, ThinkingLevel as AgentThinkingLevel } from "@earendil-works/pi-agent-core";
 
 const REPO_ROOT = join(APP_DIR, "..", "..");
@@ -49,7 +52,7 @@ export interface ModelConfig {
 export type ChatEvent =
 	| { type: "delta"; text: string }
 	| { type: "thinking"; text: string; level: string }
-	| { type: "tool"; phase: "call" | "start" | "end"; name: string; toolCallId: string; detail: unknown };
+	| { type: "tool"; phase: "call" | "pending" | "start" | "end"; name: string; toolCallId: string; detail: unknown };
 
 export interface BotDraft {
 	name: string;
@@ -309,52 +312,65 @@ export function webToolsForBot(bot: Bot | null | undefined): AgentTool<any>[] {
 	return tools;
 }
 
-// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"thinking",text,level} /
-// {type:"tool",phase,name,toolCallId,detail}。thinking 是思考链增量：pi-ai 的
-// openai-completions 已把服务商回的 reasoning_content / reasoning /
-// reasoning_text 解析成 thinking 内容，pi-agent-core 以 message_update 的
-// thinking_delta 往外送，这里原样转发并带上生效挡位 level（已 clamp 的值，
-// 供前端思考区头部与服务端按段落盘标注；挡位为 off 或服务商不回推理时不出现）。
-// tool 事件的 call/start/end 三段带同一个 toolCallId（前端按它把一次调用合并成一张卡、
-// 服务端按它收集落盘）；end 的 detail 除 isError 外并入工具结果的 details
-// （web_fetch 的 {url,status,truncated}、web_search 的 {count}），出错时再带 error 文本。
-// 返回最终助手文本。失败抛错（err.code 区分 BASE_NOT_BUILT / MODEL_ERROR 等），由路由层转 SSE error 事件。
-export async function streamChat({
-	systemPrompt,
-	history = [],
-	message,
-	onEvent,
-	tools = [],
-}: {
-	systemPrompt: string;
-	history?: SessionEntry[];
-	message: string;
-	onEvent: (event: ChatEvent) => void;
-	tools?: AgentTool<any>[];
-}): Promise<{ text: string }> {
-	const cfg = modelConfig();
-	if (!cfg.configured) {
-		throw Object.assign(new Error("未配置模型：请在设置中配置模型（端点与 API Key），或设置 PIPER_MODEL_API_KEY 后重试。"), {
-			code: "MODEL_NOT_CONFIGURED",
-		});
-	}
-	const { agentCore } = await loadRuntime();
-	const { models, model, thinkingLevel } = await buildModelsAndModel(cfg);
-	const toolNote = tools.length
-		? `\n\n你可以使用这些只读工具：${tools.map((t) => t.name).join("、")}。工具被拒绝或失败时，把原因如实告诉用户，不要编造网页内容。`
-		: "";
-	const agent = new agentCore.Agent({
-		initialState: {
-			systemPrompt: systemPrompt + toolNote,
-			model,
-			messages: toPiMessages(history, cfg),
-			tools,
-			thinkingLevel,
+// ---------- 循环闸的宿主接线（P2-3）：策略、待批落盘、等待与恢复 ----------
+// 每个进行中的会话至多一个活 Agent：批准接口先在 liveAgents 里找原 Agent，
+// 找到就 resolveToolCall 在原 run 里放行；找不到（进程重启过）走
+// resumeToolApproval 从会话 JSONL 重建 transcript 再 resolve。
+// backgroundRuns 给「SSE 已结束但 run 还停在待批」的浮动 promise 续命：
+// 没有这层引用，整条 promise 链可能被 GC 掉，批准就再也唤不醒它。
+const liveAgents = new Map<string, Agent>();
+const backgroundRuns = new Set<Promise<unknown>>();
+
+export function trackBackgroundRun(promise: Promise<unknown>): void {
+	backgroundRuns.add(promise);
+	const done = (): void => {
+		backgroundRuns.delete(promise);
+	};
+	promise.then(done, done);
+}
+
+export function getLiveAgent(sessionId: string): Agent | null {
+	return liveAgents.get(sessionId) ?? null;
+}
+
+// 闸的三个钩子（botId 在场时才装）：beforeToolCall 问 PolicyEngine——
+// deny 原样返回（本引擎的 deny 没有任何后续钩子能翻案，钩子链里它就是
+// 唯一裁决者）；ask 不带改参（本件不支持钩子改参放行，参数以模型原提
+// 为快照）；onToolApprovalPending 在等待之前把待批记录落盘（内核 await
+// 它之后才发 pending 事件、才进等待）；waitForToolApproval 本身只停泊——
+// 决定经 Agent.resolveToolCall 由基座的等待桥交付（agent.ts 内部 race），
+// 停泊的 promise 永不自行 settle，abort 时基座按取消处理。
+function gateHooks(botId: string, sessionId: string) {
+	return {
+		toolExecution: "sequential" as const,
+		sessionId,
+		beforeToolCall: async (ctx: { toolCall: { name: string }; args: unknown }) => {
+			const decision = PolicyEngine.decide({
+				botId,
+				toolName: ctx.toolCall.name,
+				args: ctx.args && typeof ctx.args === "object" ? (ctx.args as Record<string, unknown>) : {},
+			});
+			if (decision === "deny") return { decision: "deny" as const, reason: `策略拒绝：工具 ${ctx.toolCall.name} 的本次调用不被允许` };
+			if (decision === "ask") return { decision: "ask" as const };
+			return { decision: "allow" as const };
 		},
-		streamFn: (m, context, options) => models.streamSimple(m, context, options),
-	});
-	let finalText = "";
-	const unsubscribe = agent.subscribe((event) => {
+		onToolApprovalPending: async (ctx: { toolCallId: string; toolName: string; args: unknown }) => {
+			createToolApproval({ botId, sessionId, toolCallId: ctx.toolCallId, toolName: ctx.toolName, argsSnapshot: ctx.args ?? null });
+		},
+		waitForToolApproval: async () => new Promise<never>(() => {}),
+	};
+}
+
+// Agent 事件 → ChatEvent 的映射（streamChat 与 resumeToolApproval 共用）：
+// thinking 带生效挡位；tool 的 pending 来自基座 tool_approval_pending 事件
+// （落盘已在此前完成）；end 的 detail 并入工具结果 details，出错再带 error。
+function subscribeChatEvents(
+	agent: Agent,
+	onEvent: (event: ChatEvent) => void,
+	thinkingLevel: string,
+	state: { finalText: string },
+): () => void {
+	return agent.subscribe((event) => {
 		if (event.type === "message_update") {
 			const ame = event.assistantMessageEvent;
 			if (ame?.type === "text_delta" && ame.delta) onEvent({ type: "delta", text: ame.delta });
@@ -362,6 +378,8 @@ export async function streamChat({
 			if (ame?.type === "toolcall_end" && ame.toolCall) {
 				onEvent({ type: "tool", phase: "call", name: ame.toolCall.name, toolCallId: ame.toolCall.id, detail: ame.toolCall.arguments ?? null });
 			}
+		} else if (event.type === "tool_approval_pending") {
+			onEvent({ type: "tool", phase: "pending", name: event.toolName, toolCallId: event.toolCallId, detail: event.args ?? null });
 		} else if (event.type === "tool_execution_start") {
 			onEvent({ type: "tool", phase: "start", name: event.toolName, toolCallId: event.toolCallId, detail: event.args ?? null });
 		} else if (event.type === "tool_execution_end") {
@@ -376,22 +394,173 @@ export async function streamChat({
 			}
 			onEvent({ type: "tool", phase: "end", name: event.toolName, toolCallId: event.toolCallId, detail });
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
-			finalText = textOf(event.message) || finalText;
+			state.finalText = textOf(event.message) || state.finalText;
 		}
 	});
+}
+
+// 流式对话：onEvent 收结构化事件 {type:"delta",text} / {type:"thinking",text,level} /
+// {type:"tool",phase,name,toolCallId,detail}。thinking 是思考链增量：pi-ai 的
+// openai-completions 已把服务商回的 reasoning_content / reasoning /
+// reasoning_text 解析成 thinking 内容，pi-agent-core 以 message_update 的
+// thinking_delta 往外送，这里原样转发并带上生效挡位 level（已 clamp 的值，
+// 供前端思考区头部与服务端按段落盘标注；挡位为 off 或服务商不回推理时不出现）。
+// tool 事件的 call/pending/start/end 四段带同一个 toolCallId（前端按它把一次调用
+// 合并成一张卡、服务端按它收集落盘）；end 的 detail 除 isError 外并入工具结果的
+// details（web_fetch 的 {url,status,truncated}、web_search 的 {count}），出错时
+// 再带 error 文本。botId/sessionId 在场时装上循环闸（见 gateHooks）。
+// 返回最终助手文本。失败抛错（err.code 区分 BASE_NOT_BUILT / MODEL_ERROR 等），由路由层转 SSE error 事件。
+export async function streamChat({
+	systemPrompt,
+	history = [],
+	message,
+	onEvent,
+	tools = [],
+	botId,
+	sessionId,
+}: {
+	systemPrompt: string;
+	history?: SessionEntry[];
+	message: string;
+	onEvent: (event: ChatEvent) => void;
+	tools?: AgentTool<any>[];
+	botId?: string;
+	sessionId?: string;
+}): Promise<{ text: string }> {
+	const cfg = modelConfig();
+	if (!cfg.configured) {
+		throw Object.assign(new Error("未配置模型：请在设置中配置模型（端点与 API Key），或设置 PIPER_MODEL_API_KEY 后重试。"), {
+			code: "MODEL_NOT_CONFIGURED",
+		});
+	}
+	const { agentCore } = await loadRuntime();
+	const { models, model, thinkingLevel } = await buildModelsAndModel(cfg);
+	const toolNote = tools.length
+		? `\n\n你可以使用这些工具：${tools.map((t) => t.name).join("、")}。其中写操作工具会先经用户批准才会真正执行；工具被拒绝或失败时，把原因如实告诉用户，不要编造结果。`
+		: "";
+	const agent = new agentCore.Agent({
+		initialState: {
+			systemPrompt: systemPrompt + toolNote,
+			model,
+			messages: toPiMessages(history, cfg),
+			tools,
+			thinkingLevel,
+		},
+		streamFn: (m, context, options) => models.streamSimple(m, context, options),
+		...(botId ? gateHooks(botId, sessionId ?? "") : {}),
+	});
+	const state = { finalText: "" };
+	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state);
+	if (sessionId) liveAgents.set(sessionId, agent);
 	try {
 		await agent.prompt(message);
 	} catch (err) {
 		throw Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" });
 	} finally {
 		unsubscribe();
+		if (sessionId && liveAgents.get(sessionId) === agent) liveAgents.delete(sessionId);
 	}
 	if (agent.state?.errorMessage) {
 		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
 	}
-	return { text: finalText };
+	return { text: state.finalText };
 }
 
+// 待批恢复（进程重启后批准）：从会话 JSONL 重建 transcript——本轮之前的
+// 对话按文本历史（toPiMessages 同口径），本轮 = user 条目 + 一条只含待批
+// 工具调用的 assistant 消息（status 为 pending 的 tool 条目即该批的全部
+// 调用，按 seq 排序）；新建 Agent 后走 resolveToolCall（不得用 continue()，
+// 基座在 last 为 assistant 时会抛错）。续跑的事件经 onEvent 交回调用方
+// 落盘；若续跑中又有同批调用进 ask，本函数返回的 promise 会停泊在那次
+// 等待上（调用方应以 trackBackgroundRun 托住、不要直接 await 到底）。
+export async function resumeToolApproval({
+	botId,
+	sessionId,
+	toolCallId,
+	decision,
+	onEvent,
+}: {
+	botId: string;
+	sessionId: string;
+	toolCallId: string;
+	decision: "allow" | "deny";
+	onEvent: (event: ChatEvent) => void;
+}): Promise<{ text: string }> {
+	const bot = getBot(botId);
+	if (!bot) throw Object.assign(new Error(`bot 不存在: ${botId}`), { code: "BOT_NOT_FOUND" });
+	const cfg = modelConfig();
+	if (!cfg.configured) {
+		throw Object.assign(new Error("未配置模型：请在设置中配置模型（端点与 API Key），或设置 PIPER_MODEL_API_KEY 后重试。"), {
+			code: "MODEL_NOT_CONFIGURED",
+		});
+	}
+	const entries = readSession(botId);
+	const turn = entries.filter((e) => e.sessionId === sessionId);
+	const userEntry = turn.find((e) => e.role === "user");
+	const pendingTools = turn
+		.filter((e) => e.role === "tool" && e.status === "pending")
+		.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+	if (!userEntry || !pendingTools.some((t) => t.toolCallId === toolCallId)) {
+		throw Object.assign(new Error("会话记录里找不到该待批调用，无法恢复执行"), { code: "RESUME_NOT_FOUND" });
+	}
+	const { agentCore } = await loadRuntime();
+	const { models, model, thinkingLevel } = await buildModelsAndModel(cfg);
+	const zeroUsage: Usage = {
+		input: 0,
+		output: 0,
+		cacheRead: 0,
+		cacheWrite: 0,
+		totalTokens: 0,
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	const assistantMessage: AssistantMessage = {
+		role: "assistant",
+		content: pendingTools.map((t) => ({
+			type: "toolCall" as const,
+			id: String(t.toolCallId),
+			name: String(t.name),
+			arguments: (t.args ?? {}) as ToolCall["arguments"],
+		})),
+		api: "openai-completions",
+		provider: "piper",
+		model: cfg.modelId,
+		usage: zeroUsage,
+		stopReason: "toolUse",
+		timestamp: Date.now(),
+	};
+	const messages: Message[] = [
+		...toPiMessages(entries.filter((e) => e.sessionId !== sessionId), cfg),
+		{ role: "user", content: [{ type: "text", text: String(userEntry.text ?? "") }], timestamp: Date.now() },
+		assistantMessage,
+	];
+	const tools = [...webToolsForBot(bot), ...githubCommentToolsForBot(bot, sessionId)];
+	const agent = new agentCore.Agent({
+		initialState: {
+			systemPrompt: bot.systemPrompt,
+			model,
+			messages,
+			tools,
+			thinkingLevel,
+		},
+		streamFn: (m, context, options) => models.streamSimple(m, context, options),
+		...gateHooks(botId, sessionId),
+	});
+	const state = { finalText: "" };
+	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state);
+	liveAgents.set(sessionId, agent);
+	try {
+		await agent.resolveToolCall(toolCallId, { decision });
+	} catch (err) {
+		throw Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" });
+	} finally {
+		unsubscribe();
+		if (liveAgents.get(sessionId) === agent) liveAgents.delete(sessionId);
+	}
+	if (agent.state?.errorMessage) {
+		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
+	}
+	return { text: state.finalText };
+}
 // 设置页「测试连接」：用候选配置（overrides 覆盖已生效配置的对应字段）打一次最小请求。
 // 只回 {ok} 或 {ok:false, error}，不抛错、不把 Key 写进返回值。15 秒超时，坏端点不会挂死进程。
 export async function testModelConfig(overrides: { apiKey?: string; baseUrl?: string; modelId?: string } = {}): Promise<{ ok: boolean; error?: string }> {

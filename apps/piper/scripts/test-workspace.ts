@@ -369,11 +369,12 @@ try {
 
 	// ---------- 策略表其余锁定项 ----------
 	check(
-		"策略默认：web_fetch/web_search allow、github.read allow、github_comment ask、未知工具 deny",
+		"策略默认：web_fetch/web_search allow、github.read allow、github_comment 未绑定/无参 deny（绑定仓 ask 的口径见 test:tool-gateway）、未知工具 deny",
 		PolicyEngine.decide({ botId: "bot-a", toolName: "web_fetch", args: { url: "https://example.com" } }) === "allow" &&
 			PolicyEngine.decide({ botId: "bot-a", toolName: "web_search", args: { query: "x" } }) === "allow" &&
 			PolicyEngine.decide({ botId: "bot-a", toolName: "github.read", args: {} }) === "allow" &&
-			PolicyEngine.decide({ botId: "bot-a", toolName: "github_comment", args: {} }) === "ask" &&
+			PolicyEngine.decide({ botId: "bot-a", toolName: "github_comment", args: {} }) === "deny" &&
+			PolicyEngine.decide({ botId: "bot-a", toolName: "github_comment", args: { repo: "NorthAdb/LinkForge", kind: "pr_comment", number: 1, body: "x" } }) === "deny" &&
 			PolicyEngine.decide({ botId: "bot-a", toolName: "some_unknown_writer", args: {} }) === "deny",
 	);
 } finally {
