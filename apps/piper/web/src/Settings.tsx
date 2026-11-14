@@ -1,8 +1,9 @@
-// 设置视图（L0-1 骨架起，四组均已真接入）：独立整页——模型 / 基础资料 / 连接器 / 通知。
+// 设置视图（L0-1 骨架起，各组均已真接入）：独立整页——模型 / 基础资料 / 连接器 / 通知 / 外观。
 // 左栏「通知」入口以 initialTab="notifications" 直达通知组。
-import { ArrowLeftIcon, BellIcon, BlocksIcon, SlidersHorizontalIcon, UserRoundIcon } from "lucide-react";
+import { ArrowLeftIcon, BellIcon, BlocksIcon, SlidersHorizontalIcon, UserRoundIcon, PaintbrushIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { AppearanceSettings } from "./SettingsAppearance";
 import { ConnectorsSettings } from "./SettingsConnectors";
 import { ModelSettingsForm } from "./SettingsModel";
 import { NotificationsSettings } from "./SettingsNotifications";
@@ -51,6 +52,10 @@ export function Settings({
 							<BellIcon />
 							通知
 						</TabsTrigger>
+						<TabsTrigger value="appearance">
+							<PaintbrushIcon />
+							外观
+						</TabsTrigger>
 					</TabsList>
 
 					<TabsContent value="model">
@@ -64,6 +69,9 @@ export function Settings({
 					</TabsContent>
 					<TabsContent value="notifications">
 						<NotificationsSettings onUnauthorized={onUnauthorized} onOpenFinding={onOpenFinding} />
+					</TabsContent>
+					<TabsContent value="appearance">
+						<AppearanceSettings />
 					</TabsContent>
 				</Tabs>
 			</div>
