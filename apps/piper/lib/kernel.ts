@@ -305,8 +305,30 @@ function clearLiveRun(botId: string, agent: Agent): void {
 export function abortLiveRun(botId: string): { aborted: boolean; sessionId?: string } {
 	const entry = liveRunsByBot.get(botId);
 	if (!entry) return { aborted: false };
+	userAbortedSessions.add(entry.sessionId);
 	entry.agent.abort();
 	return { aborted: true, sessionId: entry.sessionId };
+}
+
+// 用户主动中止的会话标记（P2-9 试用后修复）：abort 时底层流会以
+// 「Request was aborted」之类的厂商/运行时错误收尾，若不区分就会被
+// 错误出口一律包成 MODEL_ERROR——把用户亲手停的一轮记成模型故障，
+// 且已生成的半截文本随错误一起丢掉。abortLiveRun 在真正 abort 前
+// 先给该 sessionId 打标；streamChat / resumeToolApproval 的错误出口
+// 命中标记时改抛 code RUN_ABORTED 并带上半截文本（partialText），由
+// 路由层落一条 interrupted 助手条目 + 中性系统条目，不记失败。
+const userAbortedSessions = new Set<string>();
+
+// 命中用户中止标记时消费它并构造 RUN_ABORTED 错误；未命中回 null。
+// partialText 口径与正常收尾的 finalText 一致：当前正在流出的段以
+// 增量累计（liveText）为准，还没有新段时用上一段定稿（finalText）。
+function consumeUserAbort(sessionId: string | undefined, state: { finalText: string; liveText: string }): (Error & { code: string; partialText: string }) | null {
+	if (!sessionId || !userAbortedSessions.has(sessionId)) return null;
+	userAbortedSessions.delete(sessionId);
+	return Object.assign(new Error("本轮已由用户中止"), {
+		code: "RUN_ABORTED",
+		partialText: state.liveText || state.finalText,
+	});
 }
 
 // 该 bot 此刻是否有活动 run（含停在待批等待、已批准在途执行）：对话
@@ -421,13 +443,18 @@ function subscribeChatEvents(
 	agent: Agent,
 	onEvent: (event: ChatEvent) => void,
 	thinkingLevel: string,
-	state: { finalText: string },
+	state: { finalText: string; liveText: string },
 	sessionId?: string,
 ): () => void {
 	return agent.subscribe((event) => {
 		if (event.type === "message_update") {
 			const ame = event.assistantMessageEvent;
-			if (ame?.type === "text_delta" && ame.delta) onEvent({ type: "delta", text: ame.delta });
+			if (ame?.type === "text_delta" && ame.delta) {
+				// liveText 累计当前段的增量：message_end 前被中止时，半截
+				// 文本只活在增量里，靠它落 interrupted 条目（见 consumeUserAbort）。
+				state.liveText += ame.delta;
+				onEvent({ type: "delta", text: ame.delta });
+			}
 			if (ame?.type === "thinking_delta" && ame.delta) onEvent({ type: "thinking", text: ame.delta, level: thinkingLevel });
 			if (ame?.type === "toolcall_end" && ame.toolCall) {
 				onEvent({ type: "tool", phase: "call", name: ame.toolCall.name, toolCallId: ame.toolCall.id, detail: ame.toolCall.arguments ?? null });
@@ -457,6 +484,7 @@ function subscribeChatEvents(
 				);
 		} else if (event.type === "message_end" && event.message?.role === "assistant") {
 			state.finalText = textOf(event.message) || state.finalText;
+			state.liveText = "";
 		}
 	});
 }
@@ -560,14 +588,17 @@ export async function streamChat({
 			: {}),
 		...(budget ? { finishTurn: budgetFinishTurn(budget) } : {}),
 	});
-	const state = { finalText: "" };
+	const state = { finalText: "", liveText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state, sessionId);
 	if (sessionId) liveAgents.set(sessionId, agent);
 	if (botId && sessionId) registerLiveRun(botId, sessionId, agent);
 	try {
 		await agent.prompt(message);
 	} catch (err) {
-		throw Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" });
+		throw (
+			consumeUserAbort(sessionId, state) ??
+			Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" })
+		);
 	} finally {
 		unsubscribe();
 		// 装配记录落盘（P2-6）：挂在会话流水上（kind: context_assembly），
@@ -594,8 +625,9 @@ export async function streamChat({
 		if (botId) clearLiveRun(botId, agent);
 	}
 	if (agent.state?.errorMessage) {
-		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
+		throw consumeUserAbort(sessionId, state) ?? Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
 	}
+	if (sessionId) userAbortedSessions.delete(sessionId);
 	return { text: state.finalText };
 }
 
@@ -715,7 +747,7 @@ export async function resumeToolApproval({
 		...gateHooks(botId, sessionId),
 		finishTurn: budgetFinishTurn(budget),
 	});
-	const state = { finalText: "" };
+	const state = { finalText: "", liveText: "" };
 	const unsubscribe = subscribeChatEvents(agent, onEvent, thinkingLevel, state, sessionId);
 	liveAgents.set(sessionId, agent);
 	registerLiveRun(botId, sessionId, agent);
@@ -725,15 +757,19 @@ export async function resumeToolApproval({
 			...(decision === "allow" && approvalRecord?.argsSnapshot != null ? { arguments: approvalRecord.argsSnapshot } : {}),
 		});
 	} catch (err) {
-		throw Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" });
+		throw (
+			consumeUserAbort(sessionId, state) ??
+			Object.assign(new Error(modelErrorMessage((err as { message?: unknown } | null | undefined)?.message ?? err)), { code: "MODEL_ERROR" })
+		);
 	} finally {
 		unsubscribe();
 		if (liveAgents.get(sessionId) === agent) liveAgents.delete(sessionId);
 		clearLiveRun(botId, agent);
 	}
 	if (agent.state?.errorMessage) {
-		throw Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
+		throw consumeUserAbort(sessionId, state) ?? Object.assign(new Error(modelErrorMessage(agent.state.errorMessage)), { code: "MODEL_ERROR" });
 	}
+	userAbortedSessions.delete(sessionId);
 	return { text: state.finalText };
 }
 // 设置页「测试连接」：用候选配置（overrides 覆盖已生效配置的对应字段）打一次最小请求。

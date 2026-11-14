@@ -159,6 +159,14 @@ const SEED_BOTS: Bot[] = [
 	},
 ];
 
+// 预置 bot 按 id 查（P2-9 试用后修复）：工具页签据此算「预置声明缺口」
+// ——旧版本种子建的预置 bot 不会随升级自动获得后来新增的工具声明
+//（如仓库管家的 github_comment），缺口只报给界面、由用户一键补齐，
+// 本函数只读种子、不动用户数据。
+export function presetBotById(id: string): Bot | null {
+	return SEED_BOTS.find((b) => b.id === id) ?? null;
+}
+
 const SEED_ROUTINES: Routine[] = [
 	{
 		id: "morning-scan",

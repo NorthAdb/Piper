@@ -75,9 +75,19 @@ export async function listMessages(botId: string): Promise<HistoryEntry[]> {
 	return (await api<{ messages: HistoryEntry[] }>(`/api/bots/${botId}/messages`)).messages;
 }
 
-// 工具注册表（P2-5）：该 bot 的工具清单全文，供桌面「工具」页签核对
-export async function listBotTools(botId: string): Promise<ToolRegistryItem[]> {
-	return (await api<{ tools: ToolRegistryItem[] }>(`/api/bots/${botId}/tools`)).tools;
+// 工具注册表（P2-5）：该 bot 的工具清单全文，供桌面「工具」页签核对；
+// presetGaps 是预置 bot 缺失的种子工具声明（P2-9 试用后修复）。
+export async function listBotTools(botId: string): Promise<{ tools: ToolRegistryItem[]; presetGaps: string[] }> {
+	return api<{ tools: ToolRegistryItem[]; presetGaps: string[] }>(`/api/bots/${botId}/tools`);
+}
+
+// 预置声明补齐（P2-9 试用后修复）：只加不删地把缺失的种子声明补回
+// 该 bot 的工具集，回补齐后的注册表全文与剩余缺口。
+export async function backfillPresetTools(botId: string): Promise<{ added: string[]; tools: ToolRegistryItem[]; presetGaps: string[] }> {
+	return api<{ added: string[]; tools: ToolRegistryItem[]; presetGaps: string[] }>(`/api/bots/${botId}/preset-tools/backfill`, {
+		method: "POST",
+		body: "{}",
+	});
 }
 
 // 轨迹（PR-E）：当前 bot 会话流水的按轮归一化视图，形状见 model.ts 的 TraceData。

@@ -33,6 +33,7 @@ type Tab = "routines" | "artifacts" | "memory" | "tools";
 export type DesktopProps = {
 	bot: Bot | null;
 	onUnauthorized: () => void;
+	onBotUpdated?: () => void;
 };
 
 // 分段控件：覆写 shadcn Tabs 的默认激活态（ bg-background + shadow ）为基线口径——
@@ -72,7 +73,7 @@ function artifactIcon(kind: string): ComponentType<{ className?: string }> {
 	}
 }
 
-export function Desktop({ bot, onUnauthorized }: DesktopProps) {
+export function Desktop({ bot, onUnauthorized, onBotUpdated }: DesktopProps) {
 	const [tab, setTab] = useState<Tab>("routines");
 	const [routines, setRoutines] = useState<Routine[]>([]);
 	const [artifacts, setArtifacts] = useState<ArtifactMeta[]>([]);
@@ -279,7 +280,7 @@ export function Desktop({ bot, onUnauthorized }: DesktopProps) {
 					</TabsContent>
 
 					<TabsContent value="tools" className="mt-0">
-						<ToolsPanel botId={bot?.id ?? null} onUnauthorized={onUnauthorized} />
+						<ToolsPanel botId={bot?.id ?? null} onUnauthorized={onUnauthorized} onBotUpdated={onBotUpdated} />
 					</TabsContent>
 
 					<TabsContent value="memory" className="mt-0 flex flex-col gap-5">

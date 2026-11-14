@@ -37,11 +37,23 @@ export const PlainText: TextMessagePartComponent = ({ text }) => <span className
 // phase 非 end 映射 input-available（Running），end 映射 output-available
 //（Completed），end 且 result.isError 为真映射 output-error（Error）。
 // 待批（P2-4）：phase "pending" 映射 AI Elements 的 approval-requested
-//（状态文案「待批准」），只展示参数、不得显示成运行中或已成功——批准 /
-// 驳回在待批收件箱里做，批准后会话重拉，卡片随流水终态变完成或已拒绝。
+//（状态文案「待批准」），只展示参数、不得显示成运行中或已成功。
+// P2-9 试用后修复：卡内可直接批准 / 驳回（动作经 ToolApprovalActionsContext
+// 落到同一条 ToolApproval 记录与现有接口，收件箱仍是跨 bot 总队列）；
+// 没有可操作记录时（如已在别处处理）只显示说明。批准后会话重拉，
+// 卡片随流水终态变完成或已拒绝。
 // 卡内同时留参数与结果摘要，end 后不必重开卡看执行结果。
 
 export type ToolArgs = { phase: string; args: JsonValue; result: JsonValue };
+
+export type ToolApprovalActions = {
+	actionableToolCallIds: ReadonlySet<string>;
+	busyToolCallIds: ReadonlySet<string>;
+	onApprove: (toolCallId: string) => void;
+	onReject: (toolCallId: string) => void;
+};
+
+export const ToolApprovalActionsContext = createContext<ToolApprovalActions | null>(null);
 
 function resultRecord(result: JsonValue): { [key: string]: JsonValue } | null {
 	return typeof result === "object" && result !== null && !Array.isArray(result) ? result : null;
@@ -66,19 +78,38 @@ function toolSummary(result: JsonValue): string | null {
 	return bits.length ? bits.join(" · ") : null;
 }
 
-export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, args }) => {
+export const ToolCard: ToolCallMessagePartComponent<ToolArgs> = ({ toolName, args, toolCallId }) => {
 	const phase = args?.phase ?? "";
 	const input = args?.args ?? null;
 	const result = args?.result ?? null;
 	const state = toolState(phase, result);
 	const summary = phase === "end" ? toolSummary(result) : null;
+	const approvalActions = useContext(ToolApprovalActionsContext);
+	const actionable = Boolean(toolCallId && approvalActions?.actionableToolCallIds.has(toolCallId));
+	const busy = Boolean(toolCallId && approvalActions?.busyToolCallIds.has(toolCallId));
 	return (
 		<Tool className="mb-0 bg-card">
 			<ToolHeader type={`tool-${toolName}` as `tool-${string}`} state={state} title={toolName} />
 			<ToolContent>
 				{input !== null ? <ToolInput input={input} /> : null}
 				{phase === "pending" ? (
-					<p className="text-sm text-muted-foreground">待批准：这项写操作还没有执行。请到待批收件箱批准或驳回。</p>
+					<div className="flex flex-col gap-2">
+						<p className="text-sm text-muted-foreground">
+							{actionable ? "待批准：这项写操作还没有执行，可直接在此批准或驳回。" : "待批准：这项写操作还没有执行。请到待批收件箱批准或驳回。"}
+						</p>
+						{actionable && approvalActions ? (
+							<div className="flex gap-2">
+								<Button type="button" size="sm" disabled={busy} onClick={() => approvalActions.onApprove(toolCallId)}>
+									<CheckIcon />
+									{busy ? "处理中…" : "批准并执行"}
+								</Button>
+								<Button type="button" size="sm" variant="ghost" disabled={busy} onClick={() => approvalActions.onReject(toolCallId)}>
+									<XIcon />
+									驳回
+								</Button>
+							</div>
+						) : null}
+					</div>
 				) : null}
 				{phase === "end" ? (
 					<>

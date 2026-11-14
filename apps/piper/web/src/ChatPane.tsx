@@ -16,14 +16,13 @@ import {
 import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
 import { ArrowUpIcon, Loader2Icon, MessageSquareIcon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
-import type { FormEvent } from "react";
-import { abortChat, confirmDraft, getRunState, listApprovals, listMessages, streamChat, UnauthorizedError } from "./api";
+import { abortChat, approveToolApproval, confirmDraft, getRunState, listApprovals, listMessages, rejectToolApproval, streamChat, UnauthorizedError } from "./api";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import type { Bot, ChatMessage, ChatPart } from "./model";
+import type { Bot, ChatMessage, ChatPart, ToolApprovalItem } from "./model";
 import { historyToMessages, nextId } from "./model";
-import type { DraftActions } from "./parts";
-import { DraftActionsContext, DraftCard, ErrorCard, MarkdownText, PlainText, ReasoningCard, SystemCard, ToolCard } from "./parts";
+import type { DraftActions, ToolApprovalActions } from "./parts";
+import { DraftActionsContext, DraftCard, ErrorCard, MarkdownText, PlainText, ReasoningCard, SystemCard, ToolApprovalActionsContext, ToolCard } from "./parts";
 
 type LikePart = Exclude<ThreadMessageLike["content"], string>[number];
 
@@ -142,6 +141,52 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 	const hasPendingTool = pendingToolPart !== undefined;
 	const [watchRun, setWatchRun] = useState(false);
 	const [pendingRecordStatus, setPendingRecordStatus] = useState<string | null>(null);
+	// 待批卡内批准（P2-9 试用后修复）：按 toolCallId 索引的待批记录与
+	// 可操作集合，供 ToolCard 经 context 渲染批准 / 驳回按钮；数据与
+	// 收件箱同源（listApprovals），轮询与动作后刷新。
+	const approvalByCallRef = useRef(new Map<string, ToolApprovalItem>());
+	const pendingToolCallIdRef = useRef<string | null>(null);
+	pendingToolCallIdRef.current = pendingToolPart?.id ?? null;
+	const [actionableIds, setActionableIds] = useState<ReadonlySet<string>>(new Set());
+	const [busyApprovalIds, setBusyApprovalIds] = useState<ReadonlySet<string>>(new Set());
+	const refreshApprovals = () => {
+		listApprovals()
+			.then(({ approvals, closed }) => {
+				const map = new Map<string, ToolApprovalItem>();
+				const pending = new Set<string>();
+				for (const a of [...approvals, ...closed]) {
+					if (a.kind !== "tool_call" || !a.toolCallId) continue;
+					map.set(a.toolCallId, a);
+					if (a.status === "pending") pending.add(a.toolCallId);
+				}
+				approvalByCallRef.current = map;
+				setActionableIds(pending);
+				const cur = pendingToolCallIdRef.current;
+				setPendingRecordStatus(cur ? (map.get(cur)?.status ?? null) : null);
+			})
+			.catch(() => {});
+	};
+	const actOnApproval = (toolCallId: string, act: (id: string) => Promise<ToolApprovalItem>) => {
+		const rec = approvalByCallRef.current.get(toolCallId);
+		if (!rec) return;
+		setBusyApprovalIds((prev) => new Set(prev).add(toolCallId));
+		act(rec.id)
+			.catch(() => {})
+			.finally(() => {
+				setBusyApprovalIds((prev) => {
+					const next = new Set(prev);
+					next.delete(toolCallId);
+					return next;
+				});
+				refreshApprovals();
+			});
+	};
+	const toolApprovalActions: ToolApprovalActions = {
+		actionableToolCallIds: actionableIds,
+		busyToolCallIds: busyApprovalIds,
+		onApprove: (toolCallId) => actOnApproval(toolCallId, approveToolApproval),
+		onReject: (toolCallId) => actOnApproval(toolCallId, rejectToolApproval),
+	};
 	useEffect(() => {
 		if (hasPendingTool) setWatchRun(true);
 	}, [hasPendingTool]);
@@ -184,15 +229,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 					}
 					serverRunActiveRef.current = true;
 					setServerRunActive(true);
-					if (pendingToolPart) {
-						listApprovals()
-							.then(({ approvals, closed }) => {
-								if (cancelled) return;
-								const rec = [...approvals, ...closed].find((a) => a.kind === "tool_call" && a.toolCallId === pendingToolPart.id);
-								setPendingRecordStatus(rec ? rec.status : null);
-							})
-							.catch(() => {});
-					}
+					if (pendingToolPart) refreshApprovals();
 				})
 				.catch((e: unknown) => {
 					if (!cancelled && e instanceof UnauthorizedError) onUnauthorized();
@@ -346,6 +383,12 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 					case "error":
 						patchParts(asstId, (parts) => [...parts, { type: "error", code: e.data.code, message: e.data.message }]);
 						break;
+					case "aborted":
+						// 用户主动中止（P2-9 试用后修复）：不是错误——半截文本
+						// 已在 parts 里，只补一条中性系统提示，与落盘的
+						// run_aborted 条目同文案。
+						patchParts(asstId, (parts) => [...parts, { type: "system", kind: "run_aborted", text: "本轮已由用户中止" }]);
+						break;
 					default:
 						break;
 				}
@@ -438,6 +481,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 	return (
 		<AssistantRuntimeProvider runtime={runtime}>
 			<DraftActionsContext.Provider value={draftActions}>
+				<ToolApprovalActionsContext.Provider value={toolApprovalActions}>
 				<ThreadPrimitive.Root className="flex h-full flex-col">
 					<ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth px-0 pt-6">
 						<ThreadPrimitive.Empty>
@@ -467,17 +511,21 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 									{pendingToolPart
 										? pendingRecordStatus === "approved"
 											? `已批准，正在执行：${pendingToolPart.name}…`
-											: `等待批准：${pendingToolPart.name}（请到待批收件箱处理，或在下方中止本轮）`
+											: `等待批准：${pendingToolPart.name}（可在工具卡上批准 / 驳回，或到待批收件箱处理）`
 										: "正在后台运行…（可在下方中止本轮）"}
 								</span>
 							</div>
 						</div>
 					) : null}
 					<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
-						<ComposerPrimitive.Root
-							className="flex w-full flex-col rounded-2xl border bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring/60 focus-within:ring-2 focus-within:ring-ring/30"
-							onSubmit={(e: FormEvent) => e.preventDefault()}
-						>
+						{/* 注意：ComposerPrimitive.Root 不得传 onSubmit——assistant-ui
+							用 composeEventHandlers 组合提交处理，外层 handler 一旦
+							preventDefault，其内部 send 就被跳过；Enter 发送正是走
+							form requestSubmit 这条路（发送按钮走 click 直达不受
+							影响），曾因此出现「Enter 无效、只能点发送」（P2-9
+							试用后修复）。其内部 handler 自己会 preventDefault，
+							页面不会重载。 */}
+						<ComposerPrimitive.Root className="flex w-full flex-col rounded-2xl border bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring/60 focus-within:ring-2 focus-within:ring-ring/30">
 							<ComposerPrimitive.Input
 								className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground"
 								placeholder="输入消息；对主 bot 说「创建一个 XX bot，负责……」可生成草案卡"
@@ -504,6 +552,7 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 						</ComposerPrimitive.Root>
 					</div>
 				</ThreadPrimitive.Root>
+				</ToolApprovalActionsContext.Provider>
 			</DraftActionsContext.Provider>
 		</AssistantRuntimeProvider>
 	);

@@ -4,7 +4,8 @@
 // 如实标「未提供给模型」，不假装已挂上。数据与服务端注册表同源，界面只呈现。
 import { ChevronDownIcon, WrenchIcon } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
-import { listBotTools, UnauthorizedError } from "./api";
+import { backfillPresetTools, listBotTools, UnauthorizedError } from "./api";
+import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { ToolRegistryItem } from "./model";
 
@@ -101,22 +102,54 @@ function ToolCard({ item }: { item: ToolRegistryItem }) {
 	);
 }
 
-export function ToolsPanel({ botId, onUnauthorized }: { botId: string | null; onUnauthorized: () => void }) {
+export function ToolsPanel({
+	botId,
+	onUnauthorized,
+	onBotUpdated,
+}: {
+	botId: string | null;
+	onUnauthorized: () => void;
+	onBotUpdated?: () => void;
+}) {
 	const [items, setItems] = useState<ToolRegistryItem[]>([]);
+	const [presetGaps, setPresetGaps] = useState<string[]>([]);
+	const [backfilling, setBackfilling] = useState(false);
 	const [err, setErr] = useState("");
 
 	const load = useCallback(() => {
 		if (!botId) {
 			setItems([]);
+			setPresetGaps([]);
 			return;
 		}
 		listBotTools(botId)
-			.then(setItems)
+			.then(({ tools, presetGaps: gaps }) => {
+				setItems(tools);
+				setPresetGaps(gaps);
+			})
 			.catch((e: unknown) => {
 				if (e instanceof UnauthorizedError) onUnauthorized();
 				else setErr(e instanceof Error ? e.message : String(e));
 			});
 	}, [botId, onUnauthorized]);
+
+	// 预置声明补齐（P2-9 试用后修复）：只加不删，补完刷新本页签并通知
+	// 外层重拉 bot 列表（编辑表单里的工具集随之更新）。
+	const onBackfill = () => {
+		if (!botId || backfilling) return;
+		setBackfilling(true);
+		backfillPresetTools(botId)
+			.then(({ tools, presetGaps: gaps }) => {
+				setItems(tools);
+				setPresetGaps(gaps);
+				onBotUpdated?.();
+			})
+			.catch((e: unknown) => {
+				if (e instanceof UnauthorizedError) onUnauthorized();
+				else setErr(e instanceof Error ? e.message : String(e));
+			})
+			.finally(() => setBackfilling(false));
+	};
 
 	useEffect(() => {
 		setErr("");
@@ -143,6 +176,18 @@ export function ToolsPanel({ botId, onUnauthorized }: { botId: string | null; on
 	}
 	return (
 		<div className="flex flex-col gap-3">
+			{presetGaps.length > 0 ? (
+				<div className="rounded-lg border border-amber-400/40 bg-amber-400/10 px-4 py-3.5">
+					<p className="text-sm font-medium">这个预置 bot 缺少后续版本新增的工具声明</p>
+					<p className="pt-1 text-[13px] leading-relaxed text-muted-foreground">
+						缺失：<span className="font-mono">{presetGaps.join(", ")}</span>
+						。它是旧版本创建的，升级不会自动改已有 bot 的工具集。补齐只会新增这些声明，不动其他设置。
+					</p>
+					<Button type="button" size="sm" className="mt-2.5" disabled={backfilling} onClick={onBackfill}>
+						{backfilling ? "补齐中…" : "补齐声明"}
+					</Button>
+				</div>
+			) : null}
 			{items.map((item) => (
 				<ToolCard key={item.name} item={item} />
 			))}

@@ -110,7 +110,7 @@ readBotMemory,
 import { abortLiveRun, botSelfFacts, getLiveAgent, hasLiveRun, modelConfig, resumeToolApproval, streamChat, testModelConfig, trackBackgroundRun, extractDraftWithModel, extractDraftByRules, looksLikeCreateBotIntent} from "./lib/kernel.ts";
 import { isToolWriteInFlight } from "./lib/gateway.ts";
 import type { ChatEvent} from "./lib/kernel.ts";
-import { toolRegistryForBot } from "./lib/tool-registry.ts";
+import { presetToolGaps, toolRegistryForBot } from "./lib/tool-registry.ts";
 import { findToolApprovalByToolCall, getToolApproval, listToolApprovals, listToolApprovalViews, toToolApprovalView, toolIntentSnapshotOf, updateToolApproval, updateToolApprovalBody } from "./lib/tool-approvals.ts";
 import type { ToolApproval } from "./lib/tool-approvals.ts";
 import type { ArtifactMeta, Routine, SessionEntry} from "./lib/store.ts";
@@ -498,6 +498,17 @@ async function handleChat(req: IncomingMessage, res: ServerResponse): Promise<vo
 	// 落盘照常——批准在原 run 里放行后，本轮的最终态从这里补齐。
 	const finishTurn = (): void => {
 		persistLead();
+		// 用户主动中止（P2-9 试用后修复）：不记 error、不发 error 事件——
+		// 半截助手文本落 interrupted 条目（下一轮历史里看得见，「继续」
+		// 能接着答），另落一条中性系统条目说明本轮是被用户停的。
+		const abortErr = streamError as { code?: string; partialText?: unknown } | null;
+		if (abortErr?.code === "RUN_ABORTED") {
+			const partial = typeof abortErr.partialText === "string" ? abortErr.partialText : "";
+			if (partial.trim()) appendSession(bot.id, { role: "assistant", text: partial, interrupted: true, sessionId });
+			appendSession(bot.id, { role: "system", kind: "run_aborted", text: "本轮已由用户中止", sessionId });
+			emitLive("aborted", {});
+			return;
+		}
 		if (streamError) {
 			// 错误文本进会话 JSONL 与 SSE 前统一脱敏+截断（R7）：内核已在源头处理厂商错误，
 			// 这里是其余错误路径的兜底出口。
@@ -622,7 +633,15 @@ function continuationPersister(botId: string, sessionId: string) {
 			appendSession(botId, { role: "assistant", text, sessionId });
 		},
 		fail(err: unknown): void {
-			const e = err as { message?: unknown; code?: string } | null;
+			const e = err as { message?: unknown; code?: string; partialText?: unknown } | null;
+			// 用户主动中止（同 handleChat 口径）：落 interrupted 半截文本 +
+			// 中性系统条目，不记 error。
+			if (e?.code === "RUN_ABORTED") {
+				const partial = typeof e.partialText === "string" ? e.partialText : "";
+				if (partial.trim()) appendSession(botId, { role: "assistant", text: partial, interrupted: true, sessionId });
+				appendSession(botId, { role: "system", kind: "run_aborted", text: "本轮已由用户中止", sessionId });
+				return;
+			}
 			appendSession(botId, {
 				role: "system",
 				kind: "error",
@@ -966,7 +985,20 @@ const botToolsMatch = path.match(/^\/api\/bots\/([\w-]+)\/tools$/);
 if (botToolsMatch && req.method === "GET") {
 const bot = getBot(botToolsMatch[1]);
 if (!bot) return sendJson(res, 404, { error: "bot 不存在"});
-return sendJson(res, 200, { botId: bot.id, tools: toolRegistryForBot(bot)});
+return sendJson(res, 200, { botId: bot.id, tools: toolRegistryForBot(bot), presetGaps: presetToolGaps(bot) });
+}
+// 预置声明补齐（P2-9 试用后修复）：把预置 bot 缺失的种子工具声明
+// 只加不删地补回 bot.tools（旧版本建的预置 bot 不随升级获得新声明，
+// 如仓库管家缺 github_comment）。仅界面按钮触发，不在启动时静默改
+// 数据；用户自建 bot 无缺口、调用即空操作。回补齐后的注册表与缺口。
+const botPresetBackfillMatch = path.match(/^\/api\/bots\/([\w-]+)\/preset-tools\/backfill$/);
+if (botPresetBackfillMatch && req.method === "POST") {
+const bot = getBot(botPresetBackfillMatch[1]);
+if (!bot) return sendJson(res, 404, { error: "bot 不存在"});
+const gaps = presetToolGaps(bot);
+const updated = gaps.length ? updateBot(bot.id, { tools: [...(bot.tools ?? []), ...gaps] }) : bot;
+const current = updated ?? bot;
+return sendJson(res, 200, { botId: current.id, added: gaps, tools: toolRegistryForBot(current), presetGaps: presetToolGaps(current) });
 }
 // 上下文装配记录（P2-6）：按 sessionId 查该轮的逐级装配记录（存在
 // 会话流水的 context_assembly 条目里，见 lib/context-assembler.ts 与
