@@ -256,7 +256,7 @@ export function App() {
 			</main>
 
 			<aside className="min-h-0 border-l border-sidebar-border bg-sidebar text-sidebar-foreground">
-				<Desktop bot={currentBot} onUnauthorized={onUnauthorized} />
+				<Desktop bot={currentBot} onUnauthorized={onUnauthorized} onBotUpdated={() => void reloadBots()} />
 			</aside>
 
 			{form.open ? (

@@ -326,6 +326,7 @@ export type ChatEvent =
 	| { event: "system"; data: { kind: string; text: string } }
 	| { event: "draft"; data: { draft: BotDraft } }
 	| { event: "error"; data: { code: string; message: string } }
+	| { event: "aborted"; data: Record<string, never> }
 	| { event: "done"; data: { botId: string } };
 
 // 前端消息模型：external-store runtime 自持，convertMessage 转成 assistant-ui 的 ThreadMessageLike
