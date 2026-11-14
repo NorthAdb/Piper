@@ -10,7 +10,9 @@
 // 重启后恢复第二个（第一个已执行的绝不重发）；在途驳回回 409（B10，
 // 记录保持 approved、在途写完成落 executed 恰好一次）；run-state
 // （B11，无 run false / 待批停泊 true / 落定 false / 未登录 401）；
-// 暂时性失败后驳回对照（B12，approved+error 未在途时驳回成功、零写入）。
+// 暂时性失败后驳回对照（B12，approved+error 未在途时驳回成功、零写入）；
+// 中止记账（B13/B14，P2-9 试用后修复：纯文本生成中途中止发 aborted
+// 不发 error、半截文本落 interrupted 条目、下一轮历史含半截文本）。
 // 用法（在 apps/piper 下）：node dist/scripts/test-intervention.js
 import { spawn } from "node:child_process";
 import type { ChildProcess } from "node:child_process";
@@ -160,7 +162,9 @@ await new Promise<void>((r) => ghStub.listen(0, "127.0.0.1", () => r()));
 const GH_BASE = `http://127.0.0.1:${(ghStub.address() as { port: number }).port}`;
 
 // ---- 模型替身：单评论 / 双评论（同一条 assistant 消息两个调用）两套话术 ----
+// B13（P2-9 中止记账）另加慢速长文话术，并留存全部请求体供断言历史回喂。
 let modelCallSeq = 0;
+const modelBodies: any[] = [];
 const MODEL_KEY = "interv-model-key";
 const modelStub: Server = createServer((reqHttp, resHttp) => {
 	if (!reqHttp.url?.startsWith("/v1/chat/completions")) {
@@ -192,6 +196,7 @@ const modelStub: Server = createServer((reqHttp, resHttp) => {
 			resHttp.end(JSON.stringify({ id: "x", object: "chat.completion", created: 1762732800, model, choices: [{ index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }));
 			return;
 		}
+		modelBodies.push(body);
 		const messages: any[] = body.messages ?? [];
 		const last = messages[messages.length - 1] ?? {};
 		if (last.role === "tool") {
@@ -200,6 +205,26 @@ const modelStub: Server = createServer((reqHttp, resHttp) => {
 		}
 		const lastUser = [...messages].reverse().find((mm: any) => mm.role === "user");
 		const userText = typeof lastUser?.content === "string" ? lastUser.content : JSON.stringify(lastUser?.content ?? "");
+		// 慢速长文（B13）：40 段、每段间隔 60ms 的纯文本，供生成中途中止；
+		// 「继续」只回一段短文本（其请求体由测试断言含半截历史）。
+		if (userText.includes("慢速长文") || userText.trim() === "继续") {
+			resHttp.writeHead(200, { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" });
+			const slowChunk = (delta: Record<string, unknown>, finishReason: string | null = null) =>
+				`data: ${JSON.stringify({ id: "chatcmpl-stub", object: "chat.completion.chunk", created: 1762732800, model, choices: [{ index: 0, delta, finish_reason: finishReason }] })}\n\n`;
+			void (async () => {
+				resHttp.write(slowChunk({ role: "assistant" }));
+				const total = userText.includes("慢速长文") ? 40 : 1;
+				for (let i = 1; i <= total; i++) {
+					if (resHttp.destroyed || resHttp.writableEnded) return;
+					resHttp.write(slowChunk({ content: `慢速长文第${i}段。` }));
+					if (i < total) await sleep(60);
+				}
+				if (resHttp.destroyed || resHttp.writableEnded) return;
+				resHttp.write(slowChunk({}, "stop"));
+				resHttp.end("data: [DONE]\n\n");
+			})();
+			return;
+		}
 		modelCallSeq += 1;
 		if (userText.includes("双评论")) {
 			const args1 = JSON.stringify({ repo: "NorthAdb/LinkForge", kind: "pr_comment", number: 1, body: "第一条评论正文" });
@@ -526,6 +551,63 @@ try {
 			ghPosts.length === postsBefore6 &&
 			!readAuditEntries().some((x) => x.toolApprovalId === p6.id && x.result === "executed"),
 		`failed=${JSON.stringify(p6Failed?.error)} reject=${rejectFailed.status} after=${p6After?.status} posts=${ghPosts.length - postsBefore6}`,
+	);
+
+	// ---- 中止记账（P2-9 试用后修复）：生成纯文本中途中止——SSE 发
+	// aborted 不发 error；会话落 interrupted 助手条目（半截文本）+
+	// run_aborted 系统条目，不落 error 条目；下一轮「继续」的模型请求
+	// 里能看到那半截文本（不再失忆重答）。
+	const chatRes13 = await fetch(`${BASE}/api/chat`, {
+		method: "POST",
+		headers: { "Content-Type": "application/json", Cookie: cookie },
+		body: JSON.stringify({ botId: "repo-keeper", message: "请慢速长文输出" }),
+	});
+	const reader13 = chatRes13.body!.getReader();
+	const decoder13 = new TextDecoder();
+	let sse13 = "";
+	while (!sse13.includes("慢速长文第6段")) {
+		const { value, done } = await reader13.read();
+		if (done) break;
+		sse13 += decoder13.decode(value, { stream: true });
+	}
+	const abortRes13 = await req("/api/chats/repo-keeper/abort", { method: "POST", body: JSON.stringify({}) });
+	for (;;) {
+		const { value, done } = await reader13.read();
+		if (done) break;
+		sse13 += decoder13.decode(value, { stream: true });
+	}
+	const events13: { event: string; data: any }[] = [];
+	for (const block of sse13.split("\n\n")) {
+		const ev = /event: (.*)/.exec(block)?.[1];
+		const data = /data: (.*)/s.exec(block)?.[1];
+		if (ev && data) events13.push({ event: ev, data: JSON.parse(data) });
+	}
+	const session13 = events13.find((e) => e.event === "session")?.data?.sessionId as string;
+	const turnEntries13 = await waitFor(() => {
+		const list = readSessionEntries("repo-keeper").filter((e) => e.sessionId === session13);
+		return list.some((e) => e.kind === "run_aborted") ? list : null;
+	});
+	const interrupted13 = turnEntries13.find((e) => e.role === "assistant" && e.interrupted === true);
+	const fullText13 = Array.from({ length: 40 }, (_, i) => `慢速长文第${i + 1}段。`).join("");
+	check(
+		"B13 中止记账：SSE 有 aborted 无 error；半截文本落 interrupted 条目 + run_aborted 条目、无 error 条目",
+		abortRes13.json?.aborted === true &&
+			events13.some((e) => e.event === "aborted") &&
+			!events13.some((e) => e.event === "error") &&
+			typeof interrupted13?.text === "string" &&
+			interrupted13.text.startsWith("慢速长文第1段") &&
+			interrupted13.text.includes("慢速长文第3段") &&
+			interrupted13.text.length < fullText13.length &&
+			!turnEntries13.some((e) => e.kind === "error"),
+		`abort=${JSON.stringify(abortRes13.json)} events=${events13.map((e) => e.event).join(",")} interrupted=${JSON.stringify(interrupted13?.text)?.slice(0, 80)} kinds=${turnEntries13.map((e) => e.kind ?? e.role).join(",")}`,
+	);
+	const bodiesBefore14 = modelBodies.length;
+	await chatEvents("repo-keeper", "继续");
+	const followUpBody = modelBodies.slice(bodiesBefore14).find((b) => JSON.stringify(b.messages ?? []).includes("继续"));
+	check(
+		"B14 中止后继续：下一轮模型请求的历史里含被中止的半截助手文本",
+		Boolean(followUpBody) && JSON.stringify(followUpBody.messages).includes("慢速长文第1段"),
+		`bodies=${modelBodies.length - bodiesBefore14} found=${Boolean(followUpBody)}`,
 	);
 } finally {
 	proc?.kill("SIGKILL");

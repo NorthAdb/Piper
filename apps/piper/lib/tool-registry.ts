@@ -16,6 +16,7 @@ import { webFetch, webSearch } from "./webfetch.ts";
 import { webFetchEnabled, webSearchConfig, webToolBots } from "./settings.ts";
 import { redact } from "./redact.ts";
 import type { Bot } from "./store.ts";
+import { presetBotById } from "./store.ts";
 import { GITHUB_COMMENT_TOOL_NAME, githubCommentToolsForBot } from "./github-comment.ts";
 import {
 	WORKSPACE_EDIT_TOOL_NAME,
@@ -257,6 +258,18 @@ export function toolRegistryForBot(bot: Bot): ToolRegistryItem[] {
 		});
 	}
 	return items;
+}
+
+// 预置声明缺口（P2-9 试用后修复）：bot 是预置 bot（id 与种子同名）时，
+// 种子声明里有、bot.tools 里没有的工具名——旧版本建的预置 bot 不随
+// 升级自动补齐后来新增的声明（如 github_comment 之于仓库管家），用户
+// 在界面上无从知道缺了什么。只对预置 id 计算，用户自建 bot 恒空；
+// 本函数只算不改，补齐由界面按钮触发专用接口（只加不删）。
+export function presetToolGaps(bot: Bot): string[] {
+	const preset = presetBotById(bot.id);
+	if (!preset) return [];
+	const declared = new Set(bot.tools ?? []);
+	return (preset.tools ?? []).filter((t) => !declared.has(t));
 }
 
 // 物化：发给模型的集合只从注册表出——implemented 且 modelExposure 为
