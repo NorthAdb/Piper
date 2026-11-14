@@ -3,9 +3,12 @@
 // 草案/系统/错误卡用 shadcn Card/Badge/Button 与设计系统色调实现。
 import type { DataMessagePartComponent, TextMessagePartComponent, ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { MarkdownTextPrimitive } from "@assistant-ui/react-markdown";
-import { BotIcon, BrainIcon, CheckIcon, ChevronDownIcon, InfoIcon, TriangleAlertIcon, XIcon } from "lucide-react";
-import { createContext, useContext, useEffect, useState } from "react";
+import type { CodeHeaderProps, MarkdownTextPrimitiveProps, SyntaxHighlighterProps } from "@assistant-ui/react-markdown";
+import { BotIcon, BrainIcon, CheckIcon, ChevronDownIcon, CopyIcon, InfoIcon, RotateCcwIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { createContext, lazy, Suspense, useContext, useEffect, useState } from "react";
+import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
+import remarkMath from "remark-math";
 import { Tool, ToolContent, ToolHeader, ToolInput, ToolOutput } from "@/components/ai-elements/tool";
 import type { ToolPart } from "@/components/ai-elements/tool";
 import { Badge } from "@/components/ui/badge";
@@ -14,6 +17,52 @@ import { Card, CardContent, CardFooter, CardHeader, CardTitle } from "@/componen
 import type { BotDraft, JsonValue } from "./model";
 
 // ---- 文本 ----
+
+// 代码块 banner（chat-demo CodeBlock 形态）：左围栏语言名（无语言按 text）、右复制钮。
+// 走 MarkdownTextPrimitive 的 CodeHeader 槽（官方 pre 级覆盖点），渲染为 .aui-md 中
+// pre 的前置兄弟节点，与 pre 拼成一整块（上边框与上圆角的合并见 index.css 相邻选择器）。
+function CodeBlockHeader({ language, code }: CodeHeaderProps) {
+	const [copied, setCopied] = useState(false);
+	useEffect(() => {
+		if (!copied) return;
+		const t = setTimeout(() => setCopied(false), 1500);
+		return () => clearTimeout(t);
+	}, [copied]);
+	return (
+		<div data-code-banner>
+			<span>{language ?? "text"}</span>
+			<button
+				type="button"
+				aria-label="复制代码"
+				title="复制代码"
+				onClick={() => void navigator.clipboard.writeText(code).then(() => setCopied(true)).catch(() => {})}
+			>
+				{copied ? <CheckIcon /> : <CopyIcon />}
+			</button>
+		</div>
+	);
+}
+
+// mermaid 围栏（chat-demo 形态扩展）：回合进行中不给按语言覆盖、保持代码块
+// 原样（banner + pre），回合结束才整块替换为渲染出的图表。按语言覆盖走官方
+// componentsByLanguage 覆盖点（SyntaxHighlighter 渲染在 CodeHeader 之后，替代
+// 默认 pre 本体）。React.lazy 的动态 import 是仓库「无内联 import」规则下唯一
+// 批准的例外：mermaid 只在首个 mermaid 围栏出现时加载。
+const MermaidDiagram = lazy(() => import("./components/MermaidDiagram"));
+
+type MermaidOverrides = NonNullable<MarkdownTextPrimitiveProps["componentsByLanguage"]>;
+
+function MermaidBlock({ code }: SyntaxHighlighterProps) {
+	return (
+		<Suspense fallback={<p className="my-2 text-xs text-muted-foreground" role="status">正在加载图表渲染器…</p>}>
+			<MermaidDiagram code={code} />
+		</Suspense>
+	);
+}
+
+// 两个常量身份稳定：只在回合 running↔结束翻转时切换覆盖表，流式期间不重建
+const MERMAID_OVERRIDES: MermaidOverrides = { mermaid: { SyntaxHighlighter: MermaidBlock } };
+const NO_OVERRIDES: MermaidOverrides = {};
 
 export const MarkdownText: TextMessagePartComponent = ({ text, status }) => {
 	if (!text && status.type === "running") {
@@ -25,7 +74,16 @@ export const MarkdownText: TextMessagePartComponent = ({ text, status }) => {
 			</span>
 		);
 	}
-	return <MarkdownTextPrimitive remarkPlugins={[remarkGfm]} className="aui-md" smooth={false} />;
+	return (
+		<MarkdownTextPrimitive
+			remarkPlugins={[remarkGfm, remarkMath]}
+			rehypePlugins={[rehypeKatex]}
+			components={{ CodeHeader: CodeBlockHeader }}
+			componentsByLanguage={status.type === "running" ? NO_OVERRIDES : MERMAID_OVERRIDES}
+			className="aui-md"
+			smooth={false}
+		/>
+	);
 };
 
 export const PlainText: TextMessagePartComponent = ({ text }) => <span className="whitespace-pre-wrap">{text}</span>;
@@ -196,15 +254,35 @@ export const SystemCard: DataMessagePartComponent<SystemPartData> = ({ data }) =
 
 export type ErrorPartData = { code: string; message: string };
 
-export const ErrorCard: DataMessagePartComponent<ErrorPartData> = ({ data }) => (
-	<div className="flex items-start gap-2.5 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2.5 text-sm">
-		<TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-		<div className="min-w-0">
-			<span className="mr-2 font-mono text-xs font-semibold text-destructive">{data.code}</span>
-			<span className="text-foreground/90">{data.message}</span>
+// 错误卡重试的动作由 ChatPane 注入：重试不重写历史（会话 append-only），以最后
+// 一条 user 消息的文本新开一轮；所有 ErrorCard 都带该按钮，行为正确性由
+// ChatPane 的 onRetryLastUser 保证。
+export type ChatActions = {
+	onRetryLastUser: () => void;
+};
+
+export const ChatActionsContext = createContext<ChatActions | null>(null);
+
+export const ErrorCard: DataMessagePartComponent<ErrorPartData> = ({ data }) => {
+	const actions = useContext(ChatActionsContext);
+	return (
+		<div className="rounded-lg border border-destructive/40 bg-destructive/10 text-sm">
+			<div className="flex items-start gap-2.5 px-3 py-2.5">
+				<TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
+				<div className="min-w-0">
+					<span className="mr-2 font-mono text-xs font-semibold text-destructive">{data.code}</span>
+					<span className="text-foreground/90">{data.message}</span>
+				</div>
+			</div>
+			<div className="flex justify-end px-3 pb-2">
+				<Button type="button" variant="ghost" size="sm" disabled={!actions} onClick={() => actions?.onRetryLastUser()}>
+					<RotateCcwIcon className="size-3.5" />
+					重试
+				</Button>
+			</div>
 		</div>
-	</div>
-);
+	);
+};
 
 // ---- Bot 草案卡（特殊消息卡：确认才落库，对接 draft-confirm 接口） ----
 

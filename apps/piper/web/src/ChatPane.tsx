@@ -4,25 +4,41 @@
 // 视觉按 assistant-ui 官方 registry thread 的实现方式：消息列居中定宽、用户气泡、
 // 助手整幅无气泡、Composer 为悬浮圆角卡片（输入区 + 底部工具行）。
 // 对话区收尾（feat/ui-chat-polish）：轮次节奏为轮内紧、轮间松（用户 pt-4 /
-// 助手 pb-4），消息列与 Composer 列同宽同内边距对齐（Viewport 不再另加 px），
-// 空状态与右栏同一构图（弱化描边圆 + lucide 图标 + 一句文案）。
+// 助手 pb-4），消息列与 Composer 列同宽同内边距对齐（Viewport 不再另加 px）。
+// 空状态为垂直居中构图（问候标题 + 建议 prompt chips）；消息 hover 时下方浮现
+// 复制钮（复制/反馈交给 ActionBarPrimitive.Copy），错误卡的重试经
+// ChatActionsContext 注入 onRetryLastUser，也走 sendMessage 追加一轮。
 import {
+	ActionBarPrimitive,
 	AssistantRuntimeProvider,
 	ComposerPrimitive,
 	MessagePrimitive,
 	ThreadPrimitive,
+	useAuiState,
 	useExternalStoreRuntime,
 } from "@assistant-ui/react";
 import type { AppendMessage, ThreadMessageLike } from "@assistant-ui/react";
-import { ArrowUpIcon, Loader2Icon, MessageSquareIcon, SquareIcon } from "lucide-react";
+import { ArrowUpIcon, CheckIcon, CopyIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { abortChat, approveToolApproval, confirmDraft, getRunState, listApprovals, listMessages, rejectToolApproval, streamChat, UnauthorizedError } from "./api";
 import { buttonVariants } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import type { Bot, ChatMessage, ChatPart, ToolApprovalItem } from "./model";
 import { historyToMessages, nextId } from "./model";
-import type { DraftActions, ToolApprovalActions } from "./parts";
-import { DraftActionsContext, DraftCard, ErrorCard, MarkdownText, PlainText, ReasoningCard, SystemCard, ToolApprovalActionsContext, ToolCard } from "./parts";
+import type { ChatActions, DraftActions, ToolApprovalActions } from "./parts";
+import {
+	ChatActionsContext,
+	DraftActionsContext,
+	DraftCard,
+	ErrorCard,
+	MarkdownText,
+	PlainText,
+	ReasoningCard,
+	SystemCard,
+	ToolApprovalActionsContext,
+	ToolCard,
+} from "./parts";
+import { ThinkingLevelChip } from "./ThinkingLevelChip";
 
 type LikePart = Exclude<ThreadMessageLike["content"], string>[number];
 
@@ -73,19 +89,50 @@ function TypingDots() {
 	);
 }
 
+// 消息 hover 操作行的复制钮（放在消息 Root 内才能读到该消息的 scope）：
+// 复制文本与「已复制」反馈由 ActionBarPrimitive.Copy 托管（默认
+// navigator.clipboard，isCopied 短暂为真），这里只管图标切换与样式。
+function CopyMessageButton() {
+	const copied = useAuiState((s) => s.message.isCopied);
+	return (
+		<ActionBarPrimitive.Copy
+			aria-label="复制"
+			className={cn(buttonVariants({ variant: "ghost", size: "icon-sm" }), "size-7 text-muted-foreground hover:text-foreground")}
+		>
+			{copied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
+		</ActionBarPrimitive.Copy>
+	);
+}
+
+// hover 操作行：默认 opacity-0 且 pointer-events-none（不占布局、触屏不挡正文
+// 选择），group-hover / group-focus-within 时浮现并恢复可点，键盘 Tab 聚焦即可达。
+function MessageActions({ className }: { className: string }) {
+	return (
+		<div
+			className={cn(
+				"pointer-events-none absolute flex h-7 translate-y-2 opacity-0 transition-opacity duration-150 group-focus-within:pointer-events-auto group-focus-within:opacity-100 group-hover:pointer-events-auto group-hover:opacity-100",
+				className,
+			)}
+		>
+			<CopyMessageButton />
+		</div>
+	);
+}
+
 function UserMessage() {
 	return (
-		<MessagePrimitive.Root className="animate-in fade-in slide-in-from-bottom-1 mx-auto flex w-full max-w-3xl justify-end px-2 pt-4 pb-1.5 duration-150">
+		<MessagePrimitive.Root className="group relative animate-in fade-in slide-in-from-bottom-1 mx-auto flex w-full max-w-3xl justify-end px-2 pt-4 pb-1.5 duration-150">
 			<div className="max-w-[85%] rounded-2xl bg-secondary px-4 py-2.5 text-sm leading-relaxed break-words text-secondary-foreground">
 				<MessagePrimitive.Parts components={{ Text: PlainText }} />
 			</div>
+			<MessageActions className="top-1/2 right-full mr-1 -translate-y-1/2" />
 		</MessagePrimitive.Root>
 	);
 }
 
 function AssistantMessage() {
 	return (
-		<MessagePrimitive.Root className="animate-in fade-in mx-auto w-full max-w-3xl px-2 pt-1.5 pb-4 duration-150">
+		<MessagePrimitive.Root className="group relative animate-in fade-in mx-auto w-full max-w-3xl px-2 pt-1.5 pb-4 duration-150">
 			<div className="flex flex-col gap-3 leading-relaxed break-words">
 				<MessagePrimitive.Parts
 					components={{
@@ -96,9 +143,14 @@ function AssistantMessage() {
 					}}
 				/>
 			</div>
+			<MessageActions className="left-2" />
 		</MessagePrimitive.Root>
 	);
 }
+
+// 空状态建议 prompt（构图密度参考 chat-demo Welcome）：点击即按 sendMessage
+// 开一轮；建 bot 一句与 composer placeholder 的引导呼应。
+const SUGGESTIONS = ["介绍一下你自己", "创建一个代码审查 bot，负责审查 PR 的代码质量"];
 
 export type ChatPaneProps = {
 	bot: Bot;
@@ -293,11 +345,8 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [bot.id]);
 
-	const onNew = async (append: AppendMessage) => {
-		const text = append.content
-			.filter((p) => p.type === "text")
-			.map((p) => p.text)
-			.join("");
+	// 追加一轮对话的唯一入口：composer 的 onNew、空状态建议 chips、错误卡重试都汇到这里
+	const sendMessage = async (text: string) => {
 		if (!text.trim()) return;
 		const asstId = nextId("m");
 		setMessages([
@@ -422,6 +471,14 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		}
 	};
 
+	const onNew = (append: AppendMessage) =>
+		sendMessage(
+			append.content
+				.filter((p) => p.type === "text")
+				.map((p) => p.text)
+				.join(""),
+		);
+
 	const draftActions: DraftActions = {
 		onConfirm: async (partId, draft) => {
 			const created = await confirmDraft(draft);
@@ -430,6 +487,22 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		},
 		onDiscard: (partId) => {
 			patchDraftPart(partId, () => ({ type: "system", kind: "draft", text: "已放弃该 Bot 草案卡。" }));
+		},
+	};
+
+	// 错误卡重试：会话 append-only，不重写历史，把最后一条 user 消息的文本作为
+	// 新一轮再发一次；running 时 composer 本就不可发送，重试与之同口径。
+	const chatActions: ChatActions = {
+		onRetryLastUser: () => {
+			if (running) return;
+			const lastUserText = [...messagesRef.current]
+				.reverse()
+				.find((m) => m.role === "user")
+				?.parts.filter((p) => p.type === "text")
+				.map((p) => p.text)
+				.join("");
+			if (!lastUserText?.trim()) return;
+			void sendMessage(lastUserText);
 		},
 	};
 
@@ -482,76 +555,90 @@ export function ChatPane({ bot, onRunningChange, onDraftConfirmed, onUnauthorize
 		<AssistantRuntimeProvider runtime={runtime}>
 			<DraftActionsContext.Provider value={draftActions}>
 				<ToolApprovalActionsContext.Provider value={toolApprovalActions}>
-				<ThreadPrimitive.Root className="flex h-full flex-col">
-					<ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth px-0 pt-6">
-						<ThreadPrimitive.Empty>
-							<div className="mx-auto flex w-full max-w-3xl flex-col items-center gap-3 px-2 py-16 text-center">
-								<span className="flex size-10 items-center justify-center rounded-full border bg-card text-muted-foreground">
-									<MessageSquareIcon className="size-4" />
-								</span>
-								<p className="text-sm text-muted-foreground">暂无消息，和「{bot.name}」打个招呼吧。</p>
+					<ChatActionsContext.Provider value={chatActions}>
+						<ThreadPrimitive.Root className="flex h-full flex-col">
+							<ThreadPrimitive.Viewport className="flex flex-1 flex-col overflow-y-auto scroll-smooth px-0 pt-6">
+								<ThreadPrimitive.Empty>
+									<div className="mx-auto flex w-full max-w-3xl flex-1 flex-col items-center justify-center gap-5 px-2 py-12 text-center">
+										<h2 className="text-2xl font-semibold tracking-tight">你好，我是「{bot.name}」</h2>
+										<div className="flex flex-wrap items-center justify-center gap-2">
+											{SUGGESTIONS.map((text) => (
+												<button
+													key={text}
+													type="button"
+													onClick={() => sendMessage(text)}
+													className="rounded-full border bg-card px-4 py-2 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+												>
+													{text}
+												</button>
+											))}
+										</div>
+									</div>
+								</ThreadPrimitive.Empty>
+								<ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
+							</ThreadPrimitive.Viewport>
+							{running && runStartedAt !== null && statusLabel !== null ? (
+								<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
+									<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
+										<Loader2Icon className="size-3.5 animate-spin" />
+										<span>{statusLabel}</span>
+										<span className="tabular-nums">· 已用 {elapsedSec} 秒</span>
+									</div>
+								</div>
+							) : null}
+							{!running && serverRunActive ? (
+								<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
+									<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
+										<Loader2Icon className="size-3.5 animate-spin" />
+										<span>
+											{pendingToolPart
+												? pendingRecordStatus === "approved"
+													? `已批准，正在执行：${pendingToolPart.name}…`
+													: `等待批准：${pendingToolPart.name}（可在工具卡上批准 / 驳回，或到待批收件箱处理）`
+												: "正在后台运行…（可在下方中止本轮）"}
+										</span>
+									</div>
+								</div>
+							) : null}
+							<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
+								{/* 注意：ComposerPrimitive.Root 不得传 onSubmit——assistant-ui
+									用 composeEventHandlers 组合提交处理，外层 handler 一旦
+									preventDefault，其内部 send 就被跳过；Enter 发送正是走
+									form requestSubmit 这条路（发送按钮走 click 直达不受
+									影响），曾因此出现「Enter 无效、只能点发送」（P2-9
+									试用后修复）。其内部 handler 自己会 preventDefault，
+									页面不会重载。 */}
+								<ComposerPrimitive.Root className="flex w-full flex-col rounded-2xl border bg-card shadow-md transition-[border-color,box-shadow] duration-150 focus-within:border-ring/60 focus-within:shadow-lg focus-within:ring-2 focus-within:ring-ring/30">
+									<ComposerPrimitive.Input
+										className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground"
+										placeholder="输入消息；对主 bot 说「创建一个 XX bot，负责……」可生成草案卡"
+										submitOnEnter
+									/>
+									<div className="flex items-center justify-between gap-2 px-3 pb-2.5">
+										{/* 左簇：思考挡位 chip 在前，运行提示 / 中止钮随后（chip 常驻，提示窄屏隐藏） */}
+										<div className="flex min-w-0 items-center gap-2">
+											<ThinkingLevelChip onUnauthorized={onUnauthorized} />
+											{running || serverRunActive ? (
+												<button
+													type="button"
+													onClick={onAbort}
+													className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+												>
+													<SquareIcon className="size-3.5" />
+													中止本轮
+												</button>
+											) : (
+												<span className="hidden text-xs text-muted-foreground sm:block">Enter 发送 · Shift+Enter 换行</span>
+											)}
+										</div>
+										<ComposerPrimitive.Send aria-label="发送" className={cn(buttonVariants({ size: "icon-sm" }), "ml-auto rounded-full")}>
+											<ArrowUpIcon className="size-4" />
+										</ComposerPrimitive.Send>
+									</div>
+								</ComposerPrimitive.Root>
 							</div>
-						</ThreadPrimitive.Empty>
-						<ThreadPrimitive.Messages components={{ UserMessage, AssistantMessage }} />
-					</ThreadPrimitive.Viewport>
-					{running && runStartedAt !== null && statusLabel !== null ? (
-						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
-							<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
-								<Loader2Icon className="size-3.5 animate-spin" />
-								<span>{statusLabel}</span>
-								<span className="tabular-nums">· 已用 {elapsedSec} 秒</span>
-							</div>
-						</div>
-					) : null}
-					{!running && serverRunActive ? (
-						<div className="mx-auto w-full max-w-3xl px-2 pt-2" aria-live="polite">
-							<div className="flex items-center gap-2 text-xs text-muted-foreground/80">
-								<Loader2Icon className="size-3.5 animate-spin" />
-								<span>
-									{pendingToolPart
-										? pendingRecordStatus === "approved"
-											? `已批准，正在执行：${pendingToolPart.name}…`
-											: `等待批准：${pendingToolPart.name}（可在工具卡上批准 / 驳回，或到待批收件箱处理）`
-										: "正在后台运行…（可在下方中止本轮）"}
-								</span>
-							</div>
-						</div>
-					) : null}
-					<div className="mx-auto w-full max-w-3xl px-2 pt-2 pb-4">
-						{/* 注意：ComposerPrimitive.Root 不得传 onSubmit——assistant-ui
-							用 composeEventHandlers 组合提交处理，外层 handler 一旦
-							preventDefault，其内部 send 就被跳过；Enter 发送正是走
-							form requestSubmit 这条路（发送按钮走 click 直达不受
-							影响），曾因此出现「Enter 无效、只能点发送」（P2-9
-							试用后修复）。其内部 handler 自己会 preventDefault，
-							页面不会重载。 */}
-						<ComposerPrimitive.Root className="flex w-full flex-col rounded-2xl border bg-card transition-[border-color,box-shadow] duration-150 focus-within:border-ring/60 focus-within:ring-2 focus-within:ring-ring/30">
-							<ComposerPrimitive.Input
-								className="max-h-40 min-h-10 w-full resize-none bg-transparent px-4 pt-3 pb-1 text-sm outline-none placeholder:text-muted-foreground"
-								placeholder="输入消息；对主 bot 说「创建一个 XX bot，负责……」可生成草案卡"
-								submitOnEnter
-							/>
-							<div className="flex items-center justify-between gap-2 px-3 pb-2.5">
-								{running || serverRunActive ? (
-									<button
-										type="button"
-										onClick={onAbort}
-										className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-									>
-										<SquareIcon className="size-3.5" />
-										中止本轮
-									</button>
-								) : (
-									<span className="hidden text-xs text-muted-foreground sm:block">Enter 发送 · Shift+Enter 换行</span>
-								)}
-								<ComposerPrimitive.Send className={cn(buttonVariants({ size: "sm" }), "ml-auto rounded-full pr-3 pl-3.5")}>
-									发送
-									<ArrowUpIcon className="size-4" />
-								</ComposerPrimitive.Send>
-							</div>
-						</ComposerPrimitive.Root>
-					</div>
-				</ThreadPrimitive.Root>
+						</ThreadPrimitive.Root>
+					</ChatActionsContext.Provider>
 				</ToolApprovalActionsContext.Provider>
 			</DraftActionsContext.Provider>
 		</AssistantRuntimeProvider>

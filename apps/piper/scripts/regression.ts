@@ -332,9 +332,12 @@ async function main() {
 		check("GET /api/memory/repo-keeper 返回 aboutMe 全文（非空）", typeof memory.json?.aboutMe === "string" && memory.json.aboutMe.length > 0, `长度 ${memory.json?.aboutMe?.length}`);
 
 		// ---- 静态首页（26）----
+		// 主题改为亮/暗双主题（chat-demo 迁移）：html 不再硬编码 class="dark"，
+		// 深色缺省由 head 内防闪烁脚本按 localStorage（key piper-theme）设置，
+		// 缺省仍是 dark——断言改为验证该脚本随壳伺服。
 		const home = await fetch(`${BASE}/`);
 		const homeHtml = await home.text();
-		check('GET / 返回 200 且 html 带 class="dark"', home.status === 200 && homeHtml.includes('class="dark"'), `实际 ${home.status}`);
+		check("GET / 返回 200 且壳内带主题防闪烁脚本（缺省 dark）", home.status === 200 && homeHtml.includes("piper-theme") && homeHtml.includes('classList.toggle("dark"'), `实际 ${home.status}`);
 
 		const anon = async (path: string, init: RequestInit = {}): Promise<{ status: number; json: any; text: string }> => {
 			const res = await fetch(BASE + path, { ...init, headers: { "Content-Type": "application/json", ...(init.headers || {}) } });

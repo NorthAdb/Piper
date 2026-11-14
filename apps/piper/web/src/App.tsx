@@ -17,6 +17,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { cn } from "@/lib/utils";
+import { useColumnWidths } from "./column-widths";
 import type { Bot } from "./model";
 
 type FormState = { open: boolean; bot: Bot | null };
@@ -29,6 +30,8 @@ export function App() {
 	const [busyBotIds, setBusyBotIds] = useState<ReadonlySet<string>>(new Set());
 	const [form, setForm] = useState<FormState>({ open: false, bot: null });
 	const [view, setView] = useState<"main" | "settings" | "inbox">("main");
+	// 左右栏拖拽调宽（窄窗口自动保住中栏）
+	const columns = useColumnWidths();
 	// 通知「查看事项」直达：目标 Finding id，收件箱据此滚动定位并高亮（命中已关闭项时展开历史区）
 	const [inboxFocusId, setInboxFocusId] = useState<string | null>(null);
 	// 中栏视图（对话 / 轨迹，PR-E）：轨迹窗格首次打开后保持挂载，两个窗格靠
@@ -154,8 +157,8 @@ export function App() {
 	}
 
 	return (
-		<div className="grid h-dvh grid-cols-[264px_minmax(0,1fr)_360px]">
-			<aside className="min-h-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
+		<div className="grid h-dvh" style={{ gridTemplateColumns: `${columns.widths.left}px minmax(0, 1fr) ${columns.widths.right}px` }}>
+			<aside className="relative min-h-0 border-r border-sidebar-border bg-sidebar text-sidebar-foreground">
 				<BotList
 					bots={bots}
 					currentBotId={currentBotId}
@@ -175,6 +178,13 @@ export function App() {
 						setSettingsTab("notifications");
 						setView("settings");
 					}}
+				/>
+				<button
+					type="button"
+					aria-hidden
+					tabIndex={-1}
+					onPointerDown={columns.startDrag("left")}
+					className="absolute inset-y-0 right-0 z-10 w-1.5 cursor-col-resize transition-colors duration-150 hover:bg-primary/25"
 				/>
 			</aside>
 
@@ -255,8 +265,15 @@ export function App() {
 				) : null}
 			</main>
 
-			<aside className="min-h-0 border-l border-sidebar-border bg-sidebar text-sidebar-foreground">
+			<aside className="relative min-h-0 border-l border-sidebar-border bg-sidebar text-sidebar-foreground">
 				<Desktop bot={currentBot} onUnauthorized={onUnauthorized} onBotUpdated={() => void reloadBots()} />
+				<button
+					type="button"
+					aria-hidden
+					tabIndex={-1}
+					onPointerDown={columns.startDrag("right")}
+					className="absolute inset-y-0 left-0 z-10 w-1.5 cursor-col-resize transition-colors duration-150 hover:bg-primary/25"
+				/>
 			</aside>
 
 			{form.open ? (

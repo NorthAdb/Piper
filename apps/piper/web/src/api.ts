@@ -179,6 +179,11 @@ export function saveModelSettings(input: ModelSettingsInput): Promise<ModelSetti
 	return api("/api/settings/model", { method: "PUT", body: JSON.stringify(input) });
 }
 
+// 思考挡位单独保存（PUT /api/settings/model 的部分更新）：后端热生效，下一轮对话用新挡位
+export function updateThinkingLevel(level: string): Promise<ModelSettings> {
+	return saveModelSettings({ thinkingLevel: level });
+}
+
 export function testModelSettings(input: ModelSettingsInput): Promise<{ ok: boolean; error?: string }> {
 	return api("/api/settings/model/test", { method: "POST", body: JSON.stringify(input) });
 }
