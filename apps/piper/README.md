@@ -2894,3 +2894,54 @@ regression 72），无回退。根级 `npm run check` 退出码 0。可复制命
 - **明确不做**（按切片）：不与循环闸（P2-1/P2-3）同 PR
   （本件独立成 PR）；不做多模型路由或自动换模型省钱；不把
   「提示词里写了请节约」当验收。
+
+## P2-9 真环境试用结论 + 试用后修复实测（2026-11-14，分支 feat/post-trial-fixes）
+
+P2-9 在用户本机 Windows 实例（真模型 deepseek-flash、评论目标
+NorthAdb/piper-dogfood PR #1）走完：**8/8 通过**，三处如实注明——
+第 4 条（文件闸）三种问法均被模型在调用前拦截、工作区外文件从未
+被读到，工具层证据由 test:workspace 43 条覆盖；第 5 条（中止）
+功能成立但呈现有缺陷（见下修复 2）；第 7/8 条为用户裁定通过。
+完整试用记录在仓库外（dogfood-p2-record.md）。试用暴露的问题
+在本切片一并修复：
+
+- **修复 1（卡内批准）**：对话里的待批工具卡直接带「批准并执行 /
+  驳回」按钮（parts.tsx ToolCard 经 ToolApprovalActionsContext 取
+  ChatPane 按 toolCallId 索引的待批记录，动作走现有
+  approveToolApproval / rejectToolApproval 接口、同一条
+  ToolApproval 记录与网关执行）；记录已在他处处理完时按钮自动
+  消失、只留说明。收件箱仍是跨 bot / 扫描的总队列，不变。
+- **修复 2（中止记账）**：kernel 以 abort 时打标的
+  userAbortedSessions 区分「用户亲手中止」与真模型错误：命中
+  标记的错误出口改抛 code RUN_ABORTED 并带半截文本（增量累计的
+  liveText 优先、否则上一段定稿 finalText）。路由层据此落
+  interrupted:true 的助手条目（半截文本进历史，下一轮「继续」
+  模型看得见）+ kind run_aborted 的中性系统条目，SSE 发 aborted
+  事件（前端补同文案系统提示），不再落 error 条目、不再出红色
+  MODEL_ERROR 卡。恢复续跑的落盘器（continuationPersister.fail）
+  同口径。真模型错误（未打标）维持原 MODEL_ERROR 路径不变。
+- **修复 3（预置声明缺口）**：旧版本种子建的预置 bot 不随升级
+  获得新工具声明（用户实例的仓库管家缺 github_comment、界面无
+  提示）。lib/tool-registry.ts 新增 presetToolGaps（仅预置 id
+  计算、只算不改）；GET /api/bots/:id/tools 回 presetGaps；
+  工具页签顶部出提示卡与「补齐声明」按钮，经
+  POST /api/bots/:id/preset-tools/backfill 只加不删地补回，
+  并通知外层重拉 bot 列表。不在启动时静默改用户数据。
+- **修复 4（Enter 发送）**：Enter 无效、点发送按钮有效——根因在
+  ChatPane 给 ComposerPrimitive.Root 传的 onSubmit：assistant-ui
+  以 composeEventHandlers 组合提交处理，外层 preventDefault 会
+  跳过其内部 send；Enter 走 form requestSubmit 正中此路，发送
+  按钮走 click 直达故独活（据装机版 @assistant-ui/react 0.15.33
+  dist 源码核实）。去掉该 onSubmit 即修复（其内部 handler 自行
+  preventDefault，不会整页重载），并在原处留注释防回归。
+- **亲跑验收**：test:intervention **17/17**（新增 B13/B14：慢速
+  长文生成中途中止——SSE 有 aborted 无 error、半截文本落
+  interrupted 条目、无 error 条目；随后「继续」的模型请求历史
+  含半截文本）；test:tool-registry **15/15**（新增 B8：旧形状
+  管家报缺口 [github_comment]、补齐后声明与物化齐备、重复补齐
+  空操作、自建 bot 无缺口）。修复 1/4 为前端接线，无服务端
+  行为变化，靠类型检查、构建与用户实例手测验收。全套 npm test
+  与根级 npm run check 的最终数字以 PR 描述为准。
+- **明确不做**：不改收件箱信息架构（它仍是总队列与重启后找回
+  入口）；不为第 4 条削弱模型层行为；预置补齐不覆盖用户对自建
+  bot 的任何设置。
